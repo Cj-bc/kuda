@@ -1,8 +1,13 @@
 // リリースビルドではタスク起動のたびにコンソール窓が出ないよう GUI サブシステムにする
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// 実装途中の間だけ。全サブコマンドが繋がったら外す
+#![allow(dead_code)]
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+
+mod logging;
+mod paths;
 
 #[derive(Parser)]
 #[command(
