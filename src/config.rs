@@ -236,9 +236,28 @@ pub struct Diagnose {
     pub fallback: Option<BackendKind>,
     pub prompt_file: String,
     #[serde(default)]
-    pub allowed_commands: Vec<String>,
+    pub allowed_commands: AllowedCommands,
     #[serde(default = "default_max_duration", deserialize_with = "duration")]
     pub max_duration: Duration,
+}
+
+/// LLM に許可するコマンド。他の OS 向けのコマンドまで許可しないよう OS ごとに持つ
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AllowedCommands {
+    pub windows: Vec<String>,
+    pub linux: Vec<String>,
+}
+
+impl AllowedCommands {
+    /// 実行中の OS の分だけを返す
+    pub fn current(&self) -> &[String] {
+        self.for_os(cfg!(windows))
+    }
+
+    fn for_os(&self, windows: bool) -> &[String] {
+        if windows { &self.windows } else { &self.linux }
+    }
 }
 
 fn default_max_turns() -> u32 {
@@ -421,6 +440,11 @@ mod tests {
         let diagnose = watch.diagnose.as_ref().unwrap();
         assert_eq!(diagnose.backend, BackendKind::ClaudeCode);
         assert_eq!(diagnose.fallback, Some(BackendKind::Local));
+        let allowed = &diagnose.allowed_commands;
+        assert!(allowed.windows.contains(&"tracert".to_string()));
+        assert!(!allowed.windows.contains(&"traceroute".to_string()));
+        assert!(allowed.linux.contains(&"traceroute".to_string()));
+        assert!(!allowed.linux.contains(&"tracert".to_string()));
     }
 
     #[test]
@@ -475,6 +499,40 @@ mod tests {
         assert!(Config::parse(&text).is_err());
         let text = format!("[backends.codex]\ncommand = \"codex\"\n{text}");
         assert!(Config::parse(&text).is_ok());
+    }
+
+    fn with_allowed_commands(table: &str) -> String {
+        format!(
+            "[backends.codex]\ncommand = \"codex\"\n{MINIMAL_WATCH}\n\
+             [watch.diagnose]\nbackend = \"codex\"\nprompt_file = \"p.md\"\n{table}"
+        )
+    }
+
+    #[test]
+    fn allowed_commands_are_selected_per_os() {
+        let text = with_allowed_commands(
+            "[watch.diagnose.allowed_commands]\nwindows = [\"tracert\"]\nlinux = [\"traceroute\"]\n",
+        );
+        let config = Config::parse(&text).unwrap();
+        let diagnose = config.watch("w").unwrap().diagnose.as_ref().unwrap();
+        assert_eq!(diagnose.allowed_commands.for_os(true), ["tracert"]);
+        assert_eq!(diagnose.allowed_commands.for_os(false), ["traceroute"]);
+    }
+
+    #[test]
+    fn omitted_os_allows_no_commands() {
+        let text = with_allowed_commands("[watch.diagnose.allowed_commands]\nlinux = [\"ping\"]\n");
+        let config = Config::parse(&text).unwrap();
+        let diagnose = config.watch("w").unwrap().diagnose.as_ref().unwrap();
+        assert!(diagnose.allowed_commands.for_os(true).is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_os_and_flat_allowed_commands() {
+        let unknown = "[watch.diagnose.allowed_commands]\nwindow = [\"ping\"]\n";
+        assert!(Config::parse(&with_allowed_commands(unknown)).is_err());
+        let flat = "allowed_commands = [\"ping\"]\n";
+        assert!(Config::parse(&with_allowed_commands(flat)).is_err());
     }
 
     #[test]
