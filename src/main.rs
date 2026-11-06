@@ -12,6 +12,7 @@ mod logging;
 mod paths;
 mod probe;
 mod process;
+mod store;
 mod trigger;
 
 #[derive(Parser)]
