@@ -259,6 +259,20 @@ fn check_config_reports_missing_references() {
 }
 
 #[test]
+fn windowless_binary_runs_the_same_cycle() {
+    let home = Home::new("kudaw", &failing_watch(closed_port(), 1));
+    let output = Command::new(env!("CARGO_BIN_EXE_kudaw"))
+        .args(["check", "--force"])
+        .env("KUDA_HOME", &home.dir)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let report = home.wait_for_report().expect("no report was written");
+    let text = std::fs::read_to_string(report).unwrap();
+    assert!(text.contains("fake-report-body"), "{text}");
+}
+
+#[test]
 fn invalid_config_fails_with_a_message() {
     let home = Home::new("invalid", &failing_watch(closed_port(), 2));
     std::fs::write(home.dir.join("config.toml"), "[[watch]]\nnme = 1\n").unwrap();

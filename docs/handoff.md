@@ -37,7 +37,7 @@ LLM CLIは、スケジューラがタスクを実行するのと**同じユー�
 
 ## ビルド
 
-Nix flakeでリリースビルドの単一バイナリを作ります。Windows向けもWSL上のNixからクロスビルドします。Windowsでは、タスク起動のたびにコンソール窓が出ないよう、GUIサブシステムでビルドします。
+Nix flakeでリリースビルドのバイナリを作ります。Windows向けもWSL上のNixからクロスビルドします。Windowsでは、タスク起動のたびにコンソール窓が出ないよう、スケジューラ用のGUIサブシステム版 `kudaw.exe` も作ります。
 
 ### プロジェクト構成（想定）
 
@@ -48,7 +48,9 @@ kuda/
   Cargo.toml
   Cargo.lock
   src/
-    main.rs            # CLI（check / snapshot / diagnose / status / check-config / check-backends）
+    lib.rs             # CLI（check / snapshot / diagnose / status / check-config / check-backends）
+    main.rs            # kuda の入口
+    bin/kudaw.rs       # kudaw の入口（Windows では GUI サブシステム）
     commands.rs        # 各サブコマンドの本体
     config.rs          # config.toml の読み込みと検証
     paths.rs           # OS別のディレクトリ解決（Linux は XDG）
@@ -74,13 +76,20 @@ kuda/
 
 ### Windowsでコンソール窓を出さない
 
-`main.rs` の先頭に、リリースビルドのときだけGUIサブシステムにする属性を置きます。
+Windows向けには2つのバイナリを作ります。中身は同じで、サブシステムだけが違います（Python の `python.exe` と `pythonw.exe` の関係です）。
+
+| バイナリ | サブシステム | 用途 |
+| --- | --- | --- |
+| `kuda.exe` | コンソール | 手動の実行。PowerShell などから普通に使える |
+| `kudaw.exe` | GUI | タスクスケジューラからの起動。窓を出さない |
+
+`kudaw` は `src/bin/kudaw.rs` の先頭で、次の属性によりGUIサブシステムにしています。
 
 ```rust
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 ```
 
-この場合リリースビルドでは標準出力が見えません。ログは必ずファイルに出すようにします（配置の節を参照）。手動確認ではデバッグビルドを使うか、`--verbose` でログファイルを追ってください。
+GUIサブシステムの exe は標準出力がコンソールに繋がらず、PowerShell は終了も待ちません。手元で `kudaw.exe` を実行すると、何も表示されずに動いていないように見えます。手動の確認には `kuda.exe` を使ってください。`kudaw.exe` の動作はログファイルで確認します（配置の節を参照）。
 
 ### flake.nix
 
@@ -89,7 +98,7 @@ flake の出力は次の3つです。Windows向けは `pkgsCross.mingwW64` に�
 | 出力 | 中身 |
 | --- | --- |
 | `packages.<system>.default`（`kuda`） | Linux ネイティブのバイナリ。`share/kuda/` に設定例とプロンプトを同梱 |
-| `packages.<system>.kuda-windows` | Windows 11 向けの `kuda.exe`。同じく設定例とプロンプトを同梱 |
+| `packages.<system>.kuda-windows` | Windows 11 向けの `kuda.exe` と `kudaw.exe`。同じく設定例とプロンプトを同梱 |
 | `devShells.<system>.default` | cargo、rustc、clippy、rust-analyzer、sqlite、traceroute 入りの開発シェル |
 
 ```nix
@@ -231,7 +240,7 @@ panic = "abort"
 
 | 用途 | Windows | Linux（XDG。括弧内は変数が未設定・空のときの既定値） |
 | --- | --- | --- |
-| バイナリ | `%LOCALAPPDATA%\kuda\bin\kuda.exe` | Nixプロファイル（`~/.nix-profile/bin/kuda`） |
+| バイナリ | `%LOCALAPPDATA%\kuda\bin\kuda.exe`、`kudaw.exe` | Nixプロファイル（`~/.nix-profile/bin/kuda`） |
 | 設定・プロンプト | `%LOCALAPPDATA%\kuda\config.toml`、`prompts\` | `$XDG_CONFIG_HOME/kuda/config.toml`、`prompts/`（`~/.config`） |
 | メトリクスDB（SQLite） | `%LOCALAPPDATA%\kuda\data\kuda.db` | `$XDG_STATE_HOME/kuda/kuda.db`（`~/.local/state`） |
 | 事件ディレクトリ | `%LOCALAPPDATA%\kuda\incidents\` | `$XDG_STATE_HOME/kuda/incidents/` |
@@ -265,13 +274,14 @@ DEST="$WINLOCAL/kuda"
 
 nix build .#kuda-windows
 install -Dm755 result/bin/kuda.exe "$DEST/bin/kuda.exe"
+install -Dm755 result/bin/kudaw.exe "$DEST/bin/kudaw.exe"
 # 初回のみ: 設定例とプロンプトをコピー（以後は手元の編集を上書きしない）
 [ -e "$DEST/config.toml" ] || install -Dm644 result/share/kuda/config.example.toml "$DEST/config.toml"
 mkdir -p "$DEST/prompts"
 cp -rn --no-preserve=mode result/share/kuda/prompts/. "$DEST/prompts/"
 ```
 
-更新時は `nix build` と `kuda.exe` のコピーだけを再実行します。タスクの実行中は exe がロックされてコピーに失敗することがあるので、その場合は数秒おいて再実行してください。
+更新時は `nix build` と `kuda.exe`、`kudaw.exe` のコピーだけを再実行します。タスクの実行中は exe がロックされてコピーに失敗することがあるので、その場合は数秒おいて再実行してください。
 
 ### Linux
 
@@ -495,7 +505,7 @@ interval = "5m"
 登録は次のPowerShellで行います（一度だけ実行、管理者権限は不要）。
 
 ```powershell
-$exe = "$env:LOCALAPPDATA\kuda\bin\kuda.exe"
+$exe = "$env:LOCALAPPDATA\kuda\bin\kudaw.exe"
 $action = New-ScheduledTaskAction -Execute $exe -Argument "check"
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 5)
@@ -594,7 +604,8 @@ sysctl net.ipv4.ping_group_range
 | 調査が途中で消える | 調査プロセスが切り離されていない | Windows は `CREATE_BREAKAWAY_FROM_JOB`、Linux は `systemd-run` 経由になっているか確認する |
 | LLMが「認証されていない」で失敗する | タスクが別ユーザー・別プロファイルで動いている | スケジューラの実行ユーザーで `claude` / `codex` にログインし直す |
 | 一瞬の瞬断で何度も発火する | `consecutive` が小さい、またはベースラインがまだ無い | `consecutive` を増やし、データが貯まるまで `loss` の閾値を上げる |
-| Windowsで黒い窓が一瞬出る | デバッグビルド、または外部コマンドに `CREATE_NO_WINDOW` が付いていない | リリースビルドを配置し、`tracert` などの子プロセス起動にもフラグを付ける |
+| Windowsで黒い窓が一瞬出る | タスクが `kuda.exe` を起動している、または外部コマンドに `CREATE_NO_WINDOW` が付いていない | タスクの実行ファイルを `kudaw.exe` にし、`tracert` などの子プロセス起動にもフラグを付ける |
+| PowerShellで実行しても何も表示されない | `kudaw.exe` を実行している | 手動の実行には `kuda.exe` を使う |
 | Linuxで ICMP の probe が常に失敗する | 非特権 ping ソケットが不許可 | `net.ipv4.ping_group_range` を確認するか、TCP の probe に切り替える |
 | 完全断の調査がいつも失敗する | クラウドLLMに届かない | `fallback = "local"` が設定されていて、ローカルサーバーが起動しているか確認する |
 
