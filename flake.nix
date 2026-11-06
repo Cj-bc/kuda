@@ -20,6 +20,7 @@
             ./Cargo.toml
             ./Cargo.lock
             ./src
+            ./tests
             ./prompts
             ./config.example.toml
           ];
