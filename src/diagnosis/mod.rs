@@ -4,6 +4,7 @@
 //! fallback を 1 度ずつだけで、それぞれ `max_duration` で打ち切る。
 
 mod claude_code;
+mod codex;
 
 use crate::config::{BackendKind, Config, Diagnose};
 use crate::incident::{Incident, format_time};
@@ -34,7 +35,11 @@ pub fn backend(config: &Config, kind: BackendKind) -> Result<Box<dyn Backend>> {
             let settings = config.backends.claude_code.clone();
             Box::new(claude_code::ClaudeCode(settings.with_context(missing)?))
         }
-        BackendKind::Codex | BackendKind::Local => bail!("{} is not supported yet", kind.name()),
+        BackendKind::Codex => {
+            let settings = config.backends.codex.clone();
+            Box::new(codex::Codex(settings.with_context(missing)?))
+        }
+        BackendKind::Local => bail!("{} is not supported yet", kind.name()),
     })
 }
 
