@@ -6,9 +6,11 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+mod collector;
 mod config;
 mod logging;
 mod paths;
+mod process;
 mod trigger;
 
 #[derive(Parser)]
