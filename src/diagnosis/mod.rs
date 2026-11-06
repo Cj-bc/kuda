@@ -5,6 +5,7 @@
 
 mod claude_code;
 mod codex;
+mod local;
 
 use crate::config::{BackendKind, Config, Diagnose};
 use crate::incident::{Incident, format_time};
@@ -39,7 +40,10 @@ pub fn backend(config: &Config, kind: BackendKind) -> Result<Box<dyn Backend>> {
             let settings = config.backends.codex.clone();
             Box::new(codex::Codex(settings.with_context(missing)?))
         }
-        BackendKind::Local => bail!("{} is not supported yet", kind.name()),
+        BackendKind::Local => {
+            let settings = config.backends.local.clone();
+            Box::new(local::Local(settings.with_context(missing)?))
+        }
     })
 }
 
