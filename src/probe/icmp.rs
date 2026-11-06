@@ -23,7 +23,7 @@ fn resolve_v4(host: &str, timeout: Duration) -> Result<Ipv4Addr, String> {
 }
 
 #[cfg(windows)]
-fn echo(ip: Ipv4Addr, timeout: Duration) -> Result<f64, String> {
+pub fn echo(ip: Ipv4Addr, timeout: Duration) -> Result<f64, String> {
     use windows::Win32::NetworkManagement::IpHelper::{
         ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho2,
     };
@@ -68,7 +68,7 @@ fn echo(ip: Ipv4Addr, timeout: Duration) -> Result<f64, String> {
 }
 
 #[cfg(unix)]
-fn echo(ip: Ipv4Addr, timeout: Duration) -> Result<f64, String> {
+pub fn echo(ip: Ipv4Addr, timeout: Duration) -> Result<f64, String> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use std::net::{SocketAddr, UdpSocket};
     use std::time::Instant;

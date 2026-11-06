@@ -1,9 +1,9 @@
-use super::{Sample, dns};
+use super::{Sample, dns, icmp};
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-/// ポート無しの `gateway` で試すポート。ルーターで開いていることが多い順
+/// ICMP が通らないときに `gateway` で試すポート。ルーターで開いていることが多い順
 const GATEWAY_PORTS: [u16; 3] = [53, 80, 443];
 
 pub fn check(target: &str, gateway: Option<IpAddr>, timeout: Duration) -> Result<Sample, String> {
@@ -40,6 +40,13 @@ fn connect(address: SocketAddr, timeout: Duration) -> std::io::Result<f64> {
 }
 
 fn check_gateway(ip: IpAddr, timeout: Duration) -> Result<Sample, String> {
+    // 全ポートをフィルタするゲートウェイもあるので、ポートに依らない ICMP を先に試す
+    if let IpAddr::V4(ip) = ip
+        && let Ok(rtt_ms) = icmp::echo(ip, timeout)
+    {
+        return Ok(Sample::rtt(rtt_ms));
+    }
+
     let mut last_error = String::new();
     for port in GATEWAY_PORTS {
         match connect(SocketAddr::new(ip, port), timeout) {
@@ -91,8 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn refused_gateway_counts_as_reachable_without_rtt() {
-        // 127.0.0.1 の 53/80/443 が開いていても閉じていても成功し、閉じていれば RTT は無い
+    fn local_gateway_is_reachable() {
+        // ICMP が使えない環境でも、閉じたポートの RST で到達可能と判定される
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         assert!(check_gateway(ip, TIMEOUT).is_ok());
     }
