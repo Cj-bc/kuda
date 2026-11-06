@@ -20,6 +20,7 @@
             ./Cargo.toml
             ./Cargo.lock
             ./src
+            ./tests
             ./prompts
             ./config.example.toml
           ];
@@ -45,6 +46,9 @@
               install -Dm644 config.example.toml $out/share/kuda/config.example.toml
               mkdir -p $out/share/kuda/prompts
               cp -r prompts/. $out/share/kuda/prompts/
+            '' + lib.optionalString (!isWindows) ''
+              # kudaw は Windows で窓を出さないためのもので、Linux には不要
+              rm $out/bin/kudaw
             '';
 
             meta = {

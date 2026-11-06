@@ -1,0 +1,29 @@
+[package]
+name = "kuda"
+version = "0.1.0"
+edition = "2024"
+description = "PC monitoring harness with LLM-driven investigation"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+fd-lock = "4.0.4"
+log = { version = "0.4.35", features = ["std"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.2.0"
+ureq = "3.5.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_IO"] }
+
+[target."cfg(unix)".dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }

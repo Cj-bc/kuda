@@ -37,7 +37,7 @@ LLM CLIは、スケジューラがタスクを実行するのと**同じユー�
 
 ## ビルド
 
-Nix flakeでリリースビルドの単一バイナリを作ります。Windows向けもWSL上のNixからクロスビルドします。Windowsでは、タスク起動のたびにコンソール窓が出ないよう、GUIサブシステムでビルドします。
+Nix flakeでリリースビルドのバイナリを作ります。Windows向けもWSL上のNixからクロスビルドします。Windowsでは、タスク起動のたびにコンソール窓が出ないよう、スケジューラ用のGUIサブシステム版 `kudaw.exe` も作ります。
 
 ### プロジェクト構成（想定）
 
@@ -48,7 +48,10 @@ kuda/
   Cargo.toml
   Cargo.lock
   src/
-    main.rs            # CLI（check / snapshot / diagnose / status / check-config）
+    lib.rs             # CLI（check / snapshot / diagnose / status / check-config / check-backends）
+    main.rs            # kuda の入口
+    bin/kudaw.rs       # kudaw の入口（Windows では GUI サブシステム）
+    commands.rs        # 各サブコマンドの本体
     config.rs          # config.toml の読み込みと検証
     paths.rs           # OS別のディレクトリ解決（Linux は XDG）
     probe/             # tcp, icmp, dns, http, command
@@ -59,22 +62,34 @@ kuda/
     incident.rs        # 事件ディレクトリ生成、diff 生成
     diagnosis/         # claude_code, codex, local
     lock.rs            # 多重起動防止
+    detach.rs          # 調査プロセスの切り離し起動
+    process.rs         # 外部コマンドの起動（タイムアウト、窓を出さない）
+    logging.rs         # 日付ローテーションするファイルログ
   prompts/
     network.md
   config.example.toml
+  tests/
+    e2e.rs             # 実バイナリでの通しテスト
 ```
 
-主な依存クレートは `rusqlite`（bundled）、`serde` と `toml`、`clap`、`anyhow`、`fd-lock`、`ureq`（ローカルLLMへのHTTP）です。Windowsでは `windows`（`GetAdaptersAddresses`、`GetIpForwardTable2`、`IcmpSendEcho2`）を、Linuxでは `rtnetlink` か `ip -j` の呼び出しを使います。メモリと起動時間を抑えるため、tokio などの非同期ランタイムは入れず同期実装にします。
+主な依存クレートは `rusqlite`（bundled）、`serde` と `serde_json`、`toml`、`clap`、`anyhow`、`chrono`、`log`、`fd-lock`、`ureq`（ローカルLLMへのHTTP）です。Windowsでは `windows`（`GetAdaptersAddresses`、`GetIpForwardTable2`、`IcmpSendEcho2`）を、Linuxでは `ip -j` の呼び出しと `socket2`（非特権の ping ソケット）を使います。メモリと起動時間を抑えるため、tokio などの非同期ランタイムは入れず同期実装にします。
 
 ### Windowsでコンソール窓を出さない
 
-`main.rs` の先頭に、リリースビルドのときだけGUIサブシステムにする属性を置きます。
+Windows向けには2つのバイナリを作ります。中身は同じで、サブシステムだけが違います（Python の `python.exe` と `pythonw.exe` の関係です）。
+
+| バイナリ | サブシステム | 用途 |
+| --- | --- | --- |
+| `kuda.exe` | コンソール | 手動の実行。PowerShell などから普通に使える |
+| `kudaw.exe` | GUI | タスクスケジューラからの起動。窓を出さない |
+
+`kudaw` は `src/bin/kudaw.rs` の先頭で、次の属性によりGUIサブシステムにしています。
 
 ```rust
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 ```
 
-この場合リリースビルドでは標準出力が見えません。ログは必ずファイルに出すようにします（配置の節を参照）。手動確認ではデバッグビルドを使うか、`--verbose` でログファイルを追ってください。
+GUIサブシステムの exe は標準出力がコンソールに繋がらず、PowerShell は終了も待ちません。手元で `kudaw.exe` を実行すると、何も表示されずに動いていないように見えます。手動の確認には `kuda.exe` を使ってください。`kudaw.exe` の動作はログファイルで確認します（配置の節を参照）。
 
 ### flake.nix
 
@@ -83,7 +98,7 @@ flake の出力は次の3つです。Windows向けは `pkgsCross.mingwW64` に�
 | 出力 | 中身 |
 | --- | --- |
 | `packages.<system>.default`（`kuda`） | Linux ネイティブのバイナリ。`share/kuda/` に設定例とプロンプトを同梱 |
-| `packages.<system>.kuda-windows` | Windows 11 向けの `kuda.exe`。同じく設定例とプロンプトを同梱 |
+| `packages.<system>.kuda-windows` | Windows 11 向けの `kuda.exe` と `kudaw.exe`。同じく設定例とプロンプトを同梱 |
 | `devShells.<system>.default` | cargo、rustc、clippy、rust-analyzer、sqlite、traceroute 入りの開発シェル |
 
 ```nix
@@ -221,17 +236,19 @@ panic = "abort"
 
 ## 配置とディレクトリ構成
 
-設定・データ・ログはユーザー領域に置きます。Linuxでは [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/) に従います。環境変数 `KUDA_HOME` を設定した場合は、OSを問わずその下にすべてをまとめます（Windowsと同じ構成）。
+設定・データ・ログはユーザー領域に置きます。Linuxでは [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/) に従います。環境変数 `KUDA_HOME` を設定した場合は、OSを問わずその下にすべてをまとめます（Windowsの `%LOCALAPPDATA%\kuda` と同じ構成で、設定とプロンプトも直下に置きます）。
 
 | 用途 | Windows | Linux（XDG。括弧内は変数が未設定・空のときの既定値） |
 | --- | --- | --- |
-| バイナリ | `%LOCALAPPDATA%\kuda\bin\kuda.exe` | Nixプロファイル（`~/.nix-profile/bin/kuda`） |
-| 設定・プロンプト | `%LOCALAPPDATA%\kuda\config.toml`、`prompts\` | `$XDG_CONFIG_HOME/kuda/config.toml`、`prompts/`（`~/.config`） |
+| バイナリ | `%LOCALAPPDATA%\kuda\bin\kuda.exe`、`kudaw.exe` | Nixプロファイル（`~/.nix-profile/bin/kuda`） |
+| 設定・プロンプト | `%APPDATA%\kuda\config.toml`、`prompts\` | `$XDG_CONFIG_HOME/kuda/config.toml`、`prompts/`（`~/.config`） |
 | メトリクスDB（SQLite） | `%LOCALAPPDATA%\kuda\data\kuda.db` | `$XDG_STATE_HOME/kuda/kuda.db`（`~/.local/state`） |
 | 事件ディレクトリ | `%LOCALAPPDATA%\kuda\incidents\` | `$XDG_STATE_HOME/kuda/incidents/` |
 | ログ | `%LOCALAPPDATA%\kuda\logs\` | `$XDG_STATE_HOME/kuda/logs/` |
 | レポート | `%LOCALAPPDATA%\kuda\reports\` | `$XDG_DATA_HOME/kuda/reports/`（`~/.local/share`） |
 | ロックファイル | `%LOCALAPPDATA%\kuda\data\kuda.lock` | `$XDG_RUNTIME_DIR/kuda/kuda.lock` |
+
+Windowsでは、ユーザーに付いて回る設定とプロンプトを `%APPDATA%`（Roaming）に、PCに固有のバイナリ・データ・ログを `%LOCALAPPDATA%` に置きます。
 
 Linux側の振り分けの考え方は次のとおりです。
 
@@ -250,22 +267,31 @@ Linux側の振り分けの考え方は次のとおりです。
 
 ### Windows
 
-WSL 上でビルドした成果物を、WSL から Windows 側の `%LOCALAPPDATA%` にコピーします。
+WSL 上でビルドした成果物を、WSL から Windows 側へコピーします。バイナリは `%LOCALAPPDATA%`、設定とプロンプトは `%APPDATA%` に置きます。
 
 ```bash
-# Windows の %LOCALAPPDATA% を WSL のパスに変換
-WINLOCAL=$(wslpath "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')")
-DEST="$WINLOCAL/kuda"
+# Windows の環境変数を WSL のパスに変換
+winpath() { wslpath "$(cmd.exe /c "echo %$1%" 2>/dev/null | tr -d '\r')"; }
+DEST="$(winpath LOCALAPPDATA)/kuda"
+CONF="$(winpath APPDATA)/kuda"
 
 nix build .#kuda-windows
 install -Dm755 result/bin/kuda.exe "$DEST/bin/kuda.exe"
+install -Dm755 result/bin/kudaw.exe "$DEST/bin/kudaw.exe"
 # 初回のみ: 設定例とプロンプトをコピー（以後は手元の編集を上書きしない）
-[ -e "$DEST/config.toml" ] || install -Dm644 result/share/kuda/config.example.toml "$DEST/config.toml"
-mkdir -p "$DEST/prompts"
-cp -rn --no-preserve=mode result/share/kuda/prompts/. "$DEST/prompts/"
+[ -e "$CONF/config.toml" ] || install -Dm644 result/share/kuda/config.example.toml "$CONF/config.toml"
+mkdir -p "$CONF/prompts"
+cp -rn --no-preserve=mode result/share/kuda/prompts/. "$CONF/prompts/"
 ```
 
-更新時は `nix build` と `kuda.exe` のコピーだけを再実行します。タスクの実行中は exe がロックされてコピーに失敗することがあるので、その場合は数秒おいて再実行してください。
+更新時は `nix build` と `kuda.exe`、`kudaw.exe` のコピーだけを再実行します。タスクの実行中は exe がロックされてコピーに失敗することがあるので、その場合は数秒おいて再実行してください。
+
+以前のバージョンは設定とプロンプトを `%LOCALAPPDATA%\kuda` に置いていました。自動では引き継がないので、更新前に次のPowerShellで移します。移すまで `kuda` は設定を読めずに失敗します。
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\kuda"
+Move-Item "$env:LOCALAPPDATA\kuda\config.toml", "$env:LOCALAPPDATA\kuda\prompts" "$env:APPDATA\kuda\"
+```
 
 ### Linux
 
@@ -335,11 +361,16 @@ interval = "5m"
   backend = "claude_code"
   fallback = "local"
   prompt_file = "prompts/network.md"
-  allowed_commands = ["tracert", "traceroute", "ping", "ipconfig", "ip", "nslookup", "dig", "Test-NetConnection", "Get-NetAdapter"]
   max_duration = "5m"
+
+  [watch.diagnose.allowed_commands]
+  windows = ["tracert", "ping", "ipconfig", "nslookup", "Test-NetConnection", "Get-NetAdapter"]
+  linux = ["traceroute", "ping", "nslookup", "dig"]
 ```
 
-`gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
+`gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。`kind = "tcp"` でポートを省くと ICMP echo で確かめ、通らなければ 53/80/443 への接続を試します（接続拒否も到達可能として扱います）。`gateway:80` のようにポートも指定できます。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
+
+`allowed_commands` は `windows` と `linux` に分けて書き、実行中のOSのリストだけがLLMに渡ります。他のOS向けのコマンドまで許可しないためです。省略したOSでは、コマンドを1つも許可しません。
 
 ### prompts/network.md の例
 
@@ -383,11 +414,13 @@ kuda check-config
 claude -p "tracert -d -h 5 1.1.1.1 を実行して結果を要約して" --allowedTools "Bash(tracert:*)" --output-format json
 ```
 
-ハーネスは内部で、おおむね次の形で起動します。`allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read`）だけが追加で許可されます。
+ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。実行中のOSの `allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
 
 ```
-claude -p <展開済みプロンプト> --output-format json --max-turns 20 --allowedTools "Read" "Bash(tracert:*)" ...
+claude -p --output-format json --strict-mcp-config --setting-sources project --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
 ```
+
+使えるツールを Read と Bash に絞り、MCP サーバー、ユーザー設定の allow ルールとフックを持ち込みません。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
 
 Windowsでは Claude Code のシェルが Git Bash になるため、`Test-NetConnection` などのPowerShellコマンドレットは `powershell -NoProfile -Command ...` 経由で実行されます。許可ルールもその形に合わせ、`Bash(powershell -NoProfile -Command Test-NetConnection:*)` のように展開してください。
 
@@ -471,10 +504,12 @@ interval = "5m"
   [watch.diagnose]
   backend = "claude_code"
   prompt_file = "prompts/network.md"
-  allowed_commands = ["tracert", "traceroute", "ping"]
+  [watch.diagnose.allowed_commands]
+  windows = ["tracert", "ping"]
+  linux = ["traceroute", "ping"]
 ```
 
-`kuda check` を2回実行し、2回目で発火して `reports/test-unreachable/` にレポートができれば成功です。確認後、この watch は削除してください。
+`kuda check --force` を2回実行し（`--force` が無いと `interval` が経つまで2回目の probe は飛ばされます）、2回目で発火して `reports/test-unreachable/` にレポートができれば成功です。確認後、この watch は削除してください。
 
 ## スケジューラ登録
 
@@ -487,7 +522,7 @@ interval = "5m"
 登録は次のPowerShellで行います（一度だけ実行、管理者権限は不要）。
 
 ```powershell
-$exe = "$env:LOCALAPPDATA\kuda\bin\kuda.exe"
+$exe = "$env:LOCALAPPDATA\kuda\bin\kudaw.exe"
 $action = New-ScheduledTaskAction -Execute $exe -Argument "check"
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 5)
@@ -586,7 +621,8 @@ sysctl net.ipv4.ping_group_range
 | 調査が途中で消える | 調査プロセスが切り離されていない | Windows は `CREATE_BREAKAWAY_FROM_JOB`、Linux は `systemd-run` 経由になっているか確認する |
 | LLMが「認証されていない」で失敗する | タスクが別ユーザー・別プロファイルで動いている | スケジューラの実行ユーザーで `claude` / `codex` にログインし直す |
 | 一瞬の瞬断で何度も発火する | `consecutive` が小さい、またはベースラインがまだ無い | `consecutive` を増やし、データが貯まるまで `loss` の閾値を上げる |
-| Windowsで黒い窓が一瞬出る | デバッグビルド、または外部コマンドに `CREATE_NO_WINDOW` が付いていない | リリースビルドを配置し、`tracert` などの子プロセス起動にもフラグを付ける |
+| Windowsで黒い窓が一瞬出る | タスクが `kuda.exe` を起動している、または外部コマンドに `CREATE_NO_WINDOW` が付いていない | タスクの実行ファイルを `kudaw.exe` にし、`tracert` などの子プロセス起動にもフラグを付ける |
+| PowerShellで実行しても何も表示されない | `kudaw.exe` を実行している | 手動の実行には `kuda.exe` を使う |
 | Linuxで ICMP の probe が常に失敗する | 非特権 ping ソケットが不許可 | `net.ipv4.ping_group_range` を確認するか、TCP の probe に切り替える |
 | 完全断の調査がいつも失敗する | クラウドLLMに届かない | `fallback = "local"` が設定されていて、ローカルサーバーが起動しているか確認する |
 
@@ -597,7 +633,7 @@ Windows:
 ```powershell
 Disable-ScheduledTask -TaskName "kuda"                    # 一時停止
 Unregister-ScheduledTask -TaskName "kuda" -Confirm:$false  # 削除
-Remove-Item -Recurse "$env:LOCALAPPDATA\kuda"              # データごと削除する場合
+Remove-Item -Recurse "$env:LOCALAPPDATA\kuda", "$env:APPDATA\kuda"  # データと設定ごと削除する場合
 ```
 
 Linux:
