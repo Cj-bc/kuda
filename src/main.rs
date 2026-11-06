@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod baseline;
 mod collector;
 mod config;
+mod diagnosis;
 mod incident;
 mod logging;
 mod paths;
