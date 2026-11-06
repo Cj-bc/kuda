@@ -1,5 +1,6 @@
 //! config.toml の読み込みと検証。
 
+use crate::trigger::Expr;
 use anyhow::{Context, Result, bail, ensure};
 use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
@@ -218,7 +219,7 @@ impl Default for Baseline {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
-    pub when: String,
+    pub when: Expr,
     #[serde(default = "default_consecutive")]
     pub consecutive: u32,
     #[serde(default = "default_cooldown", deserialize_with = "duration")]
