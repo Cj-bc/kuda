@@ -48,7 +48,8 @@ kuda/
   Cargo.toml
   Cargo.lock
   src/
-    main.rs            # CLI（check / snapshot / diagnose / status / check-config）
+    main.rs            # CLI（check / snapshot / diagnose / status / check-config / check-backends）
+    commands.rs        # 各サブコマンドの本体
     config.rs          # config.toml の読み込みと検証
     paths.rs           # OS別のディレクトリ解決（Linux は XDG）
     probe/             # tcp, icmp, dns, http, command
@@ -59,12 +60,17 @@ kuda/
     incident.rs        # 事件ディレクトリ生成、diff 生成
     diagnosis/         # claude_code, codex, local
     lock.rs            # 多重起動防止
+    detach.rs          # 調査プロセスの切り離し起動
+    process.rs         # 外部コマンドの起動（タイムアウト、窓を出さない）
+    logging.rs         # 日付ローテーションするファイルログ
   prompts/
     network.md
   config.example.toml
+  tests/
+    e2e.rs             # 実バイナリでの通しテスト
 ```
 
-主な依存クレートは `rusqlite`（bundled）、`serde` と `toml`、`clap`、`anyhow`、`fd-lock`、`ureq`（ローカルLLMへのHTTP）です。Windowsでは `windows`（`GetAdaptersAddresses`、`GetIpForwardTable2`、`IcmpSendEcho2`）を、Linuxでは `rtnetlink` か `ip -j` の呼び出しを使います。メモリと起動時間を抑えるため、tokio などの非同期ランタイムは入れず同期実装にします。
+主な依存クレートは `rusqlite`（bundled）、`serde` と `serde_json`、`toml`、`clap`、`anyhow`、`chrono`、`log`、`fd-lock`、`ureq`（ローカルLLMへのHTTP）です。Windowsでは `windows`（`GetAdaptersAddresses`、`GetIpForwardTable2`、`IcmpSendEcho2`）を、Linuxでは `ip -j` の呼び出しと `socket2`（非特権の ping ソケット）を使います。メモリと起動時間を抑えるため、tokio などの非同期ランタイムは入れず同期実装にします。
 
 ### Windowsでコンソール窓を出さない
 
@@ -339,7 +345,7 @@ interval = "5m"
   max_duration = "5m"
 ```
 
-`gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
+`gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。`kind = "tcp"` でポートを省くと ICMP echo で確かめ、通らなければ 53/80/443 への接続を試します（接続拒否も到達可能として扱います）。`gateway:80` のようにポートも指定できます。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
 
 ### prompts/network.md の例
 
@@ -383,11 +389,13 @@ kuda check-config
 claude -p "tracert -d -h 5 1.1.1.1 を実行して結果を要約して" --allowedTools "Bash(tracert:*)" --output-format json
 ```
 
-ハーネスは内部で、おおむね次の形で起動します。`allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read`）だけが追加で許可されます。
+ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。`allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
 
 ```
-claude -p <展開済みプロンプト> --output-format json --max-turns 20 --allowedTools "Read" "Bash(tracert:*)" ...
+claude -p --output-format json --strict-mcp-config --setting-sources project --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
 ```
+
+使えるツールを Read と Bash に絞り、MCP サーバー、ユーザー設定の allow ルールとフックを持ち込みません。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
 
 Windowsでは Claude Code のシェルが Git Bash になるため、`Test-NetConnection` などのPowerShellコマンドレットは `powershell -NoProfile -Command ...` 経由で実行されます。許可ルールもその形に合わせ、`Bash(powershell -NoProfile -Command Test-NetConnection:*)` のように展開してください。
 
@@ -474,7 +482,7 @@ interval = "5m"
   allowed_commands = ["tracert", "traceroute", "ping"]
 ```
 
-`kuda check` を2回実行し、2回目で発火して `reports/test-unreachable/` にレポートができれば成功です。確認後、この watch は削除してください。
+`kuda check --force` を2回実行し（`--force` が無いと `interval` が経つまで2回目の probe は飛ばされます）、2回目で発火して `reports/test-unreachable/` にレポートができれば成功です。確認後、この watch は削除してください。
 
 ## スケジューラ登録
 
