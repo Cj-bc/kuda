@@ -1,5 +1,6 @@
 //! watch の疎通確認。1 回の実行で各ターゲットを 1 度ずつ試す。
 
+mod command;
 mod dns;
 mod http;
 mod tcp;
@@ -91,11 +92,10 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 fn run_target(probe: &Probe, target: &str, gateway: Option<IpAddr>) -> Result<Sample, String> {
     match probe.kind {
         ProbeKind::Tcp => tcp::check(target, gateway, probe.timeout),
+        ProbeKind::Icmp => Err("probe kind is not supported yet".to_string()),
         ProbeKind::Dns => dns::check(target, probe.server.as_deref(), probe.timeout),
         ProbeKind::Http => http::check(target, probe.expect_status, probe.timeout),
-        ProbeKind::Icmp | ProbeKind::Command => {
-            Err("probe kind is not supported yet".to_string())
-        }
+        ProbeKind::Command => command::check(&probe.command, probe.timeout),
     }
 }
 
