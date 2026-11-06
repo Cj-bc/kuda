@@ -3,6 +3,7 @@
 mod command;
 mod dns;
 mod http;
+mod icmp;
 mod tcp;
 
 use crate::collector;
@@ -92,7 +93,10 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 fn run_target(probe: &Probe, target: &str, gateway: Option<IpAddr>) -> Result<Sample, String> {
     match probe.kind {
         ProbeKind::Tcp => tcp::check(target, gateway, probe.timeout),
-        ProbeKind::Icmp => Err("probe kind is not supported yet".to_string()),
+        ProbeKind::Icmp => {
+            let host = expand_gateway(target, gateway)?;
+            icmp::check(&host, probe.timeout)
+        }
         ProbeKind::Dns => dns::check(target, probe.server.as_deref(), probe.timeout),
         ProbeKind::Http => http::check(target, probe.expect_status, probe.timeout),
         ProbeKind::Command => command::check(&probe.command, probe.timeout),
