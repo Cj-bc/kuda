@@ -25,13 +25,16 @@ fn args(incident_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// サンドボックスで強制できない分は指示として伝える
+/// サンドボックスで強制できない分は指示として伝える。Codex はファイルもシェル経由で
+/// 読むので、事件ディレクトリの読み取りは許可リストの外に置く
 fn prompt_with_rules(prompt: &str, allowed_commands: &[String]) -> String {
+    const READ_RULE: &str =
+        "作業ディレクトリのファイルは、シェルの読み取りコマンドで自由に読んでかまいません。";
     if allowed_commands.is_empty() {
-        return format!("{prompt}\n\nコマンドは実行しないでください。");
+        return format!("{prompt}\n\n{READ_RULE}それ以外のコマンドは実行しないでください。");
     }
     format!(
-        "{prompt}\n\n実行してよいコマンドは次のものだけです: {}",
+        "{prompt}\n\n{READ_RULE}それ以外で実行してよいコマンドは次のものだけです: {}",
         allowed_commands.join(", ")
     )
 }
@@ -84,5 +87,6 @@ mod tests {
         let allowed = ["ping".to_string(), "tracert".to_string()];
         assert!(prompt_with_rules("p", &allowed).contains("ping, tracert"));
         assert!(prompt_with_rules("p", &[]).contains("実行しないで"));
+        assert!(prompt_with_rules("p", &allowed).contains("自由に読んで"));
     }
 }
