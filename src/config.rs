@@ -66,6 +66,7 @@ pub struct LocalBackend {
     pub endpoint: String,
     pub model: String,
     #[serde(default)]
+    #[allow(dead_code)] // 値は読まない。analyze_only 以外の指定を拒否するために持つ
     pub mode: LocalMode,
 }
 
