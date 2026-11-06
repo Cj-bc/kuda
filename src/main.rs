@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod config;
 mod logging;
 mod paths;
+mod trigger;
 
 #[derive(Parser)]
 #[command(
