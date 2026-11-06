@@ -6,6 +6,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+mod baseline;
 mod collector;
 mod config;
 mod logging;
