@@ -1,0 +1,48 @@
+[general]
+log_level = "info"
+log_retention_days = 14
+incident_retention_days = 30
+
+# --- LLMバックエンド ---
+[backends.claude_code]
+command = "claude"              # PATH 上に無ければフルパス
+max_turns = 20
+
+[backends.codex]
+command = "codex"
+
+[backends.local]
+endpoint = "http://127.0.0.1:11434/v1"   # Ollama の OpenAI 互換 API
+model = "qwen2.5:7b"
+mode = "analyze_only"          # ツール実行なしで事件ファイルだけを分析
+
+# --- 監視 ---
+[[watch]]
+name = "network-reachability"
+interval = "5m"
+
+  [watch.probe]
+  kind = "tcp"
+  targets = ["1.1.1.1:443", "8.8.8.8:53", "gateway"]
+  timeout = "3s"
+
+  [watch.baseline]
+  metrics_retention = "7d"
+  aggregate_by = "weekday_hour"
+  min_samples = 30                # これ未満の時間帯は全体の統計で代用
+  snapshot_collectors = ["adapters", "routes", "dns_config", "traceroute:1.1.1.1"]
+  snapshot_interval = "6h"
+  keep_good_snapshots = 5
+
+  [watch.trigger]
+  when = "loss >= 0.5 || rtt_p50 > baseline.rtt_p95 * 2"
+  consecutive = 3
+  cooldown = "30m"
+  recover_notify = true
+
+  [watch.diagnose]
+  backend = "claude_code"
+  fallback = "local"
+  prompt_file = "prompts/network.md"
+  allowed_commands = ["tracert", "traceroute", "ping", "ipconfig", "ip", "nslookup", "dig", "Test-NetConnection", "Get-NetAdapter"]
+  max_duration = "5m"
