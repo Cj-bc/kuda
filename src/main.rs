@@ -10,6 +10,7 @@ mod collector;
 mod config;
 mod logging;
 mod paths;
+mod probe;
 mod process;
 mod trigger;
 
