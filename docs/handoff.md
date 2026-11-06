@@ -351,7 +351,7 @@ interval = "5m"
   backend = "claude_code"
   fallback = "local"
   prompt_file = "prompts/network.md"
-  allowed_commands = ["tracert", "traceroute", "ping", "ipconfig", "ip", "nslookup", "dig", "Test-NetConnection", "Get-NetAdapter"]
+  allowed_commands = ["tracert", "traceroute", "ping", "ipconfig", "nslookup", "dig", "Test-NetConnection", "Get-NetAdapter"]
   max_duration = "5m"
 ```
 
