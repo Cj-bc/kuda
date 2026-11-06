@@ -1,6 +1,7 @@
 //! watch の疎通確認。1 回の実行で各ターゲットを 1 度ずつ試す。
 
 mod dns;
+mod http;
 mod tcp;
 
 use crate::collector;
@@ -91,7 +92,8 @@ fn run_target(probe: &Probe, target: &str, gateway: Option<IpAddr>) -> Result<Sa
     match probe.kind {
         ProbeKind::Tcp => tcp::check(target, gateway, probe.timeout),
         ProbeKind::Dns => dns::check(target, probe.server.as_deref(), probe.timeout),
-        ProbeKind::Icmp | ProbeKind::Http | ProbeKind::Command => {
+        ProbeKind::Http => http::check(target, probe.expect_status, probe.timeout),
+        ProbeKind::Icmp | ProbeKind::Command => {
             Err("probe kind is not supported yet".to_string())
         }
     }
