@@ -41,8 +41,13 @@ impl Paths {
             return Ok(Self::single_root(root));
         }
         if windows {
+            // 設定はユーザーに付いて回るもの、それ以外はこの PC に固有のもの
+            let roaming = var("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
             let local = var("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
-            return Ok(Self::single_root(PathBuf::from(local).join("kuda")));
+            return Ok(Self {
+                config_dir: PathBuf::from(roaming).join("kuda"),
+                ..Self::single_root(PathBuf::from(local).join("kuda"))
+            });
         }
 
         let home = var("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
@@ -196,10 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_uses_localappdata() {
-        let paths = resolve(true, &[("LOCALAPPDATA", "/appdata")]).unwrap();
-        let root = Path::new("/appdata").join("kuda");
-        assert_eq!(paths.config_file(), root.join("config.toml"));
+    fn windows_puts_config_in_appdata_and_the_rest_in_localappdata() {
+        let paths = resolve(true, &[("APPDATA", "/roaming"), ("LOCALAPPDATA", "/local")]).unwrap();
+        let root = Path::new("/local").join("kuda");
+        assert_eq!(
+            paths.config_file(),
+            path("/roaming", &["kuda", "config.toml"])
+        );
         assert_eq!(paths.db_file(), root.join("data").join("kuda.db"));
         assert_eq!(paths.lock_file(), root.join("data").join("kuda.lock"));
         assert_eq!(paths.reports_dir, root.join("reports"));
@@ -221,6 +229,8 @@ mod tests {
     fn missing_home_is_an_error() {
         assert!(resolve(false, &[]).is_err());
         assert!(resolve(true, &[]).is_err());
+        assert!(resolve(true, &[("APPDATA", "/roaming")]).is_err());
+        assert!(resolve(true, &[("LOCALAPPDATA", "/local")]).is_err());
     }
 
     #[cfg(unix)]

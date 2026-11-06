@@ -236,17 +236,19 @@ panic = "abort"
 
 ## 配置とディレクトリ構成
 
-設定・データ・ログはユーザー領域に置きます。Linuxでは [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/) に従います。環境変数 `KUDA_HOME` を設定した場合は、OSを問わずその下にすべてをまとめます（Windowsと同じ構成）。
+設定・データ・ログはユーザー領域に置きます。Linuxでは [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/) に従います。環境変数 `KUDA_HOME` を設定した場合は、OSを問わずその下にすべてをまとめます（Windowsの `%LOCALAPPDATA%\kuda` と同じ構成で、設定とプロンプトも直下に置きます）。
 
 | 用途 | Windows | Linux（XDG。括弧内は変数が未設定・空のときの既定値） |
 | --- | --- | --- |
 | バイナリ | `%LOCALAPPDATA%\kuda\bin\kuda.exe`、`kudaw.exe` | Nixプロファイル（`~/.nix-profile/bin/kuda`） |
-| 設定・プロンプト | `%LOCALAPPDATA%\kuda\config.toml`、`prompts\` | `$XDG_CONFIG_HOME/kuda/config.toml`、`prompts/`（`~/.config`） |
+| 設定・プロンプト | `%APPDATA%\kuda\config.toml`、`prompts\` | `$XDG_CONFIG_HOME/kuda/config.toml`、`prompts/`（`~/.config`） |
 | メトリクスDB（SQLite） | `%LOCALAPPDATA%\kuda\data\kuda.db` | `$XDG_STATE_HOME/kuda/kuda.db`（`~/.local/state`） |
 | 事件ディレクトリ | `%LOCALAPPDATA%\kuda\incidents\` | `$XDG_STATE_HOME/kuda/incidents/` |
 | ログ | `%LOCALAPPDATA%\kuda\logs\` | `$XDG_STATE_HOME/kuda/logs/` |
 | レポート | `%LOCALAPPDATA%\kuda\reports\` | `$XDG_DATA_HOME/kuda/reports/`（`~/.local/share`） |
 | ロックファイル | `%LOCALAPPDATA%\kuda\data\kuda.lock` | `$XDG_RUNTIME_DIR/kuda/kuda.lock` |
+
+Windowsでは、ユーザーに付いて回る設定とプロンプトを `%APPDATA%`（Roaming）に、PCに固有のバイナリ・データ・ログを `%LOCALAPPDATA%` に置きます。
 
 Linux側の振り分けの考え方は次のとおりです。
 
@@ -265,23 +267,31 @@ Linux側の振り分けの考え方は次のとおりです。
 
 ### Windows
 
-WSL 上でビルドした成果物を、WSL から Windows 側の `%LOCALAPPDATA%` にコピーします。
+WSL 上でビルドした成果物を、WSL から Windows 側へコピーします。バイナリは `%LOCALAPPDATA%`、設定とプロンプトは `%APPDATA%` に置きます。
 
 ```bash
-# Windows の %LOCALAPPDATA% を WSL のパスに変換
-WINLOCAL=$(wslpath "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')")
-DEST="$WINLOCAL/kuda"
+# Windows の環境変数を WSL のパスに変換
+winpath() { wslpath "$(cmd.exe /c "echo %$1%" 2>/dev/null | tr -d '\r')"; }
+DEST="$(winpath LOCALAPPDATA)/kuda"
+CONF="$(winpath APPDATA)/kuda"
 
 nix build .#kuda-windows
 install -Dm755 result/bin/kuda.exe "$DEST/bin/kuda.exe"
 install -Dm755 result/bin/kudaw.exe "$DEST/bin/kudaw.exe"
 # 初回のみ: 設定例とプロンプトをコピー（以後は手元の編集を上書きしない）
-[ -e "$DEST/config.toml" ] || install -Dm644 result/share/kuda/config.example.toml "$DEST/config.toml"
-mkdir -p "$DEST/prompts"
-cp -rn --no-preserve=mode result/share/kuda/prompts/. "$DEST/prompts/"
+[ -e "$CONF/config.toml" ] || install -Dm644 result/share/kuda/config.example.toml "$CONF/config.toml"
+mkdir -p "$CONF/prompts"
+cp -rn --no-preserve=mode result/share/kuda/prompts/. "$CONF/prompts/"
 ```
 
 更新時は `nix build` と `kuda.exe`、`kudaw.exe` のコピーだけを再実行します。タスクの実行中は exe がロックされてコピーに失敗することがあるので、その場合は数秒おいて再実行してください。
+
+以前のバージョンは設定とプロンプトを `%LOCALAPPDATA%\kuda` に置いていました。自動では引き継がないので、更新前に次のPowerShellで移します。移すまで `kuda` は設定を読めずに失敗します。
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\kuda"
+Move-Item "$env:LOCALAPPDATA\kuda\config.toml", "$env:LOCALAPPDATA\kuda\prompts" "$env:APPDATA\kuda\"
+```
 
 ### Linux
 
@@ -616,7 +626,7 @@ Windows:
 ```powershell
 Disable-ScheduledTask -TaskName "kuda"                    # 一時停止
 Unregister-ScheduledTask -TaskName "kuda" -Confirm:$false  # 削除
-Remove-Item -Recurse "$env:LOCALAPPDATA\kuda"              # データごと削除する場合
+Remove-Item -Recurse "$env:LOCALAPPDATA\kuda", "$env:APPDATA\kuda"  # データと設定ごと削除する場合
 ```
 
 Linux:
