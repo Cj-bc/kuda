@@ -1,16 +1,20 @@
 // リリースビルドではタスク起動のたびにコンソール窓が出ないよう GUI サブシステムにする
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-// 実装途中の間だけ。全サブコマンドが繋がったら外す
-#![allow(dead_code)]
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
+use config::Config;
+use paths::Paths;
+use std::process::ExitCode;
 
 mod baseline;
 mod collector;
+mod commands;
 mod config;
+mod detach;
 mod diagnosis;
 mod incident;
+mod lock;
 mod logging;
 mod paths;
 mod probe;
@@ -72,14 +76,52 @@ enum Command {
     CheckBackends,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
+    let paths = Paths::from_env()?;
+    paths.ensure_dirs()?;
+    logging::init(&paths.logs_dir, cli.verbose)?;
+
+    let config_path = paths.config_file();
+    commands::log_paths(&paths, &config_path);
+    let config = Config::load(&config_path)?;
+    logging::set_level(config.general.log_level, cli.verbose);
+
     match cli.command {
-        Command::Check { .. }
-        | Command::Snapshot { .. }
-        | Command::Diagnose { .. }
-        | Command::Status
-        | Command::CheckConfig
-        | Command::CheckBackends => bail!("not implemented yet"),
+        Command::Check { force } => commands::check(&config, &paths, force),
+        Command::Snapshot { force, watch } => {
+            commands::snapshot(&config, &paths, force, watch.as_deref())
+        }
+        Command::Diagnose {
+            watch,
+            dry_run,
+            backend,
+            incident,
+        } => commands::diagnose(
+            &config,
+            &paths,
+            commands::DiagnoseOptions {
+                watch,
+                dry_run,
+                backend,
+                incident,
+            },
+        ),
+        Command::Status => commands::status(&config, &paths),
+        Command::CheckConfig => commands::check_config(&config, &paths),
+        Command::CheckBackends => commands::check_backends(&config),
+    }
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // ログ初期化前の失敗もあるので、標準エラーにも必ず出す
+            log::error!("{error:#}");
+            if log::max_level() == log::LevelFilter::Off {
+                eprintln!("error: {error:#}");
+            }
+            ExitCode::FAILURE
+        }
     }
 }
