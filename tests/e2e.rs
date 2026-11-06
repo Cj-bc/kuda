@@ -133,7 +133,9 @@ interval = "5m"
   [watch.diagnose]
   backend = "claude_code"
   prompt_file = "prompts/p.md"
-  allowed_commands = ["ping"]
+  [watch.diagnose.allowed_commands]
+  windows = ["ping"]
+  linux = ["ping"]
 "#
     )
 }

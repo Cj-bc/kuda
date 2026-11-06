@@ -361,11 +361,16 @@ interval = "5m"
   backend = "claude_code"
   fallback = "local"
   prompt_file = "prompts/network.md"
-  allowed_commands = ["tracert", "traceroute", "ping", "ipconfig", "nslookup", "dig", "Test-NetConnection", "Get-NetAdapter"]
   max_duration = "5m"
+
+  [watch.diagnose.allowed_commands]
+  windows = ["tracert", "ping", "ipconfig", "nslookup", "Test-NetConnection", "Get-NetAdapter"]
+  linux = ["traceroute", "ping", "nslookup", "dig"]
 ```
 
 `gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。`kind = "tcp"` でポートを省くと ICMP echo で確かめ、通らなければ 53/80/443 への接続を試します（接続拒否も到達可能として扱います）。`gateway:80` のようにポートも指定できます。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
+
+`allowed_commands` は `windows` と `linux` に分けて書き、実行中のOSのリストだけがLLMに渡ります。他のOS向けのコマンドまで許可しないためです。省略したOSでは、コマンドを1つも許可しません。
 
 ### prompts/network.md の例
 
@@ -409,7 +414,7 @@ kuda check-config
 claude -p "tracert -d -h 5 1.1.1.1 を実行して結果を要約して" --allowedTools "Bash(tracert:*)" --output-format json
 ```
 
-ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。`allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
+ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。実行中のOSの `allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
 
 ```
 claude -p --output-format json --strict-mcp-config --setting-sources project --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
@@ -499,7 +504,9 @@ interval = "5m"
   [watch.diagnose]
   backend = "claude_code"
   prompt_file = "prompts/network.md"
-  allowed_commands = ["tracert", "traceroute", "ping"]
+  [watch.diagnose.allowed_commands]
+  windows = ["tracert", "ping"]
+  linux = ["traceroute", "ping"]
 ```
 
 `kuda check --force` を2回実行し（`--force` が無いと `interval` が経つまで2回目の probe は飛ばされます）、2回目で発火して `reports/test-unreachable/` にレポートができれば成功です。確認後、この watch は削除してください。

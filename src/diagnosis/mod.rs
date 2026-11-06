@@ -111,7 +111,7 @@ pub fn investigate(
     let request = Request {
         prompt: &prompt,
         incident_dir: &incident.dir,
-        allowed_commands: &diagnose.allowed_commands,
+        allowed_commands: diagnose.allowed_commands.current(),
         timeout: diagnose.max_duration,
     };
 
@@ -184,7 +184,7 @@ mod tests {
             backend: BackendKind::ClaudeCode,
             fallback,
             prompt_file: "p.md".to_string(),
-            allowed_commands: Vec::new(),
+            allowed_commands: Default::default(),
             max_duration: Duration::from_secs(1),
         }
     }
