@@ -8,6 +8,7 @@ use crate::diagnosis;
 use crate::incident::{self, Evidence, Incident, format_time};
 use crate::lock;
 use crate::logging;
+use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun};
 use crate::process;
@@ -276,6 +277,7 @@ pub struct DiagnoseOptions {
     pub dry_run: bool,
     pub backend: Option<String>,
     pub incident: Option<PathBuf>,
+    pub notify: bool,
 }
 
 pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Result<()> {
@@ -307,7 +309,25 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         println!("an investigation for {} is already running", watch.name);
         return Ok(());
     }
-    let report = diagnosis::investigate(config, paths, diagnose, &incident, override_kind)?;
+    let notify = options.notify && config.general.notify;
+    if notify {
+        notify::send(&Event::Started { watch: &watch.name });
+    }
+    let result = diagnosis::investigate(config, paths, diagnose, &incident, override_kind);
+    if notify {
+        let failed_report = diagnosis::report_path(paths, &incident);
+        notify::send(&match &result {
+            Ok(report) => Event::Finished {
+                watch: &watch.name,
+                report,
+            },
+            Err(_) => Event::Failed {
+                watch: &watch.name,
+                report: failed_report.is_file().then_some(failed_report.as_path()),
+            },
+        });
+    }
+    let report = result?;
     log::info!("{}: report {}", watch.name, report.display());
     println!("report: {}", report.display());
     Ok(())

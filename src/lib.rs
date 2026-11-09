@@ -15,6 +15,7 @@ mod diagnosis;
 mod incident;
 mod lock;
 mod logging;
+mod notify;
 mod paths;
 mod probe;
 mod process;
@@ -66,6 +67,9 @@ enum Command {
         /// Investigate an existing incident directory
         #[arg(long)]
         incident: Option<std::path::PathBuf>,
+        /// Show desktop notifications when the investigation starts and ends
+        #[arg(long)]
+        notify: bool,
     },
     /// Show samples, baselines, snapshots and cooldowns for each watch
     Status,
@@ -95,6 +99,7 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             backend,
             incident,
+            notify,
         } => commands::diagnose(
             &config,
             &paths,
@@ -103,6 +108,7 @@ fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 backend,
                 incident,
+                notify,
             },
         ),
         Command::Status => commands::status(&config, &paths),

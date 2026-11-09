@@ -2,6 +2,7 @@
 log_level = "info"
 log_retention_days = 14
 incident_retention_days = 30
+notify = true                  # 自動で始めた調査の開始と終了をデスクトップ通知で知らせる
 
 # --- LLMバックエンド ---
 [backends.claude_code]

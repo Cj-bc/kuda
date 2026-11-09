@@ -26,6 +26,8 @@ pub struct General {
     pub log_level: LevelFilter,
     pub log_retention_days: u32,
     pub incident_retention_days: u32,
+    /// 自動で始めた調査の開始と終了をデスクトップ通知で知らせる
+    pub notify: bool,
 }
 
 impl Default for General {
@@ -34,6 +36,7 @@ impl Default for General {
             log_level: LevelFilter::Info,
             log_retention_days: 14,
             incident_retention_days: 30,
+            notify: true,
         }
     }
 }

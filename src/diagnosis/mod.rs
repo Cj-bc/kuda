@@ -95,6 +95,13 @@ fn render_report(incident: &Incident, attempts: &[Attempt], body: &str) -> Strin
     text
 }
 
+pub fn report_path(paths: &Paths, incident: &Incident) -> PathBuf {
+    paths
+        .reports_dir
+        .join(&incident.watch)
+        .join(format!("{}.md", incident.id))
+}
+
 /// 調査を実行してレポートを保存し、そのパスを返す。全バックエンドが失敗しても
 /// 失敗の記録をレポートとして残したうえでエラーを返す
 pub fn investigate(
@@ -143,9 +150,8 @@ pub fn investigate(
         }
     }
 
-    let dir = paths.reports_dir.join(&incident.watch);
-    create_private_dir(&dir)?;
-    let path = dir.join(format!("{}.md", incident.id));
+    create_private_dir(&paths.reports_dir.join(&incident.watch))?;
+    let path = report_path(paths, incident);
     let succeeded = body.is_some();
     let body = body.unwrap_or_else(|| "すべてのバックエンドが失敗しました。".to_string());
     std::fs::write(&path, render_report(incident, &attempts, &body))

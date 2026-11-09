@@ -47,7 +47,8 @@ impl Home {
         .unwrap();
         let claude = write_fake_claude(&dir, RESULT_JSON);
         let config = format!(
-            "[backends.claude_code]\ncommand = '{}'\n\n{watch_body}",
+            // テストのたびにデスクトップ通知が出ないようにする
+            "[general]\nnotify = false\n\n[backends.claude_code]\ncommand = '{}'\n\n{watch_body}",
             claude.display()
         );
         std::fs::write(dir.join("config.toml"), config).unwrap();
