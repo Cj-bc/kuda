@@ -319,6 +319,7 @@ cp -rn --no-preserve=mode result/share/kuda/prompts/. "$CONF/prompts/"
 [general]
 log_level = "info"
 log_retention_days = 14
+notify = true                  # 自動で始めた調査の開始と終了をデスクトップ通知で知らせる
 
 # --- LLMバックエンド ---
 [backends.claude_code]
@@ -612,6 +613,12 @@ sysctl net.ipv4.ping_group_range
 - **レポート**: `reports/<watch名>/<日時>.md`。使ったバックエンド、所要時間、実行したコマンドも記録されます
 - **事件ディレクトリ**: `incidents/` の中身はレポートの根拠です。既定で30日分を残します
 - **ログ**: `logs/kuda-<日付>.log`
+
+### 通知
+
+発火して調査が始まったとき、調査が終わったとき、全バックエンドが失敗したときに、デスクトップ通知を出します。Windows はトースト（PowerShell 5.1 経由）で、通知を押すとレポートを開きます。Linux は `notify-send` を使い、本文にレポートのパスを載せます。`notify-send` が無いなど通知を出せないときは、調査は続けたままログに警告を残します。
+
+通知は、発火で切り離して起動した調査だけが出します。手動の `kuda diagnose` でも出したいときは `--notify` を付けます。止めるには `[general]` に `notify = false` を書きます。
 
 ### トラブルシューティング
 
