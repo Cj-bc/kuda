@@ -210,6 +210,8 @@ impl Tree {
     fn prepare(command: &mut Command) -> Self {
         use std::os::unix::process::CommandExt;
         install_signal_handlers();
+        // Ctrl-Z (SIGTSTP) では kuda だけが止まって子のグループは走り続け、再開すると
+        // 壁時計の期限を過ぎているのですぐ時間切れとして止める
         command.process_group(0);
         Tree { slot: None }
     }
