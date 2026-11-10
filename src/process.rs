@@ -523,7 +523,15 @@ mod tests {
         }
 
         let dir = marker_dir("signal-tree");
-        let mut helper = Command::new(std::env::current_exe().unwrap())
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        // SIGTERM を無視する設定で起動された環境でも、ヘルパーではハンドラが入るようにする
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut helper, || {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut helper = helper
             .args([
                 "--exact",
                 "process::tests::stops_commands_when_signalled",
