@@ -173,13 +173,14 @@ extern "C" fn on_terminating_signal(signal: libc::c_int) {
     }
 }
 
-/// SIGINT / SIGTERM / SIGHUP のハンドラを一度だけ入れる。
-/// 既定以外（nohup による無視など）になっているシグナルはそのままにする
+/// SIGINT / SIGTERM / SIGHUP / SIGQUIT のハンドラを一度だけ入れる。
+/// 既定以外（nohup による無視など）になっているシグナルはそのままにする。
+/// SIGQUIT も既定の動作で受け直すので、コアダンプはこれまでどおり残る
 #[cfg(unix)]
 fn install_signal_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
             unsafe {
                 let mut current: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(signal, std::ptr::null(), &mut current) != 0
