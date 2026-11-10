@@ -46,10 +46,21 @@ const KNOWN_GOOD: &str = "
         data TEXT NOT NULL,
         PRIMARY KEY (watch, collector)
     ) WITHOUT ROWID;
+    -- 壊れた行で DB を開けなくならないよう、形の合わない行は読まずに飛ばす。
+    -- SQLite は AND を左から評価するとは限らないので、CASE で順序を決める
     INSERT INTO known_good (watch, collector, ts, data)
         SELECT s.watch, c.key, MAX(s.ts), c.value -> '$.data'
-        FROM snapshots AS s, json_each(s.data, '$.collectors') AS c
-        WHERE json_type(c.value, '$.ok') = 'true'
+        FROM snapshots AS s,
+             json_each(
+                 CASE WHEN NOT json_valid(s.data) THEN '{}'
+                      WHEN json_type(s.data, '$.collectors') = 'object' THEN s.data
+                      ELSE '{}' END,
+                 '$.collectors'
+             ) AS c
+        WHERE CASE WHEN c.type = 'object'
+                   THEN json_type(c.value, '$.ok') = 'true'
+                        AND json_type(c.value, '$.data') IS NOT NULL
+                   ELSE 0 END
         GROUP BY s.watch, c.key;
     ALTER TABLE watch_state ADD COLUMN last_complete_snapshot INTEGER;
 ";
@@ -839,37 +850,49 @@ mod tests {
         assert_eq!(state.last_complete_snapshot, Some(200));
     }
 
+    /// watch `w` の取得履歴に `snapshots` (ts, data の文字列) を記録した、版 2 の DB
+    fn v2_db(name: &str, snapshots: &[(i64, String)]) -> TempDb {
+        let db = TempDb::new(name);
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA_V1} {HIST_BY_AGGREGATION} PRAGMA user_version = 2;"
+        ))
+        .unwrap();
+        for (ts, data) in snapshots {
+            conn.execute(
+                "INSERT INTO snapshots (watch, ts, data) VALUES ('w', ?1, ?2)",
+                params![ts, data],
+            )
+            .unwrap();
+        }
+        db
+    }
+
     #[test]
     fn v2_file_database_is_migrated_to_a_per_collector_baseline() {
-        let db = TempDb::new("v2");
-        {
-            let conn = Connection::open(db.path()).unwrap();
-            conn.execute_batch(&format!(
-                "{SCHEMA_V1} {HIST_BY_AGGREGATION} PRAGMA user_version = 2;"
-            ))
-            .unwrap();
-            // 版 2 では失敗した取得も最新の正常時として保存されていた
-            for (ts, data) in [
+        // 版 2 では失敗した取得も最新の正常時として保存されていた
+        let db = v2_db(
+            "v2",
+            &[
                 (
                     100,
-                    snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" }))),
+                    snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" }))).to_string(),
                 ),
-                (200, snapshot(200, ok(json!({ "n": 2 })), failed())),
-                (300, snapshot(300, failed(), failed())),
-            ] {
-                conn.execute(
-                    "INSERT INTO snapshots (watch, ts, data) VALUES ('w', ?1, ?2)",
-                    params![ts, data.to_string()],
-                )
-                .unwrap();
-            }
-            conn.execute(
+                (
+                    200,
+                    snapshot(200, ok(json!({ "n": 2 })), failed()).to_string(),
+                ),
+                (300, snapshot(300, failed(), failed()).to_string()),
+            ],
+        );
+        Connection::open(db.path())
+            .unwrap()
+            .execute(
                 "INSERT INTO watch_state (watch, last_probe, last_snapshot, streak, active)
                  VALUES ('w', 310, 300, 0, 0)",
                 [],
             )
             .unwrap();
-        }
         let store = db.open();
         assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
         let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
@@ -883,6 +906,41 @@ mod tests {
         assert_eq!(state.last_complete_snapshot, None);
         // 取得履歴はそのまま残る
         assert_eq!(history_count(&store), 3);
+    }
+
+    #[test]
+    fn v2_migration_skips_malformed_snapshots() {
+        let rows = [
+            (100, "not json".to_string()),
+            (110, json!({ "taken_at": 110 }).to_string()),
+            (120, json!({ "collectors": [ok(json!(1))] }).to_string()),
+            (
+                130,
+                json!({ "collectors": { "routes": "ok", "dns_config": { "ok": true } } })
+                    .to_string(),
+            ),
+            (
+                90,
+                snapshot(90, ok(json!({ "n": 1 })), failed()).to_string(),
+            ),
+        ];
+        let db = v2_db("v2-malformed", &rows);
+        let store = db.open();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        // 形の合わない行は基準にせず、正しい行からは引き継ぐ
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 1);
+        assert_eq!(baseline["collectors"]["routes"]["taken_at"], 90);
+        assert!(baseline["collectors"].get("dns_config").is_none());
+        assert_eq!(history_count(&store), 5);
+    }
+
+    #[test]
+    fn v2_database_without_snapshots_is_migrated() {
+        let db = v2_db("v2-empty", &[]);
+        let store = db.open();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        assert!(store.last_known_good("w", &names()).unwrap().is_none());
     }
 
     #[test]
