@@ -26,6 +26,9 @@ fn allow_rule(command: &str, windows: bool) -> String {
 ///   事件ディレクトリの中身は指示ではなく調べる材料なので、それでよい
 /// - 許可されていない操作は確認せず拒否する
 ///
+/// `--setting-sources ""` が何も読まない意味になることは CLI に明記されていないので、
+/// 設定ファイルを無視する `--restricted` も付ける。これを知らない古い CLI は
+/// 未知のオプションとして起動に失敗するので、設定を読んだまま動くことはない。
 /// `--bare` は OAuth のログインを読まなくなるので使わない
 fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<String> {
     let mut args: Vec<String> = [
@@ -33,6 +36,7 @@ fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<Strin
         "--output-format",
         "json",
         "--strict-mcp-config",
+        "--restricted",
         "--setting-sources",
         "",
         "--permission-mode",
@@ -142,6 +146,7 @@ mod tests {
         let args = args(20, &[], false);
         let at = args.iter().position(|arg| arg == "--setting-sources");
         assert_eq!(args.get(at.unwrap() + 1).map(String::as_str), Some(""));
+        assert!(args.iter().any(|arg| arg == "--restricted"));
     }
 
     #[test]
