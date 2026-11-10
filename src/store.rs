@@ -837,6 +837,19 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_at_the_same_second_replaces_the_baseline() {
+        let store = Store::in_memory().unwrap();
+        let first = snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" })));
+        let second = snapshot(100, ok(json!({ "n": 2 })), failed());
+        store.record_snapshot("w", 100, &first, 5).unwrap();
+        store.record_snapshot("w", 100, &second, 5).unwrap();
+        // 同じ秒なら後から記録した方を新しいものとする
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 2);
+        assert_eq!(baseline["collectors"]["dns_config"]["data"]["s"], "a");
+    }
+
+    #[test]
     fn an_earlier_snapshot_finishing_later_does_not_roll_back_the_baseline() {
         let store = Store::in_memory().unwrap();
         let newer = snapshot(200, ok(json!({ "n": 2 })), ok(json!({ "s": "b" })));
