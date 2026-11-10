@@ -258,7 +258,10 @@ mod tests {
                 [ \"$1\" = --output-last-message ] && out=\"$2\"\n\
                 shift\n\
                 done";
-            (dir.join("fake-codex"), format!("#!/bin/sh\n{find}\n{write}\n"))
+            (
+                dir.join("fake-codex"),
+                format!("#!/bin/sh\n{find}\n{write}\n"),
+            )
         };
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]

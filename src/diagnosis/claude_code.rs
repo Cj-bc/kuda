@@ -92,7 +92,9 @@ fn failure_detail(stdout: &str, stderr: &str) -> String {
         .collect();
     if parts.is_empty() {
         // どちらにも手がかりが無ければ、stdout を読めなかった理由だけでも返す
-        return parse_output(stdout).err().map_or_else(String::new, |e| e.to_string());
+        return parse_output(stdout)
+            .err()
+            .map_or_else(String::new, |e| e.to_string());
     }
     parts.join("; ")
 }
