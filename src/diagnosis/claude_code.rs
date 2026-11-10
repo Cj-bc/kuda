@@ -20,9 +20,17 @@ fn allow_rule(command: &str, windows: bool) -> String {
 /// ツールの境界をここで固定する。
 /// - 使えるのは Read と Bash だけで、MCP サーバーも読み込まない
 /// - Read は作業ディレクトリ（事件ディレクトリ）の中に限る
-/// - ユーザー設定の allow ルールとフックを持ち込まない
+/// - 設定は user / project / local のどれも読まない。事件ディレクトリは第三者から
+///   受け取ることもあり、そこの `.claude/settings.json` のフックや allow ルールを
+///   読むと、ここで渡すルールの外でコマンドが動きうる。CLAUDE.md も読まれなくなるが、
+///   事件ディレクトリの中身は指示ではなく調べる材料なので、それでよい
 /// - 許可されていない操作は確認せず拒否する
 ///
+/// `--setting-sources ""` が何も読まない意味になることは CLI に明記されていないので、
+/// 設定ファイルを無視する `--restricted` も付ける。これを知らない古い CLI は
+/// 未知のオプションとして起動に失敗するので、設定を読んだまま動くことはない。
+/// `--restricted` はほかに、ファイル系ツールを作業ディレクトリに閉じ込め、`--tools` に
+/// 無いコード実行ツールを外すが、どちらも上の方針（`Read(./**)` と Read・Bash だけ）と一致する。
 /// `--bare` は OAuth のログインを読まなくなるので使わない
 fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<String> {
     let mut args: Vec<String> = [
@@ -30,8 +38,9 @@ fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<Strin
         "--output-format",
         "json",
         "--strict-mcp-config",
+        "--restricted",
         "--setting-sources",
-        "project",
+        "",
         "--permission-mode",
         "dontAsk",
         "--max-turns",
@@ -69,6 +78,25 @@ fn parse_output(stdout: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
+/// 失敗したときの理由を組み立てる。認証エラーなどは stdout の JSON に入っていることが
+/// 多く、未知のオプションで起動できなかったときなどは stdout が空で stderr にだけ出る
+fn failure_detail(stdout: &str, stderr: &str) -> String {
+    let from_stdout = serde_json::from_str::<Value>(stdout.trim())
+        .ok()
+        .and_then(|_| parse_output(stdout).err())
+        .map(|e| e.to_string());
+    let stderr = stderr.trim();
+    let parts: Vec<String> = from_stdout
+        .into_iter()
+        .chain((!stderr.is_empty()).then(|| stderr.to_string()))
+        .collect();
+    if parts.is_empty() {
+        // どちらにも手がかりが無ければ、stdout を読めなかった理由だけでも返す
+        return parse_output(stdout).err().map_or_else(String::new, |e| e.to_string());
+    }
+    parts.join("; ")
+}
+
 impl Backend for ClaudeCode {
     fn available(&self) -> Result<String, String> {
         process::find_program(&self.0.command)
@@ -93,11 +121,8 @@ impl Backend for ClaudeCode {
             bail!("timed out after {:?}", request.timeout);
         }
         if !output.success() {
-            // 認証エラーなどは stdout の JSON に入っていることが多い
-            let detail = parse_output(&output.stdout)
-                .err()
-                .map_or_else(|| output.stderr.clone(), |e| e.to_string());
-            bail!("exit code {:?}: {}", output.code, detail.trim());
+            let detail = failure_detail(&output.stdout, &output.stderr);
+            bail!("exit code {:?}: {detail}", output.code);
         }
         parse_output(&output.stdout)
     }
@@ -125,14 +150,21 @@ mod tests {
     }
 
     #[test]
-    fn locks_down_tools_and_settings() {
+    fn locks_down_tools() {
         let args = args(20, &strings(&["ping"]), false);
         let joined = args.join(" ");
         assert!(joined.contains("--tools Read Bash --allowedTools Read(./**) Bash(ping:*)"));
         assert!(joined.contains("--max-turns 20"));
         assert!(joined.contains("--permission-mode dontAsk"));
         assert!(joined.contains("--strict-mcp-config"));
-        assert!(joined.contains("--setting-sources project"));
+    }
+
+    #[test]
+    fn loads_no_setting_sources() {
+        let args = args(20, &[], false);
+        let at = args.iter().position(|arg| arg == "--setting-sources");
+        assert_eq!(args.get(at.unwrap() + 1).map(String::as_str), Some(""));
+        assert!(args.iter().any(|arg| arg == "--restricted"));
     }
 
     #[test]
@@ -160,6 +192,25 @@ mod tests {
         let stdout = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#;
         let error = parse_output(stdout).unwrap_err().to_string();
         assert!(error.contains("error_max_turns"));
+    }
+
+    #[test]
+    fn failure_shows_stderr_when_stdout_is_empty() {
+        let detail = failure_detail("", "error: unknown option '--restricted'\n");
+        assert_eq!(detail, "error: unknown option '--restricted'");
+    }
+
+    #[test]
+    fn failure_prefers_the_error_in_stdout() {
+        let stdout = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"not logged in"}"#;
+        let detail = failure_detail(stdout, "");
+        assert!(detail.contains("error_during_execution"), "{detail}");
+        assert!(detail.contains("not logged in"), "{detail}");
+    }
+
+    #[test]
+    fn failure_without_any_clue_explains_the_stdout() {
+        assert_eq!(failure_detail("garbage", ""), "output is not JSON");
     }
 
     #[test]

@@ -418,10 +418,16 @@ claude -p "tracert -d -h 5 1.1.1.1 を実行して結果を要約して" --allow
 ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。実行中のOSの `allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
 
 ```
-claude -p --output-format json --strict-mcp-config --setting-sources project --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
+claude -p --output-format json --strict-mcp-config --restricted --setting-sources "" --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
 ```
 
-使えるツールを Read と Bash に絞り、MCP サーバー、ユーザー設定の allow ルールとフックを持ち込みません。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
+使えるツールを Read と Bash に絞り、次のものを読み込みません。受け取った事件ディレクトリに仕込まれたフックや allow ルール、指示が効かないようにするためです。
+
+- 設定ファイル: ユーザー設定と、事件ディレクトリの `.claude/settings.json`・`.claude/settings.local.json`（フック、allow ルールなど）
+- 事件ディレクトリの `CLAUDE.md`・`.claude/rules`・skills・output style。中身は指示ではなく調べる材料なので、必要なら Read で読みます
+- MCP サーバー: 事件ディレクトリの `.mcp.json` も含め、`--strict-mcp-config` で無視します
+
+`--restricted` は設定ファイルを読まないことを確実にするために付けています。このオプションが無い古い Claude Code では起動時にエラーになるので、その場合は Claude Code を更新してください（2.1.311 で確認）。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
 
 Windowsでは Claude Code のシェルが Git Bash になるため、`Test-NetConnection` などのPowerShellコマンドレットは `powershell -NoProfile -Command ...` 経由で実行されます。許可ルールもその形に合わせ、`Bash(powershell -NoProfile -Command Test-NetConnection:*)` のように展開してください。
 
