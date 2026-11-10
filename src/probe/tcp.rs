@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 const GATEWAY_PORTS: [u16; 3] = [53, 80, 443];
 
 /// 複数アドレスのホストで、次のアドレスへの接続を追加で始めるまでの間隔。
-/// RFC 8305 (Happy Eyeballs) の推奨値
+/// RFC 8305 (Happy Eyeballs) の推奨値。RFC からは試行開始の間隔だけを採用し、
+/// アドレスファミリーの交互並べはしない。どの試行も同じ期限で打ち切られ、
+/// 並べ替えても全体が期限内に収まることは変わらないので、リゾルバの返した順で試す
 const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// `gateway` で ICMP だけを先に試す時間の上限。この間に応答があればポートには触れない
@@ -89,9 +91,10 @@ fn connect(address: SocketAddr, timeout: Duration) -> std::io::Result<f64> {
     Ok(started.elapsed().as_secs_f64() * 1000.0)
 }
 
-/// ポートに依らない ICMP を先に試し、応答が無いときだけ各ポートを同時に試す。
-/// Windows は RST 後も SYN を再送し、閉じたポートの拒否が分かるまで 2 秒ほど
-/// かかるので、ポートには順番に時間を分けず、どれにも残り時間全体を渡す
+/// ポートに依らない ICMP を先に試し、先行時間内に応答が無ければ ICMP を待ち
+/// ながら各ポートも同時に試す。Windows は RST 後も SYN を再送し、閉じたポートの
+/// 拒否が分かるまで 2 秒ほどかかるので、ポートには順番に時間を分けず、どれにも
+/// 残り時間全体を渡す
 fn check_gateway(ip: IpAddr, deadline: Deadline) -> Result<Sample, String> {
     let Some(remaining) = deadline.remaining() else {
         return Err(format!("timed out reaching gateway {ip}"));
