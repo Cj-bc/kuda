@@ -29,6 +29,8 @@ fn allow_rule(command: &str, windows: bool) -> String {
 /// `--setting-sources ""` が何も読まない意味になることは CLI に明記されていないので、
 /// 設定ファイルを無視する `--restricted` も付ける。これを知らない古い CLI は
 /// 未知のオプションとして起動に失敗するので、設定を読んだまま動くことはない。
+/// `--restricted` はほかに、ファイル系ツールを作業ディレクトリに閉じ込め、`--tools` に
+/// 無いコード実行ツールを外すが、どちらも上の方針（`Read(./**)` と Read・Bash だけ）と一致する。
 /// `--bare` は OAuth のログインを読まなくなるので使わない
 fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<String> {
     let mut args: Vec<String> = [
