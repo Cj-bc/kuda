@@ -2,7 +2,7 @@
 
 use crate::probe::{ProbeRun, TargetResult};
 use crate::trigger::TriggerState;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::Path;
@@ -113,12 +113,12 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        Self::init(conn)
+        Self::init(conn, path)
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, Path::new(":memory:"))
     }
 
     /// 版 1 のスキーマで `hist` (watch, series, bucket, bin, count) を記録した DB を開く
@@ -133,15 +133,16 @@ impl Store {
                 params![row.0, row.1, row.2, row.3, row.4],
             )?;
         }
-        Self::init(conn)
+        Self::init(conn, Path::new(":memory:"))
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    /// `path` はエラーメッセージに出すためのもの
+    fn init(conn: Connection, path: &Path) -> Result<Self> {
         // 調査プロセスと次の check が同時に開いても待ち合わせで済むようにする
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let mut store = Self { conn };
-        store.migrate()?;
+        store.migrate(path)?;
         Ok(store)
     }
 
@@ -151,10 +152,11 @@ impl Store {
     }
 
     /// `user_version` の版から最新版まで 1 段ずつ上げる。
-    /// 同時に開いた別プロセスと二重に適用しないよう、版の確認と適用を同じ書き込みトランザクションで行う
-    fn migrate(&mut self) -> Result<()> {
+    /// 同時に開いた別プロセスと二重に適用しないよう、版の確認と適用を同じ書き込みトランザクションで行う。
+    /// 新しい kuda が上げた DB は読み方が分からないので開かない（ダウングレードは非対応）
+    fn migrate(&mut self, path: &Path) -> Result<()> {
         // 最新版なら書き込みロックを取らずに済ませる
-        if Self::version(&self.conn)? >= MIGRATIONS.len() {
+        if Self::version(&self.conn)? == MIGRATIONS.len() {
             return Ok(());
         }
         loop {
@@ -162,11 +164,23 @@ impl Store {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let version = Self::version(&tx)?;
-            let Some(migration) = MIGRATIONS.get(version) else {
+            if version == MIGRATIONS.len() {
                 return Ok(());
+            }
+            let Some(migration) = MIGRATIONS.get(version) else {
+                bail!(
+                    "{} has schema version {version}, but this kuda supports up to {}. \
+                     Update kuda, or move the database aside to start over",
+                    path.display(),
+                    MIGRATIONS.len()
+                );
             };
             tx.execute_batch(migration).with_context(|| {
-                format!("failed to migrate the database to version {}", version + 1)
+                format!(
+                    "failed to migrate {} to schema version {}",
+                    path.display(),
+                    version + 1
+                )
             })?;
             tx.pragma_update(None, "user_version", (version + 1) as i64)?;
             tx.commit()?;
@@ -778,6 +792,24 @@ mod tests {
     fn new_database_is_at_the_latest_version() {
         let store = Store::in_memory().unwrap();
         assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn rejects_a_database_from_a_newer_kuda() {
+        let dir = std::env::temp_dir().join(format!("kuda-store-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kuda.db");
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        let error = Store::open(&path).err().unwrap().to_string();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("Update kuda"), "{error}");
+        // 拒否した DB は書き換えない
+        let version = Store::version(&Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(version, MIGRATIONS.len() + 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

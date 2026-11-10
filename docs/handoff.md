@@ -638,6 +638,7 @@ sysctl net.ipv4.ping_group_range
 | PowerShellで実行しても何も表示されない | `kudaw.exe` を実行している | 手動の実行には `kuda.exe` を使う |
 | Linuxで ICMP の probe が常に失敗する | 非特権 ping ソケットが不許可 | `net.ipv4.ping_group_range` を確認するか、TCP の probe に切り替える |
 | 完全断の調査がいつも失敗する | クラウドLLMに届かない | `fallback = "local"` が設定されていて、ローカルサーバーが起動しているか確認する |
+| `has schema version N, but this kuda supports up to M` で止まる | 新しい kuda で一度開いたメトリクスDBを、古い kuda で開いた | kuda を更新する。ダウングレードは非対応なので、古い版に戻すなら更新前に取ったDBのバックアップに戻すか、DBを退避して作り直す |
 
 ### 一時停止とアンインストール
 
