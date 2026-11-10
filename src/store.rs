@@ -262,12 +262,14 @@ impl Store {
     }
 
     /// last_snapshot だけを更新する。check と snapshot のどちらからも呼ばれるので、
-    /// 他の列は読み込んだ時点の値で上書きしない
+    /// 他の列は読み込んだ時点の値で上書きしない。後から完了した側の収集開始が
+    /// 早いこともあるので、時刻は戻さない
     pub fn set_last_snapshot(&self, watch: &str, ts: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO watch_state (watch, last_snapshot, streak, active)
              VALUES (?1, ?2, 0, 0)
-             ON CONFLICT (watch) DO UPDATE SET last_snapshot = excluded.last_snapshot",
+             ON CONFLICT (watch) DO UPDATE SET last_snapshot =
+                 max(coalesce(last_snapshot, excluded.last_snapshot), excluded.last_snapshot)",
             params![watch, ts],
         )?;
         Ok(())
@@ -410,6 +412,17 @@ mod tests {
             ..WatchState::default()
         };
         assert_eq!(store.load_state("w").unwrap(), expected);
+    }
+
+    #[test]
+    fn last_snapshot_never_moves_backwards() {
+        let store = Store::in_memory().unwrap();
+        // snapshot が 100 に収集を始め、その間に check が 110 で保存し、最後に snapshot が完了する
+        store.set_last_snapshot("w", 110).unwrap();
+        store.set_last_snapshot("w", 100).unwrap();
+        assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(110));
+        store.set_last_snapshot("w", 120).unwrap();
+        assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(120));
     }
 
     fn temp_db(name: &str) -> std::path::PathBuf {
