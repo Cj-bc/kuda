@@ -234,4 +234,51 @@ mod tests {
         assert!(report.contains("local: 成功（2.0 秒）"));
         assert!(report.contains("## 症状"));
     }
+
+    fn paths() -> Paths {
+        let root = PathBuf::from("home");
+        Paths {
+            config_dir: root.clone(),
+            data_dir: root.clone(),
+            incidents_dir: root.join("incidents"),
+            logs_dir: root.join("logs"),
+            reports_dir: root.join("reports"),
+            lock_dir: root,
+            lock_fallback: false,
+        }
+    }
+
+    #[test]
+    fn report_path_stays_under_the_watch_reports_dir() {
+        let path = report_path(&paths(), &incident()).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("home")
+                .join("reports")
+                .join("w")
+                .join("20261106-120000.md")
+        );
+    }
+
+    #[test]
+    fn report_path_rejects_names_that_are_not_one_component() {
+        for (watch, id) in [
+            ("w", "../../escaped"),
+            ("w", "a/b"),
+            ("w", "a\\b"),
+            ("w", ""),
+            ("..", "x"),
+            ("/abs", "x"),
+        ] {
+            let incident = Incident {
+                watch: watch.to_string(),
+                id: id.to_string(),
+                ..incident()
+            };
+            assert!(
+                report_path(&paths(), &incident).is_err(),
+                "{watch:?} {id:?}"
+            );
+        }
+    }
 }
