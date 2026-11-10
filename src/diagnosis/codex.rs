@@ -141,19 +141,33 @@ mod tests {
         assert!(prompt_with_rules("p", &allowed).contains("自由に読んで"));
     }
 
-    /// `--output-last-message` の引数（9 番目）へ `written` を書く偽の codex。
+    /// `--output-last-message` の直後の引数へ `written` を書く偽の codex。
     /// `written` が None なら何も書かず、標準出力に stdout-body を出す
     fn fake_codex(dir: &Path, written: Option<&str>) -> PathBuf {
         let (path, script) = if cfg!(windows) {
             let write = written.map_or("echo stdout-body".to_string(), |text| {
-                format!("(echo {text})> \"%~9\"")
+                format!("(echo {text})> \"%out%\"")
             });
-            (dir.join("fake-codex.cmd"), format!("@echo off\r\n{write}\r\n"))
+            let find = [
+                "@echo off",
+                ":next",
+                "if \"%~1\"==\"\" goto done",
+                "if \"%~1\"==\"--output-last-message\" set \"out=%~2\"",
+                "shift",
+                "goto next",
+                ":done",
+            ]
+            .join("\r\n");
+            (dir.join("fake-codex.cmd"), format!("{find}\r\n{write}\r\n"))
         } else {
             let write = written.map_or("echo stdout-body".to_string(), |text| {
-                format!("echo {text} > \"$9\"")
+                format!("echo {text} > \"$out\"")
             });
-            (dir.join("fake-codex"), format!("#!/bin/sh\n{write}\n"))
+            let find = "while [ $# -gt 0 ]; do\n\
+                [ \"$1\" = --output-last-message ] && out=\"$2\"\n\
+                shift\n\
+                done";
+            (dir.join("fake-codex"), format!("#!/bin/sh\n{find}\n{write}\n"))
         };
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
