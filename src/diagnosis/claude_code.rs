@@ -20,7 +20,10 @@ fn allow_rule(command: &str, windows: bool) -> String {
 /// ツールの境界をここで固定する。
 /// - 使えるのは Read と Bash だけで、MCP サーバーも読み込まない
 /// - Read は作業ディレクトリ（事件ディレクトリ）の中に限る
-/// - ユーザー設定の allow ルールとフックを持ち込まない
+/// - 設定は user / project / local のどれも読まない。事件ディレクトリは第三者から
+///   受け取ることもあり、そこの `.claude/settings.json` のフックや allow ルールを
+///   読むと、ここで渡すルールの外でコマンドが動きうる。CLAUDE.md も読まれなくなるが、
+///   事件ディレクトリの中身は指示ではなく調べる材料なので、それでよい
 /// - 許可されていない操作は確認せず拒否する
 ///
 /// `--bare` は OAuth のログインを読まなくなるので使わない
@@ -31,7 +34,7 @@ fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<Strin
         "json",
         "--strict-mcp-config",
         "--setting-sources",
-        "project",
+        "",
         "--permission-mode",
         "dontAsk",
         "--max-turns",
@@ -132,7 +135,13 @@ mod tests {
         assert!(joined.contains("--max-turns 20"));
         assert!(joined.contains("--permission-mode dontAsk"));
         assert!(joined.contains("--strict-mcp-config"));
-        assert!(joined.contains("--setting-sources project"));
+    }
+
+    #[test]
+    fn loads_no_setting_sources() {
+        let args = args(20, &[], false);
+        let at = args.iter().position(|arg| arg == "--setting-sources");
+        assert_eq!(args.get(at.unwrap() + 1).map(String::as_str), Some(""));
     }
 
     #[test]
