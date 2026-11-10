@@ -261,15 +261,35 @@ impl Store {
         Ok(state.unwrap_or_default())
     }
 
+    /// last_snapshot だけを更新する。check と snapshot のどちらからも呼ばれるので、
+    /// 他の列は読み込んだ時点の値で上書きしない。後から完了した側の収集開始が
+    /// 早いこともあるので、時刻は戻さない
+    pub fn set_last_snapshot(&self, watch: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO watch_state (watch, last_snapshot, streak, active)
+             VALUES (?1, ?2, 0, 0)
+             ON CONFLICT (watch) DO UPDATE SET last_snapshot =
+                 max(coalesce(last_snapshot, excluded.last_snapshot), excluded.last_snapshot)",
+            params![watch, ts],
+        )?;
+        Ok(())
+    }
+
+    /// check が所有する probe と trigger の状態を保存する。`state.last_snapshot` は
+    /// 書かない（snapshot と並行しても巻き戻さないよう、`set_last_snapshot` で更新する）
     pub fn save_state(&self, watch: &str, state: &WatchState) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO watch_state
-             (watch, last_probe, last_snapshot, streak, since, last_fired, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO watch_state (watch, last_probe, streak, since, last_fired, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (watch) DO UPDATE SET
+                 last_probe = excluded.last_probe,
+                 streak = excluded.streak,
+                 since = excluded.since,
+                 last_fired = excluded.last_fired,
+                 active = excluded.active",
             params![
                 watch,
                 state.last_probe,
-                state.last_snapshot,
                 state.trigger.streak,
                 state.trigger.since,
                 state.trigger.last_fired,
@@ -379,19 +399,105 @@ mod tests {
             },
         };
         store.save_state("w", &state).unwrap();
+        store.set_last_snapshot("w", 2).unwrap();
         assert_eq!(store.load_state("w").unwrap(), state);
     }
 
     #[test]
+    fn last_snapshot_alone_creates_default_state() {
+        let store = Store::in_memory().unwrap();
+        store.set_last_snapshot("w", 2).unwrap();
+        let expected = WatchState {
+            last_snapshot: Some(2),
+            ..WatchState::default()
+        };
+        assert_eq!(store.load_state("w").unwrap(), expected);
+    }
+
+    #[test]
+    fn last_snapshot_never_moves_backwards() {
+        let store = Store::in_memory().unwrap();
+        // snapshot が 100 に収集を始め、その間に check が 110 で保存し、最後に snapshot が完了する
+        store.set_last_snapshot("w", 110).unwrap();
+        store.set_last_snapshot("w", 100).unwrap();
+        assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(110));
+        store.set_last_snapshot("w", 120).unwrap();
+        assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(120));
+    }
+
+    /// 別プロセスの代わりに同じファイルを複数の接続で開くための DB。drop で片付ける
+    struct TempDb {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("kuda-store-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn open(&self) -> Store {
+            Store::open(&self.dir.join("kuda.db")).unwrap()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn snapshot_does_not_roll_back_check_state() {
+        // 接続より先に宣言し、接続を閉じてから片付ける
+        let db = TempDb::new("snapshot-race");
+        let snapshot = db.open();
+        let check = db.open();
+
+        // snapshot が収集している間に check が状態を進めて保存し、その後 snapshot が
+        // 完了する。commands::snapshot は収集前に読んだ状態を書き戻さず、
+        // set_last_snapshot だけを呼ぶ
+        let mut checked = check.load_state("w").unwrap();
+        checked.last_probe = Some(10);
+        checked.trigger = TriggerState {
+            streak: 3,
+            since: Some(4),
+            last_fired: Some(5),
+            active: true,
+        };
+        check.save_state("w", &checked).unwrap();
+        snapshot.set_last_snapshot("w", 20).unwrap();
+
+        let state = check.load_state("w").unwrap();
+        assert_eq!(state.last_probe, Some(10));
+        assert_eq!(state.last_snapshot, Some(20));
+        assert_eq!(state.trigger, checked.trigger);
+    }
+
+    #[test]
+    fn check_does_not_roll_back_last_snapshot() {
+        let db = TempDb::new("check-race");
+        let snapshot = db.open();
+        let check = db.open();
+
+        // check が状態を読んだ後に snapshot が完了し、その後で check が保存する
+        let mut state = check.load_state("w").unwrap();
+        snapshot.set_last_snapshot("w", 20).unwrap();
+        state.last_probe = Some(30);
+        check.save_state("w", &state).unwrap();
+
+        let state = snapshot.load_state("w").unwrap();
+        assert_eq!(state.last_probe, Some(30));
+        assert_eq!(state.last_snapshot, Some(20));
+    }
+
+    #[test]
     fn reopening_keeps_data() {
-        let dir = std::env::temp_dir().join(format!("kuda-store-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kuda.db");
-        Store::open(&path)
-            .unwrap()
-            .record_run("w", &run(100, true))
-            .unwrap();
-        assert_eq!(Store::open(&path).unwrap().sample_count("w").unwrap(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
+        let db = TempDb::new("reopen");
+        db.open().record_run("w", &run(100, true)).unwrap();
+        assert_eq!(db.open().sample_count("w").unwrap(), 1);
     }
 }

@@ -107,7 +107,7 @@ fn check_watch(
             let snapshot = collector::take_snapshot(&watch.baseline.snapshot_collectors, now);
             let keep = watch.baseline.keep_good_snapshots;
             store.save_snapshot(&watch.name, now, &snapshot, keep)?;
-            state.last_snapshot = Some(now);
+            store.set_last_snapshot(&watch.name, now)?;
         }
     }
 
@@ -238,9 +238,11 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             println!("{}: no snapshot_collectors configured", watch.name);
             continue;
         }
-        let mut state = store.load_state(&watch.name)?;
+        // check のロックは取らない。check と並行してよいよう、last_snapshot 以外は書かない。
+        // ここで読んだ状態を save_state で書き戻すと、収集中に check が保存した状態を巻き戻す
+        let last_snapshot = store.load_state(&watch.name)?.last_snapshot;
         let now = now();
-        if !force && !is_due(state.last_snapshot, now, watch.baseline.snapshot_interval) {
+        if !force && !is_due(last_snapshot, now, watch.baseline.snapshot_interval) {
             println!("{}: snapshot_interval has not elapsed", watch.name);
             continue;
         }
@@ -253,8 +255,7 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             &snapshot,
             watch.baseline.keep_good_snapshots,
         )?;
-        state.last_snapshot = Some(now);
-        store.save_state(&watch.name, &state)?;
+        store.set_last_snapshot(&watch.name, now)?;
     }
     if failed > 0 {
         bail!("{failed} collector(s) failed");
