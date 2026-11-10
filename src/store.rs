@@ -425,20 +425,41 @@ mod tests {
         assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(120));
     }
 
-    fn temp_db(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuda-store-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("kuda.db")
+    /// 別プロセスの代わりに同じファイルを複数の接続で開くための DB。drop で片付ける
+    struct TempDb {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("kuda-store-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn open(&self) -> Store {
+            Store::open(&self.dir.join("kuda.db")).unwrap()
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
     fn snapshot_does_not_roll_back_check_state() {
-        let path = temp_db("snapshot-race");
-        let snapshot = Store::open(&path).unwrap();
-        let check = Store::open(&path).unwrap();
+        // 接続より先に宣言し、接続を閉じてから片付ける
+        let db = TempDb::new("snapshot-race");
+        let snapshot = db.open();
+        let check = db.open();
 
-        // snapshot が状態を読んで収集している間に、check が状態を進めて保存する
-        let stale = snapshot.load_state("w").unwrap();
+        // snapshot が収集している間に check が状態を進めて保存し、その後 snapshot が
+        // 完了する。commands::snapshot は収集前に読んだ状態を書き戻さず、
+        // set_last_snapshot だけを呼ぶ
         let mut checked = check.load_state("w").unwrap();
         checked.last_probe = Some(10);
         checked.trigger = TriggerState {
@@ -451,19 +472,16 @@ mod tests {
         snapshot.set_last_snapshot("w", 20).unwrap();
 
         let state = check.load_state("w").unwrap();
-        assert_eq!(stale, WatchState::default());
         assert_eq!(state.last_probe, Some(10));
         assert_eq!(state.last_snapshot, Some(20));
         assert_eq!(state.trigger, checked.trigger);
-        drop((snapshot, check));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn check_does_not_roll_back_last_snapshot() {
-        let path = temp_db("check-race");
-        let snapshot = Store::open(&path).unwrap();
-        let check = Store::open(&path).unwrap();
+        let db = TempDb::new("check-race");
+        let snapshot = db.open();
+        let check = db.open();
 
         // check が状態を読んだ後に snapshot が完了し、その後で check が保存する
         let mut state = check.load_state("w").unwrap();
@@ -474,8 +492,6 @@ mod tests {
         let state = snapshot.load_state("w").unwrap();
         assert_eq!(state.last_probe, Some(30));
         assert_eq!(state.last_snapshot, Some(20));
-        drop((snapshot, check));
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

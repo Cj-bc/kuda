@@ -238,7 +238,8 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             println!("{}: no snapshot_collectors configured", watch.name);
             continue;
         }
-        // check のロックは取らない。check と並行してよいよう、last_snapshot 以外は書かない
+        // check のロックは取らない。check と並行してよいよう、last_snapshot 以外は書かない。
+        // ここで読んだ状態を save_state で書き戻すと、収集中に check が保存した状態を巻き戻す
         let last_snapshot = store.load_state(&watch.name)?.last_snapshot;
         let now = now();
         if !force && !is_due(last_snapshot, now, watch.baseline.snapshot_interval) {
