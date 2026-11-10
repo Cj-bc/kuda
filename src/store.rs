@@ -633,11 +633,9 @@ mod tests {
 
     #[test]
     fn v1_file_database_is_migrated_on_open() {
-        let dir = std::env::temp_dir().join(format!("kuda-store-v1-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kuda.db");
+        let db = TempDb::new("v1");
         {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(db.path()).unwrap();
             conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))
                 .unwrap();
             conn.execute(
@@ -647,16 +645,14 @@ mod tests {
             )
             .unwrap();
         }
-        let store = Store::open(&path).unwrap();
+        let store = db.open();
         assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
         assert_eq!(store.hist("w", "rtt", None).unwrap(), [(5, 2)]);
         drop(store);
         // 開き直しても版は進まず、データも変わらない
-        let store = Store::open(&path).unwrap();
+        let store = db.open();
         assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
         assert!(store.v1_hist("w").unwrap().is_some());
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -733,8 +729,12 @@ mod tests {
             Self { dir }
         }
 
+        fn path(&self) -> std::path::PathBuf {
+            self.dir.join("kuda.db")
+        }
+
         fn open(&self) -> Store {
-            Store::open(&self.dir.join("kuda.db")).unwrap()
+            Store::open(&self.path()).unwrap()
         }
     }
 
@@ -796,9 +796,8 @@ mod tests {
 
     #[test]
     fn rejects_a_database_from_a_newer_kuda() {
-        let dir = std::env::temp_dir().join(format!("kuda-store-newer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kuda.db");
+        let db = TempDb::new("newer");
+        let path = db.path();
         Connection::open(&path)
             .unwrap()
             .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
@@ -809,7 +808,6 @@ mod tests {
         // 拒否した DB は書き換えない
         let version = Store::version(&Connection::open(&path).unwrap()).unwrap();
         assert_eq!(version, MIGRATIONS.len() + 1);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
