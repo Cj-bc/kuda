@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -62,7 +62,102 @@ fn lossy(buffer: &Mutex<Vec<u8>>) -> String {
         .unwrap_or_default()
 }
 
-/// 実行して出力を集める。時間切れなら kill し、そこまでの出力を返す
+/// 子プロセスとその子孫をまとめて止めるための入れ物。
+/// Windows はジョブオブジェクト、Unix はプロセスグループで子孫を束ねる
+#[cfg(windows)]
+struct Tree {
+    /// ジョブを作れなかったときは None で、直接の子だけを止める
+    job: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl Tree {
+    fn prepare(_command: &mut Command) -> Self {
+        Tree { job: None }
+    }
+
+    /// ジョブに入れた後に起動された孫もジョブに属する。
+    /// spawn から登録までの間に子が孫を起動すると取りこぼすが、その隙間はごく短い
+    fn attach(&mut self, child: &Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let result = unsafe {
+            CreateJobObjectW(None, windows::core::PCWSTR::null()).and_then(|job| {
+                // kuda が落ちてハンドルが閉じられたときも子孫ごと止まるようにする
+                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let attached = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    size_of_val(&info) as u32,
+                )
+                .and_then(|()| AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())));
+                match attached {
+                    Ok(()) => Ok(job),
+                    Err(error) => {
+                        let _ = CloseHandle(job);
+                        Err(error)
+                    }
+                }
+            })
+        };
+        match result {
+            Ok(job) => self.job = Some(job),
+            Err(error) => log::warn!("failed to put the child in a job object: {error}"),
+        }
+    }
+
+    fn kill(&mut self, child: &mut Child) {
+        if let Some(job) = self.job {
+            let _ = unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) };
+        }
+        let _ = child.kill();
+    }
+}
+
+/// ハンドルを閉じるとジョブに残った子孫も止まる。終了後に居残る孫も片付けることになる
+#[cfg(windows)]
+impl Drop for Tree {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+        }
+    }
+}
+
+#[cfg(unix)]
+struct Tree;
+
+#[cfg(unix)]
+impl Tree {
+    /// 子を新しいプロセスグループの長にする。孫は特に何もしなければ同じグループに入る
+    fn prepare(command: &mut Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        Tree
+    }
+
+    fn attach(&mut self, _child: &Child) {}
+
+    /// 子をまだ回収していないので、グループ ID（= 子の PID）が他に再利用されることはない
+    fn kill(&mut self, child: &mut Child) {
+        if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+    }
+}
+
+/// 実行して出力を集める。時間切れなら子孫ごと kill し、そこまでの出力を返す
 pub fn run(mut command: Command, stdin: Option<&str>, timeout: Duration) -> Result<Output> {
     command
         .stdin(if stdin.is_some() {
@@ -72,9 +167,11 @@ pub fn run(mut command: Command, stdin: Option<&str>, timeout: Duration) -> Resu
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let mut tree = Tree::prepare(&mut command);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {:?}", command.get_program()))?;
+    tree.attach(&child);
 
     if let (Some(mut pipe), Some(text)) = (child.stdin.take(), stdin) {
         let text = text.to_string();
@@ -92,14 +189,15 @@ pub fn run(mut command: Command, stdin: Option<&str>, timeout: Duration) -> Resu
             break (status.code(), false);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            tree.kill(&mut child);
             let _ = child.wait();
             break (None, true);
         }
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    // 孫プロセスがパイプを握っていると EOF が来ないので、join で待ち切らない
+    // 子孫を止めたのでパイプは閉じるはずだが、ジョブやグループから抜けた孫が
+    // パイプを握っていると EOF が来ないので、join で待ち切らない
     let grace = Instant::now() + Duration::from_secs(1);
     while Instant::now() < grace && !(stdout_reader.is_finished() && stderr_reader.is_finished()) {
         std::thread::sleep(Duration::from_millis(10));
@@ -176,6 +274,59 @@ mod tests {
         assert_eq!(output.code, None);
         assert!(output.stdout.contains("partial"));
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    /// 孫プロセスを起動し、孫が「起動した」印を書いたあと、しばらく眠って「期限後」の印を書くコマンド
+    #[cfg(windows)]
+    fn spawns_grandchild(started: &Path, late: &Path) -> Command {
+        use std::os::windows::process::CommandExt;
+        // 外側の cmd が子、内側の cmd が孫。ping で約 4 秒眠る
+        let mut cmd = command("cmd");
+        cmd.raw_arg(format!(
+            "/d /c cmd /d /c \"echo x>\"{}\" & ping -n 5 127.0.0.1 >nul & echo x>\"{}\"\"",
+            started.display(),
+            late.display()
+        ));
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn spawns_grandchild(started: &Path, late: &Path) -> Command {
+        // サブシェルが孫。外側の sh は wait で待つだけ
+        let script = format!(
+            "(touch '{}'; sleep 4; touch '{}') & wait",
+            started.display(),
+            late.display()
+        );
+        shell(&script)
+    }
+
+    #[test]
+    fn kills_grandchildren_on_timeout() {
+        let dir = std::env::temp_dir().join(format!("kuda-process-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        let late = dir.join("late");
+        let _ = std::fs::remove_file(&started);
+        let _ = std::fs::remove_file(&late);
+
+        let begun = Instant::now();
+        let output = run(
+            spawns_grandchild(&started, &late),
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.timed_out);
+        // 孫がパイプを握ったままでも、読み取りの待ちで詰まらずに戻る
+        assert!(begun.elapsed() < Duration::from_millis(3500));
+        assert!(started.exists(), "grandchild did not start before the deadline");
+
+        // 孫が生きていれば印を書くはずの時刻を十分に過ぎるまで待つ
+        std::thread::sleep(Duration::from_secs(7).saturating_sub(begun.elapsed()));
+        let wrote_late = late.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!wrote_late, "grandchild kept running after the timeout");
     }
 
     #[test]
