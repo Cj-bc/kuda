@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn locks_down_tools_and_settings() {
+    fn locks_down_tools() {
         let args = args(20, &strings(&["ping"]), false);
         let joined = args.join(" ");
         assert!(joined.contains("--tools Read Bash --allowedTools Read(./**) Bash(ping:*)"));
