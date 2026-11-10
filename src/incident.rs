@@ -1,10 +1,10 @@
 //! 事件ディレクトリ（現在のスナップショット、正常時との差分、メトリクス）の生成。
 
 use crate::baseline::{SeriesStats, Source};
-use crate::paths::create_private_dir;
+use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +104,14 @@ pub fn load(dir: &Path) -> Result<Incident> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let mut incident: Incident = serde_json::from_str(&text)?;
+    // watch と id はレポートの保存先パスに使う。他人から受け取った事件でも外へ書かせない
+    for (key, value) in [("watch", &incident.watch), ("id", &incident.id)] {
+        ensure!(
+            is_safe_name(value),
+            "{} has an invalid {key}: {value:?}",
+            path.display()
+        );
+    }
     incident.dir = dir.to_path_buf();
     Ok(incident)
 }
@@ -515,6 +523,26 @@ mod tests {
         prune(&root, 30, 91 * 86400).unwrap();
         assert!(!old.dir.exists());
         assert!(recent.dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_names_that_escape_a_directory() {
+        let root = temp_dir("incident-unsafe");
+        std::fs::create_dir_all(&root).unwrap();
+        for (watch, id) in [
+            ("w", "../../escaped"),
+            ("w", "a/b"),
+            ("w", "a\\b"),
+            ("w", ""),
+            ("..", "x"),
+            ("/abs", "x"),
+            ("C:", "x"),
+        ] {
+            let meta = json!({"watch": watch, "id": id, "created": 1000, "since": 900});
+            std::fs::write(root.join(META_FILE), meta.to_string()).unwrap();
+            assert!(load(&root).is_err(), "{watch:?} {id:?}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

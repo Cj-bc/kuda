@@ -14,7 +14,7 @@ use crate::probe::{self, ProbeRun};
 use crate::process;
 use crate::store::{Store, WatchState};
 use crate::trigger::{self, Outcome, Variables};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Local;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -292,6 +292,14 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         Some(dir) => incident::load(dir)?,
         None => manual_incident(paths, watch)?,
     };
+    // 別の watch の事件を、この watch の設定やロックのまま調べない
+    ensure!(
+        incident.watch == watch.name,
+        "incident {} belongs to watch {:?}, not {:?}",
+        incident.dir.display(),
+        incident.watch,
+        watch.name
+    );
     println!("incident: {}", incident.dir.display());
     if options.dry_run {
         return Ok(());
@@ -315,7 +323,7 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
     }
     let result = diagnosis::investigate(config, paths, diagnose, &incident, override_kind);
     if notify {
-        let failed_report = diagnosis::report_path(paths, &incident);
+        let failed_report = diagnosis::report_path(paths, &incident).ok();
         notify::send(&match &result {
             Ok(report) => Event::Finished {
                 watch: &watch.name,
@@ -323,7 +331,7 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
             },
             Err(_) => Event::Failed {
                 watch: &watch.name,
-                report: failed_report.is_file().then_some(failed_report.as_path()),
+                report: failed_report.as_deref().filter(|path| path.is_file()),
             },
         });
     }

@@ -9,8 +9,8 @@ mod local;
 
 use crate::config::{BackendKind, Config, Diagnose};
 use crate::incident::{Incident, format_time};
-use crate::paths::{Paths, create_private_dir};
-use anyhow::{Context, Result, bail};
+use crate::paths::{Paths, create_private_dir, is_safe_name};
+use anyhow::{Context, Result, bail, ensure};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -95,11 +95,18 @@ fn render_report(incident: &Incident, attempts: &[Attempt], body: &str) -> Strin
     text
 }
 
-pub fn report_path(paths: &Paths, incident: &Incident) -> PathBuf {
-    paths
+/// レポートの保存先。watch と id が 1 つのパス要素でなければ reports の外を指しうるので拒む
+pub fn report_path(paths: &Paths, incident: &Incident) -> Result<PathBuf> {
+    ensure!(
+        is_safe_name(&incident.watch) && is_safe_name(&incident.id),
+        "unsafe incident name: watch {:?}, id {:?}",
+        incident.watch,
+        incident.id
+    );
+    Ok(paths
         .reports_dir
         .join(&incident.watch)
-        .join(format!("{}.md", incident.id))
+        .join(format!("{}.md", incident.id)))
 }
 
 /// 調査を実行してレポートを保存し、そのパスを返す。全バックエンドが失敗しても
@@ -111,6 +118,7 @@ pub fn investigate(
     incident: &Incident,
     override_kind: Option<BackendKind>,
 ) -> Result<PathBuf> {
+    let path = report_path(paths, incident)?;
     let prompt_path = paths.config_dir.join(&diagnose.prompt_file);
     let template = std::fs::read_to_string(&prompt_path)
         .with_context(|| format!("failed to read {}", prompt_path.display()))?;
@@ -151,7 +159,6 @@ pub fn investigate(
     }
 
     create_private_dir(&paths.reports_dir.join(&incident.watch))?;
-    let path = report_path(paths, incident);
     let succeeded = body.is_some();
     let body = body.unwrap_or_else(|| "すべてのバックエンドが失敗しました。".to_string());
     std::fs::write(&path, render_report(incident, &attempts, &body))
