@@ -110,7 +110,8 @@ impl Tree {
         };
         match result {
             Ok(job) => self.job = Some(job),
-            // すぐ終わった子は登録が拒否されるが、止める相手もいないので問題ない
+            // すぐ終わった子は登録が拒否される。子自身は止める必要がないので警告はしないが、
+            // ジョブに入る前に子が起動した子孫は止められない（spawn 直後の隙間と同じ既知の制限）
             Err(error) if matches!(child.try_wait(), Ok(Some(_))) => {
                 log::debug!("child exited before joining a job object: {error}");
             }
