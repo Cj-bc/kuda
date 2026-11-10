@@ -1,10 +1,10 @@
 //! 事件ディレクトリ（現在のスナップショット、正常時との差分、メトリクス）の生成。
 
 use crate::baseline::{SeriesStats, Source};
-use crate::paths::create_private_dir;
+use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,7 +38,8 @@ pub struct Evidence<'a> {
     pub stats: &'a [SeriesStats],
     pub history: &'a [MetricRow],
     pub current: &'a Value,
-    pub last_good: Option<&'a (i64, Value)>,
+    /// collector ごとの最後の成功データ（`Store::last_known_good`）
+    pub last_good: Option<&'a Value>,
 }
 
 pub fn format_time(ts: i64) -> String {
@@ -83,15 +84,12 @@ pub fn create(incidents_dir: &Path, evidence: &Evidence, created: i64) -> Result
         std::fs::write(&path, contents).with_context(|| format!("failed to write {name}"))
     };
     write("summary.md", render_summary(evidence, created))?;
-    write(
-        "diff.md",
-        render_diff(evidence.last_good.map(|(_, data)| data), evidence.current),
-    )?;
+    write("diff.md", render_diff(evidence.last_good, evidence.current))?;
     write(
         "current.json",
         serde_json::to_string_pretty(evidence.current)?,
     )?;
-    if let Some((_, data)) = evidence.last_good {
+    if let Some(data) = evidence.last_good {
         write("last_known_good.json", serde_json::to_string_pretty(data)?)?;
     }
     write("metrics.csv", render_metrics(evidence))?;
@@ -99,11 +97,30 @@ pub fn create(incidents_dir: &Path, evidence: &Evidence, created: i64) -> Result
     Ok(incident)
 }
 
+/// create_unique_dir が付ける形の id（時刻と連番）か。英字を通さないので
+/// `-recovered` の回復レポートや Windows の予約名（NUL など）と重ならない
+fn is_incident_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
 pub fn load(dir: &Path) -> Result<Incident> {
     let path = dir.join(META_FILE);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let mut incident: Incident = serde_json::from_str(&text)?;
+    // watch と id はレポートの保存先パスに使う。他人から受け取った事件でも外へ書かせない
+    ensure!(
+        is_safe_name(&incident.watch),
+        "{} has an invalid watch: {:?}",
+        path.display(),
+        incident.watch
+    );
+    ensure!(
+        is_incident_id(&incident.id),
+        "{} has an invalid id: {:?}",
+        path.display(),
+        incident.id
+    );
     incident.dir = dir.to_path_buf();
     Ok(incident)
 }
@@ -184,13 +201,43 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
     }
 
     text.push_str("\n## 最後の正常時スナップショット\n\n");
-    match evidence.last_good {
-        Some((ts, _)) => {
-            let _ = writeln!(text, "{}", format_time(*ts));
-        }
-        None => text.push_str("ありません。\n"),
+    text.push_str("collector ごとに、最後に取得に成功した時点のデータと比べます。\n\n");
+    let mut names = collector_names(evidence.current);
+    if let Some(last_good) = evidence.last_good {
+        names.extend(collector_names(last_good));
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        text.push_str("ありません。\n");
+    }
+    for name in names {
+        let taken_at = evidence
+            .last_good
+            .and_then(|last_good| last_good["collectors"][&name]["taken_at"].as_i64());
+        let time = taken_at.map_or_else(|| "成功した取得がありません".to_string(), format_time);
+        let _ = writeln!(text, "- `{name}`: {time}");
     }
     text
+}
+
+/// 比較基準の取得時刻。collector ごとに異なりうるので、異なれば範囲で示す
+fn baseline_time(last_good: &Value) -> String {
+    let times: Vec<i64> = last_good["collectors"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, entry)| entry["taken_at"].as_i64())
+        .collect();
+    match (times.iter().min(), times.iter().max()) {
+        (Some(first), Some(last)) if first == last => format_time(*first),
+        (Some(first), Some(last)) => format!(
+            "{} 〜 {}（collector ごとに最後に成功した時点）",
+            format_time(*first),
+            format_time(*last)
+        ),
+        _ => "?".to_string(),
+    }
 }
 
 fn render_metrics(evidence: &Evidence) -> String {
@@ -288,9 +335,7 @@ fn render_diff(last_good: Option<&Value>, current: &Value) -> String {
     let _ = writeln!(
         text,
         "基準: {} / 現在: {}\n",
-        last_good["taken_at"]
-            .as_i64()
-            .map_or_else(|| "?".to_string(), format_time),
+        baseline_time(last_good),
         current["taken_at"]
             .as_i64()
             .map_or_else(|| "?".to_string(), format_time),
@@ -309,10 +354,13 @@ fn render_diff(last_good: Option<&Value>, current: &Value) -> String {
             collector_data(current, &name),
         ) else {
             // 片方で取得できていないと全項目が差分に見えるので、1 行にまとめる
-            let error = current["collectors"][&name]["error"]
-                .as_str()
-                .or(last_good["collectors"][&name]["error"].as_str())
-                .unwrap_or("片方のスナップショットに含まれていません");
+            let error = match current["collectors"][&name]["error"].as_str() {
+                Some(error) => error,
+                None if current["collectors"].get(&name).is_none() => {
+                    "現在のスナップショットに含まれていません"
+                }
+                None => "正常時に取得に成功したことがありません",
+            };
             failed.push(format!("- `{name}`: {error}"));
             continue;
         };
@@ -426,6 +474,49 @@ mod tests {
     }
 
     #[test]
+    fn per_collector_baseline_is_compared_with_its_own_time() {
+        // routes は 1 時間前、dns_config は 7 時間前が最後の成功
+        let last_good = json!({ "collectors": {
+            "routes": { "ok": true, "taken_at": 3600, "data": [route("0.0.0.0/0", "192.168.1.1", 10)] },
+            "dns_config": { "ok": true, "taken_at": 0, "data": { "servers": ["192.168.1.1"] } },
+        }});
+        let current = json!({ "taken_at": 7200, "collectors": {
+            "routes": { "ok": true, "data": [route("0.0.0.0/0", "192.168.1.1", 50)] },
+            "dns_config": { "ok": true, "data": { "servers": ["192.168.1.1"] } },
+            "adapters": { "ok": true, "data": [] },
+        }});
+        let diff = render_diff(Some(&last_good), &current);
+        assert!(
+            diff.contains(&format!("{} 〜 {}", format_time(0), format_time(3600))),
+            "{diff}"
+        );
+        assert!(diff.contains("10 ⇒ 50"), "{diff}");
+        assert!(
+            diff.contains("`adapters`: 正常時に取得に成功したことがありません"),
+            "{diff}"
+        );
+
+        let run = run();
+        let evidence = Evidence {
+            last_good: Some(&last_good),
+            ..evidence(&run, &current, &[])
+        };
+        let summary = render_summary(&evidence, 7200);
+        assert!(
+            summary.contains(&format!("- `dns_config`: {}", format_time(0))),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("- `routes`: {}", format_time(3600))),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- `adapters`: 成功した取得がありません"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn missing_baseline_snapshot_is_stated() {
         assert!(render_diff(None, &snapshot(json!([]))).contains("ありません"));
     }
@@ -515,6 +606,28 @@ mod tests {
         prune(&root, 30, 91 * 86400).unwrap();
         assert!(!old.dir.exists());
         assert!(recent.dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_names_unsafe_for_a_report_path() {
+        let root = temp_dir("incident-unsafe");
+        std::fs::create_dir_all(&root).unwrap();
+        for (watch, id) in [
+            ("w", "../../escaped"),
+            ("w", "a/b"),
+            ("w", "a\\b"),
+            ("w", ""),
+            ("w", "20260101-000000-recovered"),
+            ("w", "NUL"),
+            ("..", "20260101-000000"),
+            ("/abs", "20260101-000000"),
+            ("C:", "20260101-000000"),
+        ] {
+            let meta = json!({"watch": watch, "id": id, "created": 1000, "since": 900});
+            std::fs::write(root.join(META_FILE), meta.to_string()).unwrap();
+            assert!(load(&root).is_err(), "{watch:?} {id:?}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

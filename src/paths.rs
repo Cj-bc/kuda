@@ -116,6 +116,14 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("failed to create {}", dir.display()))
 }
 
+/// 1 つのパス要素としてそのまま使える名前か。区切り文字や `..` を通さないよう文字種を絞る
+pub fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

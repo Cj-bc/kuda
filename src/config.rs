@@ -1,5 +1,6 @@
 //! config.toml の読み込みと検証。
 
+use crate::paths::is_safe_name;
 use crate::trigger::Expr;
 use anyhow::{Context, Result, bail, ensure};
 use log::LevelFilter;
@@ -26,6 +27,8 @@ pub struct General {
     pub log_level: LevelFilter,
     pub log_retention_days: u32,
     pub incident_retention_days: u32,
+    /// 自動で始めた調査の開始と終了をデスクトップ通知で知らせる
+    pub notify: bool,
 }
 
 impl Default for General {
@@ -34,6 +37,7 @@ impl Default for General {
             log_level: LevelFilter::Info,
             log_retention_days: 14,
             incident_retention_days: 30,
+            notify: true,
         }
     }
 }
@@ -347,11 +351,7 @@ impl Config {
         for watch in &self.watches {
             // ディレクトリ名と systemd のユニット名にそのまま使うので文字種を絞る
             ensure!(
-                !watch.name.is_empty()
-                    && watch
-                        .name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                is_safe_name(&watch.name),
                 "watch name must be [A-Za-z0-9_-]+: {:?}",
                 watch.name
             );

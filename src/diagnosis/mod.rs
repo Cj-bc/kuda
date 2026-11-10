@@ -9,8 +9,8 @@ mod local;
 
 use crate::config::{BackendKind, Config, Diagnose};
 use crate::incident::{Incident, format_time};
-use crate::paths::{Paths, create_private_dir};
-use anyhow::{Context, Result, bail};
+use crate::paths::{Paths, create_private_dir, is_safe_name};
+use anyhow::{Context, Result, bail, ensure};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 pub struct Request<'a> {
     pub prompt: &'a str,
     pub incident_dir: &'a Path,
+    /// バックエンドが一時ファイルを置くための、kuda が管理するディレクトリ。
+    /// 事件ディレクトリは外から渡されうるので、そこには書かない
+    pub work_dir: &'a Path,
     pub allowed_commands: &'a [String],
     pub timeout: Duration,
 }
@@ -95,6 +98,20 @@ fn render_report(incident: &Incident, attempts: &[Attempt], body: &str) -> Strin
     text
 }
 
+/// レポートの保存先。watch と id が 1 つのパス要素でなければ reports の外を指しうるので拒む
+pub fn report_path(paths: &Paths, incident: &Incident) -> Result<PathBuf> {
+    ensure!(
+        is_safe_name(&incident.watch) && is_safe_name(&incident.id),
+        "unsafe incident name: watch {:?}, id {:?}",
+        incident.watch,
+        incident.id
+    );
+    Ok(paths
+        .reports_dir
+        .join(&incident.watch)
+        .join(format!("{}.md", incident.id)))
+}
+
 /// 調査を実行してレポートを保存し、そのパスを返す。全バックエンドが失敗しても
 /// 失敗の記録をレポートとして残したうえでエラーを返す
 pub fn investigate(
@@ -104,6 +121,7 @@ pub fn investigate(
     incident: &Incident,
     override_kind: Option<BackendKind>,
 ) -> Result<PathBuf> {
+    let path = report_path(paths, incident)?;
     let prompt_path = paths.config_dir.join(&diagnose.prompt_file);
     let template = std::fs::read_to_string(&prompt_path)
         .with_context(|| format!("failed to read {}", prompt_path.display()))?;
@@ -111,6 +129,7 @@ pub fn investigate(
     let request = Request {
         prompt: &prompt,
         incident_dir: &incident.dir,
+        work_dir: &paths.data_dir,
         allowed_commands: diagnose.allowed_commands.current(),
         timeout: diagnose.max_duration,
     };
@@ -143,9 +162,7 @@ pub fn investigate(
         }
     }
 
-    let dir = paths.reports_dir.join(&incident.watch);
-    create_private_dir(&dir)?;
-    let path = dir.join(format!("{}.md", incident.id));
+    create_private_dir(&paths.reports_dir.join(&incident.watch))?;
     let succeeded = body.is_some();
     let body = body.unwrap_or_else(|| "すべてのバックエンドが失敗しました。".to_string());
     std::fs::write(&path, render_report(incident, &attempts, &body))
@@ -220,5 +237,52 @@ mod tests {
         assert!(report.contains("claude_code: 失敗: not available（1.5 秒）"));
         assert!(report.contains("local: 成功（2.0 秒）"));
         assert!(report.contains("## 症状"));
+    }
+
+    fn paths() -> Paths {
+        let root = PathBuf::from("home");
+        Paths {
+            config_dir: root.clone(),
+            data_dir: root.clone(),
+            incidents_dir: root.join("incidents"),
+            logs_dir: root.join("logs"),
+            reports_dir: root.join("reports"),
+            lock_dir: root,
+            lock_fallback: false,
+        }
+    }
+
+    #[test]
+    fn report_path_stays_under_the_watch_reports_dir() {
+        let path = report_path(&paths(), &incident()).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("home")
+                .join("reports")
+                .join("w")
+                .join("20261106-120000.md")
+        );
+    }
+
+    #[test]
+    fn report_path_rejects_names_that_are_not_one_component() {
+        for (watch, id) in [
+            ("w", "../../escaped"),
+            ("w", "a/b"),
+            ("w", "a\\b"),
+            ("w", ""),
+            ("..", "x"),
+            ("/abs", "x"),
+        ] {
+            let incident = Incident {
+                watch: watch.to_string(),
+                id: id.to_string(),
+                ..incident()
+            };
+            assert!(
+                report_path(&paths(), &incident).is_err(),
+                "{watch:?} {id:?}"
+            );
+        }
     }
 }

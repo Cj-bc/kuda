@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// 切り離した調査は誰も画面で見ていないので、通知を求める（設定で切っていれば出ない）
 fn diagnose_command(program: &Path, watch: &str, incident_dir: &Path) -> Vec<String> {
     vec![
         program.display().to_string(),
@@ -15,6 +16,7 @@ fn diagnose_command(program: &Path, watch: &str, incident_dir: &Path) -> Vec<Str
         watch.to_string(),
         "--incident".to_string(),
         incident_dir.display().to_string(),
+        "--notify".to_string(),
     ]
 }
 
@@ -126,7 +128,15 @@ mod tests {
         let argv = diagnose_command(Path::new("kuda"), "w", Path::new("incident"));
         assert_eq!(
             argv,
-            ["kuda", "diagnose", "--watch", "w", "--incident", "incident"]
+            [
+                "kuda",
+                "diagnose",
+                "--watch",
+                "w",
+                "--incident",
+                "incident",
+                "--notify"
+            ]
         );
     }
 

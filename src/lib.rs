@@ -15,6 +15,7 @@ mod diagnosis;
 mod incident;
 mod lock;
 mod logging;
+mod notify;
 mod paths;
 mod probe;
 mod process;
@@ -44,9 +45,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Take snapshots and store them as last_known_good
+    /// Take snapshots and store each successful collector as last_known_good
     Snapshot {
-        /// Ignore snapshot_interval
+        /// Ignore snapshot_interval and the retry interval
         #[arg(long)]
         force: bool,
         /// Limit to one watch
@@ -66,6 +67,9 @@ enum Command {
         /// Investigate an existing incident directory
         #[arg(long)]
         incident: Option<std::path::PathBuf>,
+        /// Show desktop notifications when the investigation starts and ends
+        #[arg(long)]
+        notify: bool,
     },
     /// Show samples, baselines, snapshots and cooldowns for each watch
     Status,
@@ -95,6 +99,7 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
             backend,
             incident,
+            notify,
         } => commands::diagnose(
             &config,
             &paths,
@@ -103,6 +108,7 @@ fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 backend,
                 incident,
+                notify,
             },
         ),
         Command::Status => commands::status(&config, &paths),

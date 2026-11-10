@@ -47,7 +47,8 @@ impl Home {
         .unwrap();
         let claude = write_fake_claude(&dir, RESULT_JSON);
         let config = format!(
-            "[backends.claude_code]\ncommand = '{}'\n\n{watch_body}",
+            // テストのたびにデスクトップ通知が出ないようにする
+            "[general]\nnotify = false\n\n[backends.claude_code]\ncommand = '{}'\n\n{watch_body}",
             claude.display()
         );
         std::fs::write(dir.join("config.toml"), config).unwrap();
@@ -282,4 +283,68 @@ fn invalid_config_fails_with_a_message() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid config"), "{stderr}");
+}
+
+/// 事件ディレクトリを作り、incident.json の watch と id を差し替える
+fn tampered_incident(home: &Home, watch: &str, id: &str) -> PathBuf {
+    let dir = home.dir.join("received");
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = format!(r#"{{"watch":"{watch}","id":"{id}","created":1000,"since":900}}"#);
+    std::fs::write(dir.join("incident.json"), meta).unwrap();
+    dir
+}
+
+#[test]
+fn incident_names_cannot_escape_the_reports_dir() {
+    let home = Home::new("escape", &failing_watch(closed_port(), 2));
+    let dir = tampered_incident(&home, "test-unreachable", "../../escaped");
+    let output = home.kuda(&[
+        "diagnose",
+        "--watch",
+        "test-unreachable",
+        "--incident",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(!home.dir.join("escaped.md").exists());
+    assert!(home.files_under("reports").is_empty());
+}
+
+#[test]
+fn incident_of_another_watch_is_rejected() {
+    let home = Home::new("mismatch", &failing_watch(closed_port(), 2));
+    let dir = tampered_incident(&home, "other", "20260101-000000");
+    let output = home.kuda(&[
+        "diagnose",
+        "--watch",
+        "test-unreachable",
+        "--incident",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("belongs to watch"), "{stderr}");
+    assert!(home.files_under("reports").is_empty());
+}
+
+#[test]
+fn existing_incident_can_be_investigated_again() {
+    let home = Home::new("rediagnose", &failing_watch(closed_port(), 2));
+    assert_success(&home.kuda(&["diagnose", "--watch", "test-unreachable", "--dry-run"]));
+    let meta = home
+        .files_under("incidents")
+        .into_iter()
+        .find(|path| path.ends_with("incident.json"))
+        .expect("no incident was created");
+    let output = home.kuda(&[
+        "diagnose",
+        "--watch",
+        "test-unreachable",
+        "--incident",
+        meta.parent().unwrap().to_str().unwrap(),
+    ]);
+    assert_success(&output);
+    let report = home.wait_for_report().expect("no report was written");
+    let text = std::fs::read_to_string(report).unwrap();
+    assert!(text.contains("fake-report-body"), "{text}");
 }

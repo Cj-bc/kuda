@@ -8,12 +8,13 @@ use crate::diagnosis;
 use crate::incident::{self, Evidence, Incident, format_time};
 use crate::lock;
 use crate::logging;
+use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun};
 use crate::process;
 use crate::store::{Store, WatchState};
 use crate::trigger::{self, Outcome, Variables};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Local;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,29 @@ fn is_due(last: Option<i64>, now: i64, interval: Duration) -> bool {
     };
     let interval = interval.as_secs() as i64;
     now - last >= interval - (interval / 10).min(30)
+}
+
+/// collector が失敗した取得の後は、snapshot_interval を待たずにこの間隔で取り直す
+const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// スナップショットを取る時期か。最後の取得で全 collector が成功していれば snapshot_interval、
+/// 失敗した collector があれば再試行の間隔（snapshot_interval が短ければそちら）を、
+/// 最後の取得から空ける
+fn is_snapshot_due(state: &WatchState, now: i64, interval: Duration) -> bool {
+    let wait = if state.last_snapshot_complete == Some(true) {
+        interval
+    } else {
+        interval.min(SNAPSHOT_RETRY_INTERVAL)
+    };
+    is_due(state.last_snapshot, now, wait)
+}
+
+/// スナップショットを取り、取得履歴と比較基準に記録する
+fn take_snapshot(store: &Store, watch: &Watch, now: i64) -> Result<Value> {
+    let snapshot = collector::take_snapshot(&watch.baseline.snapshot_collectors, now);
+    let keep = watch.baseline.keep_good_snapshots;
+    store.record_snapshot(&watch.name, now, &snapshot, keep)?;
+    Ok(snapshot)
 }
 
 pub fn check(config: &Config, paths: &Paths, force: bool) -> Result<()> {
@@ -101,12 +125,10 @@ fn check_watch(
     let healthy = !matched && metrics["loss"] < 1.0;
     if healthy {
         baseline::update(store, &watch.name, &watch.baseline, &metrics, now)?;
-        let due = is_due(state.last_snapshot, now, watch.baseline.snapshot_interval);
-        if due && !watch.baseline.snapshot_collectors.is_empty() {
-            let snapshot = collector::take_snapshot(&watch.baseline.snapshot_collectors, now);
-            let keep = watch.baseline.keep_good_snapshots;
-            store.save_snapshot(&watch.name, now, &snapshot, keep)?;
-            state.last_snapshot = Some(now);
+        if is_snapshot_due(&state, now, watch.baseline.snapshot_interval)
+            && !watch.baseline.snapshot_collectors.is_empty()
+        {
+            take_snapshot(store, watch, now)?;
         }
     }
 
@@ -170,7 +192,13 @@ fn build_incident(
 ) -> Result<Incident> {
     let created = now();
     let current = collector::take_snapshot(&watch.baseline.snapshot_collectors, created);
-    let last_good = store.last_known_good(&watch.name)?;
+    let collectors: Vec<String> = watch
+        .baseline
+        .snapshot_collectors
+        .iter()
+        .map(|spec| spec.name())
+        .collect();
+    let last_good = store.last_known_good(&watch.name, &collectors)?;
     let history = store.recent_metrics(&watch.name, INCIDENT_HISTORY_RUNS)?;
     let evidence = Evidence {
         watch: &watch.name,
@@ -237,23 +265,20 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             println!("{}: no snapshot_collectors configured", watch.name);
             continue;
         }
-        let mut state = store.load_state(&watch.name)?;
+        // check のロックは取らない。check と並行してよいよう、スナップショットの記録以外は
+        // 書かない。ここで読んだ状態を save_state で書き戻すと、収集中に check が保存した状態を巻き戻す
+        let state = store.load_state(&watch.name)?;
         let now = now();
-        if !force && !is_due(state.last_snapshot, now, watch.baseline.snapshot_interval) {
-            println!("{}: snapshot_interval has not elapsed", watch.name);
+        if !force && !is_snapshot_due(&state, now, watch.baseline.snapshot_interval) {
+            println!(
+                "{}: not due yet (snapshot_interval, or the retry interval after a failure)",
+                watch.name
+            );
             continue;
         }
-        let snapshot = collector::take_snapshot(collectors, now);
+        let snapshot = take_snapshot(&store, watch, now)?;
         print_collectors(&watch.name, &snapshot);
         failed += collector::failed_collectors(&snapshot).len();
-        store.save_snapshot(
-            &watch.name,
-            now,
-            &snapshot,
-            watch.baseline.keep_good_snapshots,
-        )?;
-        state.last_snapshot = Some(now);
-        store.save_state(&watch.name, &state)?;
     }
     if failed > 0 {
         bail!("{failed} collector(s) failed");
@@ -276,6 +301,7 @@ pub struct DiagnoseOptions {
     pub dry_run: bool,
     pub backend: Option<String>,
     pub incident: Option<PathBuf>,
+    pub notify: bool,
 }
 
 pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Result<()> {
@@ -290,6 +316,14 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         Some(dir) => incident::load(dir)?,
         None => manual_incident(paths, watch)?,
     };
+    // 別の watch の事件を、この watch の設定やロックのまま調べない
+    ensure!(
+        incident.watch == watch.name,
+        "incident {} belongs to watch {:?}, not {:?}",
+        incident.dir.display(),
+        incident.watch,
+        watch.name
+    );
     println!("incident: {}", incident.dir.display());
     if options.dry_run {
         return Ok(());
@@ -307,7 +341,25 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         println!("an investigation for {} is already running", watch.name);
         return Ok(());
     }
-    let report = diagnosis::investigate(config, paths, diagnose, &incident, override_kind)?;
+    let notify = options.notify && config.general.notify;
+    if notify {
+        notify::send(&Event::Started { watch: &watch.name });
+    }
+    let result = diagnosis::investigate(config, paths, diagnose, &incident, override_kind);
+    if notify {
+        let failed_report = diagnosis::report_path(paths, &incident).ok();
+        notify::send(&match &result {
+            Ok(report) => Event::Finished {
+                watch: &watch.name,
+                report,
+            },
+            Err(_) => Event::Failed {
+                watch: &watch.name,
+                report: failed_report.as_deref().filter(|path| path.is_file()),
+            },
+        });
+    }
+    let report = result?;
     log::info!("{}: report {}", watch.name, report.display());
     println!("report: {}", report.display());
     Ok(())
@@ -331,11 +383,29 @@ pub fn status(config: &Config, paths: &Paths) -> Result<()> {
         print_probe_status(&store, watch, &state)?;
         let stats = baseline::stats(&store, &watch.name, &watch.baseline, now())?;
         print_baseline(&stats);
-        let last_snapshot = state.last_snapshot.map_or("none".to_string(), format_time);
-        println!("  last snapshot: {last_snapshot}");
+        println!("  last snapshot: {}", snapshot_status(&state));
         print_trigger_status(watch, &state, now());
     }
     Ok(())
+}
+
+/// 最後の取得時刻と、そのとき失敗した collector があったか。
+/// 成否の記録が無いとき（版 3 へ上げた直後）は、失敗とは言い切らない
+fn snapshot_status(state: &WatchState) -> String {
+    let Some(last) = state.last_snapshot else {
+        return "none".to_string();
+    };
+    match state.last_snapshot_complete {
+        Some(true) => format_time(last),
+        Some(false) => format!(
+            "{} (some collectors failed; last complete: {})",
+            format_time(last),
+            state
+                .last_complete_snapshot
+                .map_or("none".to_string(), format_time)
+        ),
+        None => format!("{} (no complete snapshot recorded yet)", format_time(last)),
+    }
 }
 
 fn print_probe_status(store: &Store, watch: &Watch, state: &WatchState) -> Result<()> {
@@ -481,6 +551,95 @@ mod tests {
         assert!(is_due(Some(1000), 1299, interval));
         assert!(is_due(Some(1000), 1270, interval));
         assert!(!is_due(Some(1000), 1269, interval));
+    }
+
+    /// 最後の取得の成否は、全 collector が成功した時刻と一致するかで決める。
+    /// 成功した時刻が無ければ、版 3 へ上げた直後の成否不明とする
+    fn snapshot_state(last: Option<i64>, complete: Option<i64>) -> WatchState {
+        WatchState {
+            last_snapshot: last,
+            last_complete_snapshot: complete,
+            last_snapshot_complete: complete.map(|complete| Some(complete) == last),
+            ..WatchState::default()
+        }
+    }
+
+    #[test]
+    fn failure_at_the_same_second_as_a_success_is_retried() {
+        let interval = Duration::from_secs(6 * 3600);
+        // 同じ秒に始めた成功と失敗の取得が重なり、時刻は全 collector の成功と一致している
+        let state = WatchState {
+            last_snapshot_complete: Some(false),
+            ..snapshot_state(Some(100), Some(100))
+        };
+        assert!(is_snapshot_due(&state, 100 + 1800, interval));
+        let status = snapshot_status(&state);
+        assert!(status.contains("some collectors failed"), "{status}");
+    }
+
+    #[test]
+    fn snapshot_status_tells_failures_from_unknown() {
+        assert_eq!(snapshot_status(&snapshot_state(None, None)), "none");
+        assert_eq!(
+            snapshot_status(&snapshot_state(Some(100), Some(100))),
+            format_time(100)
+        );
+        let failed = snapshot_status(&snapshot_state(Some(200), Some(100)));
+        assert!(failed.contains("some collectors failed"), "{failed}");
+        assert!(failed.contains(&format_time(100)), "{failed}");
+        // 版 3 へ上げた直後は成否の記録が無いので、失敗とは表示しない
+        let unknown = snapshot_status(&snapshot_state(Some(200), None));
+        assert!(!unknown.contains("failed"), "{unknown}");
+        assert!(
+            unknown.contains("no complete snapshot recorded yet"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn complete_snapshot_waits_for_the_full_interval() {
+        let interval = Duration::from_secs(6 * 3600);
+        let state = snapshot_state(Some(0), Some(0));
+        assert!(!is_snapshot_due(&state, 3 * 3600, interval));
+        assert!(is_snapshot_due(&state, 6 * 3600, interval));
+    }
+
+    #[test]
+    fn failed_snapshot_is_retried_sooner() {
+        let interval = Duration::from_secs(6 * 3600);
+        // 0 に全 collector が成功し、6 時間後の取得で一部が失敗した
+        let state = snapshot_state(Some(6 * 3600), Some(0));
+        assert!(!is_snapshot_due(&state, 6 * 3600 + 600, interval));
+        assert!(is_snapshot_due(&state, 6 * 3600 + 1800, interval));
+        // 一度も全 collector が成功していなくても、毎回の check で取り直しはしない
+        let never = snapshot_state(Some(100), None);
+        assert!(!is_snapshot_due(&never, 400, interval));
+        assert!(is_snapshot_due(&never, 1900, interval));
+        assert!(is_snapshot_due(&snapshot_state(None, None), 0, interval));
+    }
+
+    #[test]
+    fn early_forced_failure_is_retried_without_waiting_for_the_interval() {
+        let interval = Duration::from_secs(6 * 3600);
+        // 0 に全 collector が成功し、1 時間後の snapshot --force で一部が失敗した
+        let state = snapshot_state(Some(3600), Some(0));
+        assert!(!is_snapshot_due(&state, 3600 + 600, interval));
+        assert!(is_snapshot_due(&state, 3600 + 1800, interval));
+    }
+
+    #[test]
+    fn early_forced_success_restarts_the_interval() {
+        let interval = Duration::from_secs(6 * 3600);
+        let state = snapshot_state(Some(3600), Some(3600));
+        assert!(!is_snapshot_due(&state, 6 * 3600, interval));
+        assert!(is_snapshot_due(&state, 7 * 3600, interval));
+    }
+
+    #[test]
+    fn retry_never_waits_longer_than_the_interval() {
+        let interval = Duration::from_secs(600);
+        let state = snapshot_state(Some(1000), Some(0));
+        assert!(is_snapshot_due(&state, 1600, interval));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 1. 設定ファイルを読み、各 watch の probe（TCP/ICMP/DNS など）を実行する
 2. 結果をSQLiteに記録し、統計ベースラインを更新する
-3. 正常時で、前回の取得から `snapshot_interval` 以上経っていれば、スナップショットを取って `last_known_good` として保存する
+3. 正常時で、前回の取得から `snapshot_interval` 以上経っていれば、スナップショットを取り、取得に成功した collector の分を `last_known_good` として保存する（失敗した collector があれば 30 分後に取り直す）
 4. トリガー条件（連続回数・クールダウン込み）を判定する
 5. 発火した場合は、事件ディレクトリ（現在のスナップショット、正常時との差分、メトリクス）を生成し、調査プロセスを切り離して起動したうえで自身は即終了する
 
@@ -319,6 +319,7 @@ cp -rn --no-preserve=mode result/share/kuda/prompts/. "$CONF/prompts/"
 [general]
 log_level = "info"
 log_retention_days = 14
+notify = true                  # 自動で始めた調査の開始と終了をデスクトップ通知で知らせる
 
 # --- LLMバックエンド ---
 [backends.claude_code]
@@ -370,6 +371,10 @@ interval = "5m"
 
 `gateway` は、実行時のデフォルトゲートウェイに置き換えられる特別なターゲットです。`kind = "tcp"` でポートを省くと ICMP echo で確かめ、通らなければ 53/80/443 への接続を試します（接続拒否も到達可能として扱います）。`gateway:80` のようにポートも指定できます。ベースラインの `rtt_p95` は、データが貯まるまで（`min_samples` 未満の間）条件式で使えません。最初の数日は `loss` 系の条件だけが効きます。
 
+スナップショットの比較基準（`last_known_good`）は collector ごとに持ち、取得に成功した collector の分だけを置き換えます。失敗した collector は、前回までに成功したときのデータを比較基準に使い続けます。一部の collector が失敗した場合は `snapshot_interval` を待たず、30 分後（`snapshot_interval` がそれより短ければその間隔）に取り直します。全 collector が成功するまで、この間隔で再試行を続けます。`keep_good_snapshots` は失敗を含む取得履歴の保持件数で、比較基準はこの件数に関わらず残ります。
+
+`kind = "command"` のプローブや調査バックエンドなどの外部コマンドは、起動した子孫プロセスごと管理されます。時間切れのときだけでなく正常に終了したときも、残っている子孫は止められます。バックグラウンドで起動したプロセスも止まります。ただし、自分でプロセスグループやジョブを抜けたプロセス（`setsid` や二重 fork によるデーモンなど）は対象外です。
+
 `allowed_commands` は `windows` と `linux` に分けて書き、実行中のOSのリストだけがLLMに渡ります。他のOS向けのコマンドまで許可しないためです。省略したOSでは、コマンドを1つも許可しません。
 
 ### prompts/network.md の例
@@ -380,7 +385,7 @@ interval = "5m"
 あなたはこのPCのネットワーク障害を調査する担当です。
 
 調査材料は {{incident_dir}} にあります。まず summary.md と diff.md を読んでください。
-- current.json / last_known_good.json: 異常時と最後の正常時のスナップショット
+- current.json / last_known_good.json: 異常時と最後の正常時のスナップショット（正常時は collector ごとに最後に成功した時点）
 - metrics.csv: 直近の probe 結果と同時間帯のベースライン
 
 必要に応じて読み取り専用のコマンドで追加調査してください。
@@ -417,10 +422,16 @@ claude -p "tracert -d -h 5 1.1.1.1 を実行して結果を要約して" --allow
 ハーネスは内部で、事件ディレクトリを作業ディレクトリにして次の形で起動します。実行中のOSの `allowed_commands` が `--allowedTools` に変換され、事件ディレクトリの読み取り（`Read(./**)`）だけが追加で許可されます。プロンプトは標準入力で渡します。
 
 ```
-claude -p --output-format json --strict-mcp-config --setting-sources project --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
+claude -p --output-format json --strict-mcp-config --restricted --setting-sources "" --permission-mode dontAsk --max-turns 20 --tools Read Bash --allowedTools "Read(./**)" "Bash(tracert:*)" ...
 ```
 
-使えるツールを Read と Bash に絞り、MCP サーバー、ユーザー設定の allow ルールとフックを持ち込みません。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
+使えるツールを Read と Bash に絞り、次のものを読み込みません。受け取った事件ディレクトリに仕込まれたフックや allow ルール、指示が効かないようにするためです。
+
+- 設定ファイル: ユーザー設定と、事件ディレクトリの `.claude/settings.json`・`.claude/settings.local.json`（フック、allow ルールなど）
+- 事件ディレクトリの `CLAUDE.md`・`.claude/rules`・skills・output style。中身は指示ではなく調べる材料なので、必要なら Read で読みます
+- MCP サーバー: 事件ディレクトリの `.mcp.json` も含め、`--strict-mcp-config` で無視します
+
+`--restricted` は設定ファイルを読まないことを確実にするために付けています。このオプションが無い古い Claude Code では起動時にエラーになるので、その場合は Claude Code を更新してください（2.1.311 で確認）。許可外の操作は確認なしで拒否されます。ただし、Claude Code が読み取り専用と判定するコマンド（`whoami` など）は許可リストに無くても実行されます。`--bare` は OAuth のログインを読まなくなるため使いません。
 
 Windowsでは Claude Code のシェルが Git Bash になるため、`Test-NetConnection` などのPowerShellコマンドレットは `powershell -NoProfile -Command ...` 経由で実行されます。許可ルールもその形に合わせ、`Bash(powershell -NoProfile -Command Test-NetConnection:*)` のように展開してください。
 
@@ -462,7 +473,7 @@ kuda check-backends
 kuda check --verbose
 ```
 
-2. スナップショットを強制取得し、collector がすべて成功するか確認する。初回の `last_known_good` もこれで作られます。
+2. スナップショットを強制取得し、collector がすべて成功するか確認する。初回の `last_known_good` もこれで作られます（失敗した collector の分は作られないので、原因を直して取り直します）。
 
 ```
 kuda snapshot --force
@@ -613,6 +624,12 @@ sysctl net.ipv4.ping_group_range
 - **事件ディレクトリ**: `incidents/` の中身はレポートの根拠です。既定で30日分を残します
 - **ログ**: `logs/kuda-<日付>.log`
 
+### 通知
+
+発火して調査が始まったとき、調査が終わったとき、全バックエンドが失敗したときに、デスクトップ通知を出します。Windows はトースト（PowerShell 5.1 経由）で、通知を押すとレポートを開きます。Linux は `notify-send` を使い、本文にレポートのパスを載せます。`notify-send` が無いなど通知を出せないときは、調査は続けたままログに警告を残します。
+
+通知は、発火で切り離して起動した調査だけが出します。手動の `kuda diagnose` でも出したいときは `--notify` を付けます。止めるには `[general]` に `notify = false` を書きます。
+
 ### トラブルシューティング
 
 | 症状 | よくある原因 | 対処 |
@@ -625,6 +642,7 @@ sysctl net.ipv4.ping_group_range
 | PowerShellで実行しても何も表示されない | `kudaw.exe` を実行している | 手動の実行には `kuda.exe` を使う |
 | Linuxで ICMP の probe が常に失敗する | 非特権 ping ソケットが不許可 | `net.ipv4.ping_group_range` を確認するか、TCP の probe に切り替える |
 | 完全断の調査がいつも失敗する | クラウドLLMに届かない | `fallback = "local"` が設定されていて、ローカルサーバーが起動しているか確認する |
+| `has schema version N, but this kuda supports up to M` で止まる | 新しい kuda で一度開いたメトリクスDBを、古い kuda で開いた | kuda を更新する。ダウングレードは非対応なので、古い版に戻すなら更新前に取ったDBのバックアップに戻すか、DBを退避して作り直す |
 
 ### 一時停止とアンインストール
 
