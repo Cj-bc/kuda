@@ -63,6 +63,7 @@ const KNOWN_GOOD: &str = "
                    ELSE 0 END
         GROUP BY s.watch, c.key;
     ALTER TABLE watch_state ADD COLUMN last_complete_snapshot INTEGER;
+    ALTER TABLE watch_state ADD COLUMN last_snapshot_complete INTEGER;
 ";
 
 const SCHEMA_V1: &str = "
@@ -120,6 +121,9 @@ pub struct WatchState {
     pub last_snapshot: Option<i64>,
     /// 全 collector が成功した最後の取得の時刻
     pub last_complete_snapshot: Option<i64>,
+    /// `last_snapshot` の取得で全 collector が成功したか。版 2 から上げた直後は分からないので None。
+    /// 成功と失敗の取得が同じ秒に重なると時刻では見分けられないので、時刻とは別に持つ
+    pub last_snapshot_complete: Option<bool>,
     pub trigger: TriggerState,
 }
 
@@ -479,7 +483,7 @@ impl Store {
             .conn
             .query_row(
                 "SELECT last_probe, last_snapshot, last_complete_snapshot,
-                        streak, since, last_fired, active
+                        last_snapshot_complete, streak, since, last_fired, active
                  FROM watch_state WHERE watch = ?1",
                 params![watch],
                 |row| {
@@ -487,11 +491,12 @@ impl Store {
                         last_probe: row.get(0)?,
                         last_snapshot: row.get(1)?,
                         last_complete_snapshot: row.get(2)?,
+                        last_snapshot_complete: row.get(3)?,
                         trigger: TriggerState {
-                            streak: row.get(3)?,
-                            since: row.get(4)?,
-                            last_fired: row.get(5)?,
-                            active: row.get(6)?,
+                            streak: row.get(4)?,
+                            since: row.get(5)?,
+                            last_fired: row.get(6)?,
+                            active: row.get(7)?,
                         },
                     })
                 },
@@ -500,21 +505,31 @@ impl Store {
         Ok(state.unwrap_or_default())
     }
 
-    /// last_snapshot と、`complete` なら last_complete_snapshot だけを更新する。
-    /// check と snapshot のどちらからも呼ばれるので、他の列は読み込んだ時点の値で
-    /// 上書きしない。後から完了した側の収集開始が早いこともあるので、時刻は戻さない
+    /// last_snapshot・last_snapshot_complete と、`complete` なら last_complete_snapshot だけを
+    /// 更新する。check と snapshot のどちらからも呼ばれるので、他の列は読み込んだ時点の値で
+    /// 上書きしない。後から完了した側の収集開始が早いこともあるので、時刻は戻さない。
+    /// 同じ秒の取得が重なったら、どちらかが失敗していれば失敗とする
     fn update_last_snapshot(conn: &Connection, watch: &str, ts: i64, complete: bool) -> Result<()> {
+        // SET の右辺の列名は、どれも更新前の値を指す
         conn.execute(
-            "INSERT INTO watch_state (watch, last_snapshot, last_complete_snapshot, streak, active)
-             VALUES (?1, ?2, ?3, 0, 0)
+            "INSERT INTO watch_state
+                 (watch, last_snapshot, last_complete_snapshot, last_snapshot_complete, streak, active)
+             VALUES (?1, ?2, ?3, ?4, 0, 0)
              ON CONFLICT (watch) DO UPDATE SET
                  last_snapshot =
                      max(coalesce(last_snapshot, excluded.last_snapshot), excluded.last_snapshot),
                  last_complete_snapshot = max(
                      coalesce(last_complete_snapshot, excluded.last_complete_snapshot),
                      coalesce(excluded.last_complete_snapshot, last_complete_snapshot)
-                 )",
-            params![watch, ts, complete.then_some(ts)],
+                 ),
+                 last_snapshot_complete = CASE
+                     WHEN last_snapshot IS NULL OR excluded.last_snapshot > last_snapshot
+                         THEN excluded.last_snapshot_complete
+                     WHEN excluded.last_snapshot = last_snapshot
+                         THEN last_snapshot_complete AND excluded.last_snapshot_complete
+                     ELSE last_snapshot_complete
+                 END",
+            params![watch, ts, complete.then_some(ts), complete],
         )?;
         Ok(())
     }
@@ -850,6 +865,51 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_at_the_same_second_as_a_success_is_not_hidden() {
+        let complete = snapshot(100, ok(json!(1)), ok(json!(2)));
+        let partial = snapshot(100, ok(json!(1)), failed());
+        // 成功と失敗のどちらが後に完了しても、その秒の取得は失敗として扱う
+        for order in [[&complete, &partial], [&partial, &complete]] {
+            let store = Store::in_memory().unwrap();
+            for data in order {
+                store.record_snapshot("w", 100, data, 5).unwrap();
+            }
+            let state = store.load_state("w").unwrap();
+            assert_eq!(state.last_snapshot, Some(100));
+            assert_eq!(state.last_complete_snapshot, Some(100));
+            assert_eq!(state.last_snapshot_complete, Some(false));
+        }
+    }
+
+    #[test]
+    fn latest_attempt_decides_whether_the_snapshot_was_complete() {
+        let store = Store::in_memory().unwrap();
+        let complete = snapshot(100, ok(json!(1)), ok(json!(2)));
+        let partial = snapshot(200, ok(json!(1)), failed());
+        store.record_snapshot("w", 100, &complete, 5).unwrap();
+        assert_eq!(
+            store.load_state("w").unwrap().last_snapshot_complete,
+            Some(true)
+        );
+        store.record_snapshot("w", 200, &partial, 5).unwrap();
+        assert_eq!(
+            store.load_state("w").unwrap().last_snapshot_complete,
+            Some(false)
+        );
+        // 収集開始の早い取得が後から完了しても、最後の取得の成否は変えない
+        store.record_snapshot("w", 150, &complete, 5).unwrap();
+        assert_eq!(
+            store.load_state("w").unwrap().last_snapshot_complete,
+            Some(false)
+        );
+        store.record_snapshot("w", 300, &complete, 5).unwrap();
+        assert_eq!(
+            store.load_state("w").unwrap().last_snapshot_complete,
+            Some(true)
+        );
+    }
+
+    #[test]
     fn an_earlier_snapshot_finishing_later_does_not_roll_back_the_baseline() {
         let store = Store::in_memory().unwrap();
         let newer = snapshot(200, ok(json!({ "n": 2 })), ok(json!({ "s": "b" })));
@@ -917,6 +977,7 @@ mod tests {
         assert_eq!(state.last_probe, Some(310));
         assert_eq!(state.last_snapshot, Some(300));
         assert_eq!(state.last_complete_snapshot, None);
+        assert_eq!(state.last_snapshot_complete, None);
         // 取得履歴はそのまま残る
         assert_eq!(history_count(&store), 3);
     }
@@ -964,6 +1025,7 @@ mod tests {
             last_probe: Some(1),
             last_snapshot: Some(2),
             last_complete_snapshot: Some(2),
+            last_snapshot_complete: Some(true),
             trigger: TriggerState {
                 streak: 3,
                 since: Some(4),
@@ -983,6 +1045,7 @@ mod tests {
         let expected = WatchState {
             last_snapshot: Some(2),
             last_complete_snapshot: Some(2),
+            last_snapshot_complete: Some(true),
             ..WatchState::default()
         };
         assert_eq!(store.load_state("w").unwrap(), expected);

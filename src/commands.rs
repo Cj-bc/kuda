@@ -44,10 +44,7 @@ const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// 失敗した collector があれば再試行の間隔（snapshot_interval が短ければそちら）を、
 /// 最後の取得から空ける
 fn is_snapshot_due(state: &WatchState, now: i64, interval: Duration) -> bool {
-    let complete = state
-        .last_snapshot
-        .is_some_and(|last| state.last_complete_snapshot == Some(last));
-    let wait = if complete {
+    let wait = if state.last_snapshot_complete == Some(true) {
         interval
     } else {
         interval.min(SNAPSHOT_RETRY_INTERVAL)
@@ -393,17 +390,19 @@ pub fn status(config: &Config, paths: &Paths) -> Result<()> {
 }
 
 /// 最後の取得時刻と、そのとき失敗した collector があったか。
-/// 全 collector が成功した記録がまだ無いとき（版 3 へ上げた直後を含む）は、失敗とは言い切らない
+/// 成否の記録が無いとき（版 3 へ上げた直後）は、失敗とは言い切らない
 fn snapshot_status(state: &WatchState) -> String {
     let Some(last) = state.last_snapshot else {
         return "none".to_string();
     };
-    match state.last_complete_snapshot {
-        Some(complete) if complete == last => format_time(last),
-        Some(complete) => format!(
+    match state.last_snapshot_complete {
+        Some(true) => format_time(last),
+        Some(false) => format!(
             "{} (some collectors failed; last complete: {})",
             format_time(last),
-            format_time(complete)
+            state
+                .last_complete_snapshot
+                .map_or("none".to_string(), format_time)
         ),
         None => format!("{} (no complete snapshot recorded yet)", format_time(last)),
     }
@@ -554,12 +553,28 @@ mod tests {
         assert!(!is_due(Some(1000), 1269, interval));
     }
 
+    /// 最後の取得の成否は、全 collector が成功した時刻と一致するかで決める。
+    /// 成功した時刻が無ければ、版 3 へ上げた直後の成否不明とする
     fn snapshot_state(last: Option<i64>, complete: Option<i64>) -> WatchState {
         WatchState {
             last_snapshot: last,
             last_complete_snapshot: complete,
+            last_snapshot_complete: complete.map(|complete| Some(complete) == last),
             ..WatchState::default()
         }
+    }
+
+    #[test]
+    fn failure_at_the_same_second_as_a_success_is_retried() {
+        let interval = Duration::from_secs(6 * 3600);
+        // 同じ秒に始めた成功と失敗の取得が重なり、時刻は全 collector の成功と一致している
+        let state = WatchState {
+            last_snapshot_complete: Some(false),
+            ..snapshot_state(Some(100), Some(100))
+        };
+        assert!(is_snapshot_due(&state, 100 + 1800, interval));
+        let status = snapshot_status(&state);
+        assert!(status.contains("some collectors failed"), "{status}");
     }
 
     #[test]
