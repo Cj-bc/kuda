@@ -3,12 +3,16 @@
 use crate::probe::{ProbeRun, TargetResult};
 use crate::trigger::TriggerState;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-const SCHEMA: &str = "
+/// `MIGRATIONS[i]` は版 i の DB を版 i + 1 へ上げる。新規 DB は版 0 から順に適用する。
+/// 版を足すときは末尾に追加し、既存の要素は書き換えない
+const MIGRATIONS: [&str; 1] = [SCHEMA_V1];
+
+const SCHEMA_V1: &str = "
     CREATE TABLE probe_results (
         watch TEXT NOT NULL,
         ts INTEGER NOT NULL,
@@ -90,11 +94,37 @@ impl Store {
         // 調査プロセスと次の check が同時に開いても待ち合わせで済むようにする
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mut store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn version(conn: &Connection) -> Result<usize> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version == 0 {
-            conn.execute_batch(&format!("BEGIN; {SCHEMA} PRAGMA user_version = 1; COMMIT;"))?;
+        Ok(version as usize)
+    }
+
+    /// `user_version` の版から最新版まで 1 段ずつ上げる。
+    /// 同時に開いた別プロセスと二重に適用しないよう、版の確認と適用を同じ書き込みトランザクションで行う
+    fn migrate(&mut self) -> Result<()> {
+        // 最新版なら書き込みロックを取らずに済ませる
+        if Self::version(&self.conn)? >= MIGRATIONS.len() {
+            return Ok(());
         }
-        Ok(Self { conn })
+        loop {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let version = Self::version(&tx)?;
+            let Some(migration) = MIGRATIONS.get(version) else {
+                return Ok(());
+            };
+            tx.execute_batch(migration).with_context(|| {
+                format!("failed to migrate the database to version {}", version + 1)
+            })?;
+            tx.pragma_update(None, "user_version", (version + 1) as i64)?;
+            tx.commit()?;
+        }
     }
 
     pub fn record_run(&mut self, watch: &str, run: &ProbeRun) -> Result<()> {
@@ -492,6 +522,12 @@ mod tests {
         let state = snapshot.load_state("w").unwrap();
         assert_eq!(state.last_probe, Some(30));
         assert_eq!(state.last_snapshot, Some(20));
+    }
+
+    #[test]
+    fn new_database_is_at_the_latest_version() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
     }
 
     #[test]
