@@ -496,14 +496,8 @@ mod tests {
 
     #[test]
     fn reopening_keeps_data() {
-        let dir = std::env::temp_dir().join(format!("kuda-store-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("kuda.db");
-        Store::open(&path)
-            .unwrap()
-            .record_run("w", &run(100, true))
-            .unwrap();
-        assert_eq!(Store::open(&path).unwrap().sample_count("w").unwrap(), 1);
-        std::fs::remove_dir_all(dir).unwrap();
+        let db = TempDb::new("reopen");
+        db.open().record_run("w", &run(100, true)).unwrap();
+        assert_eq!(db.open().sample_count("w").unwrap(), 1);
     }
 }
