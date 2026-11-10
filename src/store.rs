@@ -4,13 +4,13 @@ use crate::probe::{ProbeRun, TargetResult};
 use crate::trigger::TriggerState;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Duration;
 
 /// `MIGRATIONS[i]` は版 i の DB を版 i + 1 へ上げる。新規 DB は版 0 から順に適用する。
 /// 版を足すときは末尾に追加し、既存の要素は書き換えない
-const MIGRATIONS: [&str; 2] = [SCHEMA_V1, HIST_BY_AGGREGATION];
+const MIGRATIONS: [&str; 3] = [SCHEMA_V1, HIST_BY_AGGREGATION, KNOWN_GOOD];
 
 /// 版 1 の分布に付ける `aggregate_by`。記録時の集計方式が分からない
 const HIST_V1: &str = "v1";
@@ -32,6 +32,26 @@ const HIST_BY_AGGREGATION: &str = "
         SELECT watch, 'v1', series, bucket, bin, count FROM baseline_hist;
     DROP TABLE baseline_hist;
     ALTER TABLE baseline_hist_v2 RENAME TO baseline_hist;
+";
+
+/// 版 3: 取得履歴（snapshots）と比較基準を分ける。比較基準は collector ごとに
+/// 最後に成功したデータを持ち、失敗した取得で置き換えない。
+/// 既存の履歴からは collector ごとに最後の成功を拾って基準にする。全 collector が
+/// 成功した最後の取得時刻は分からないので空にし、次の取得を再試行の間隔で行う
+const KNOWN_GOOD: &str = "
+    CREATE TABLE known_good (
+        watch TEXT NOT NULL,
+        collector TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (watch, collector)
+    ) WITHOUT ROWID;
+    INSERT INTO known_good (watch, collector, ts, data)
+        SELECT s.watch, c.key, MAX(s.ts), c.value -> '$.data'
+        FROM snapshots AS s, json_each(s.data, '$.collectors') AS c
+        WHERE json_type(c.value, '$.ok') = 'true'
+        GROUP BY s.watch, c.key;
+    ALTER TABLE watch_state ADD COLUMN last_complete_snapshot INTEGER;
 ";
 
 const SCHEMA_V1: &str = "
@@ -85,7 +105,10 @@ const SCHEMA_V1: &str = "
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WatchState {
     pub last_probe: Option<i64>,
+    /// 最後にスナップショットを取得した時刻。collector の成否を問わない
     pub last_snapshot: Option<i64>,
+    /// 全 collector が成功した最後の取得の時刻
+    pub last_complete_snapshot: Option<i64>,
     pub trigger: TriggerState,
 }
 
@@ -381,52 +404,83 @@ impl Store {
         Ok(())
     }
 
-    /// 正常時のスナップショットを保存し、新しい `keep` 件だけを残す
-    pub fn save_snapshot(&self, watch: &str, ts: i64, data: &Value, keep: u32) -> Result<()> {
-        self.conn.execute(
+    /// 正常時に取得したスナップショットを記録する。取得履歴には失敗した collector も
+    /// そのまま残し、新しい `keep` 件だけを残す。比較基準は成功した collector の分だけを
+    /// 置き換え、失敗した collector は前回までの成功データを使い続ける。
+    /// 全 collector が成功したときだけ、取得時刻を `last_complete_snapshot` にも記録する
+    pub fn record_snapshot(&self, watch: &str, ts: i64, snapshot: &Value, keep: u32) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO snapshots (watch, ts, data) VALUES (?1, ?2, ?3)",
-            params![watch, ts, data.to_string()],
+            params![watch, ts, snapshot.to_string()],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM snapshots WHERE watch = ?1 AND rowid NOT IN (
                  SELECT rowid FROM snapshots WHERE watch = ?1
                  ORDER BY ts DESC, rowid DESC LIMIT ?2
              )",
             params![watch, keep],
         )?;
+        let mut complete = true;
+        for (name, result) in snapshot["collectors"].as_object().into_iter().flatten() {
+            if result["ok"] != Value::Bool(true) {
+                complete = false;
+                continue;
+            }
+            // check と snapshot が並行したとき、収集開始の早い側が後から完了しても戻さない
+            tx.execute(
+                "INSERT INTO known_good (watch, collector, ts, data) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (watch, collector) DO UPDATE SET ts = excluded.ts, data = excluded.data
+                 WHERE excluded.ts >= known_good.ts",
+                params![watch, name, ts, result["data"].to_string()],
+            )?;
+        }
+        Self::update_last_snapshot(&tx, watch, ts, complete)?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn last_known_good(&self, watch: &str) -> Result<Option<(i64, Value)>> {
-        let row: Option<(i64, String)> = self
+    /// `collectors` それぞれの最後の成功データをまとめた、比較基準のスナップショット。
+    /// collector ごとに取得時刻が異なるので、時刻は各 collector の `taken_at` に持つ。
+    /// どれも成功したことがなければ None
+    pub fn last_known_good(&self, watch: &str, collectors: &[String]) -> Result<Option<Value>> {
+        let mut statement = self
             .conn
-            .query_row(
-                "SELECT ts, data FROM snapshots WHERE watch = ?1
-                 ORDER BY ts DESC, rowid DESC LIMIT 1",
-                params![watch],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        row.map(|(ts, data)| Ok((ts, serde_json::from_str(&data)?)))
-            .transpose()
+            .prepare("SELECT ts, data FROM known_good WHERE watch = ?1 AND collector = ?2")?;
+        let mut merged = serde_json::Map::new();
+        for name in collectors {
+            let row: Option<(i64, String)> = statement
+                .query_row(params![watch, name], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((ts, data)) = row {
+                let data: Value = serde_json::from_str(&data)?;
+                merged.insert(
+                    name.clone(),
+                    json!({ "ok": true, "taken_at": ts, "data": data }),
+                );
+            }
+        }
+        Ok((!merged.is_empty()).then(|| json!({ "collectors": merged })))
     }
 
     pub fn load_state(&self, watch: &str) -> Result<WatchState> {
         let state = self
             .conn
             .query_row(
-                "SELECT last_probe, last_snapshot, streak, since, last_fired, active
+                "SELECT last_probe, last_snapshot, last_complete_snapshot,
+                        streak, since, last_fired, active
                  FROM watch_state WHERE watch = ?1",
                 params![watch],
                 |row| {
                     Ok(WatchState {
                         last_probe: row.get(0)?,
                         last_snapshot: row.get(1)?,
+                        last_complete_snapshot: row.get(2)?,
                         trigger: TriggerState {
-                            streak: row.get(2)?,
-                            since: row.get(3)?,
-                            last_fired: row.get(4)?,
-                            active: row.get(5)?,
+                            streak: row.get(3)?,
+                            since: row.get(4)?,
+                            last_fired: row.get(5)?,
+                            active: row.get(6)?,
                         },
                     })
                 },
@@ -435,22 +489,34 @@ impl Store {
         Ok(state.unwrap_or_default())
     }
 
-    /// last_snapshot だけを更新する。check と snapshot のどちらからも呼ばれるので、
-    /// 他の列は読み込んだ時点の値で上書きしない。後から完了した側の収集開始が
-    /// 早いこともあるので、時刻は戻さない
-    pub fn set_last_snapshot(&self, watch: &str, ts: i64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO watch_state (watch, last_snapshot, streak, active)
-             VALUES (?1, ?2, 0, 0)
-             ON CONFLICT (watch) DO UPDATE SET last_snapshot =
-                 max(coalesce(last_snapshot, excluded.last_snapshot), excluded.last_snapshot)",
-            params![watch, ts],
+    /// last_snapshot と、`complete` なら last_complete_snapshot だけを更新する。
+    /// check と snapshot のどちらからも呼ばれるので、他の列は読み込んだ時点の値で
+    /// 上書きしない。後から完了した側の収集開始が早いこともあるので、時刻は戻さない
+    fn update_last_snapshot(conn: &Connection, watch: &str, ts: i64, complete: bool) -> Result<()> {
+        conn.execute(
+            "INSERT INTO watch_state (watch, last_snapshot, last_complete_snapshot, streak, active)
+             VALUES (?1, ?2, ?3, 0, 0)
+             ON CONFLICT (watch) DO UPDATE SET
+                 last_snapshot =
+                     max(coalesce(last_snapshot, excluded.last_snapshot), excluded.last_snapshot),
+                 last_complete_snapshot = max(
+                     coalesce(last_complete_snapshot, excluded.last_complete_snapshot),
+                     coalesce(excluded.last_complete_snapshot, last_complete_snapshot)
+                 )",
+            params![watch, ts, complete.then_some(ts)],
         )?;
         Ok(())
     }
 
-    /// check が所有する probe と trigger の状態を保存する。`state.last_snapshot` は
-    /// 書かない（snapshot と並行しても巻き戻さないよう、`set_last_snapshot` で更新する）
+    /// 全 collector が成功した取得として時刻だけを記録する
+    #[cfg(test)]
+    pub fn set_last_snapshot(&self, watch: &str, ts: i64) -> Result<()> {
+        Self::update_last_snapshot(&self.conn, watch, ts, true)
+    }
+
+    /// check が所有する probe と trigger の状態を保存する。`state.last_snapshot` と
+    /// `state.last_complete_snapshot` は書かない（snapshot と並行しても巻き戻さないよう、
+    /// `record_snapshot` で更新する）
     pub fn save_state(&self, watch: &str, state: &WatchState) -> Result<()> {
         self.conn.execute(
             "INSERT INTO watch_state (watch, last_probe, streak, since, last_fired, active)
@@ -655,23 +721,168 @@ mod tests {
         assert!(store.v1_hist("w").unwrap().is_some());
     }
 
-    #[test]
-    fn snapshots_keep_only_the_newest() {
-        let store = Store::in_memory().unwrap();
-        assert!(store.last_known_good("w").unwrap().is_none());
-        for ts in 1..=4 {
-            store
-                .save_snapshot("w", ts, &json!({ "n": ts }), 2)
-                .unwrap();
-        }
-        let (ts, data) = store.last_known_good("w").unwrap().unwrap();
-        assert_eq!(ts, 4);
-        assert_eq!(data["n"], 4);
-        let count: i64 = store
+    fn ok(data: Value) -> Value {
+        json!({ "ok": true, "data": data })
+    }
+
+    fn failed() -> Value {
+        json!({ "ok": false, "error": "command not found" })
+    }
+
+    fn snapshot(ts: i64, routes: Value, dns: Value) -> Value {
+        json!({ "taken_at": ts, "collectors": { "routes": routes, "dns_config": dns } })
+    }
+
+    fn names() -> Vec<String> {
+        vec!["routes".to_string(), "dns_config".to_string()]
+    }
+
+    fn history_count(store: &Store) -> i64 {
+        store
             .conn
             .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn snapshot_history_keeps_only_the_newest() {
+        let store = Store::in_memory().unwrap();
+        assert!(store.last_known_good("w", &names()).unwrap().is_none());
+        for ts in 1..=4 {
+            let data = snapshot(ts, ok(json!({ "n": ts })), ok(json!([])));
+            store.record_snapshot("w", ts, &data, 2).unwrap();
+        }
+        let good = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(good["collectors"]["routes"]["data"]["n"], 4);
+        assert_eq!(good["collectors"]["routes"]["taken_at"], 4);
+        assert_eq!(history_count(&store), 2);
+    }
+
+    #[test]
+    fn failed_collectors_keep_the_last_good_data() {
+        let store = Store::in_memory().unwrap();
+        let good = snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" })));
+        store.record_snapshot("w", 100, &good, 5).unwrap();
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_snapshot, Some(100));
+        assert_eq!(state.last_complete_snapshot, Some(100));
+
+        // 部分失敗: 成功した routes だけが新しくなり、dns_config は前回の成功を使い続ける
+        let partial = snapshot(200, ok(json!({ "n": 2 })), failed());
+        store.record_snapshot("w", 200, &partial, 5).unwrap();
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 2);
+        assert_eq!(baseline["collectors"]["routes"]["taken_at"], 200);
+        assert_eq!(baseline["collectors"]["dns_config"]["data"]["s"], "a");
+        assert_eq!(baseline["collectors"]["dns_config"]["taken_at"], 100);
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_snapshot, Some(200));
+        assert_eq!(state.last_complete_snapshot, Some(100));
+
+        // 全失敗: 比較基準は変わらない
+        store
+            .record_snapshot("w", 300, &snapshot(300, failed(), failed()), 5)
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(
+            store.last_known_good("w", &names()).unwrap().unwrap(),
+            baseline
+        );
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_snapshot, Some(300));
+        assert_eq!(state.last_complete_snapshot, Some(100));
+        // 取得履歴には失敗も残る
+        assert_eq!(history_count(&store), 3);
+    }
+
+    #[test]
+    fn baseline_outlives_the_snapshot_history() {
+        let store = Store::in_memory().unwrap();
+        let good = snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" })));
+        store.record_snapshot("w", 100, &good, 2).unwrap();
+        // 失敗が keep 件を超えて続き、成功した取得が履歴から消えても基準は残る
+        for ts in [200, 300, 400] {
+            store
+                .record_snapshot("w", ts, &snapshot(ts, failed(), failed()), 2)
+                .unwrap();
+        }
+        assert_eq!(history_count(&store), 2);
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 1);
+        assert_eq!(baseline["collectors"]["dns_config"]["data"]["s"], "a");
+    }
+
+    #[test]
+    fn baseline_is_limited_to_the_requested_collectors() {
+        let store = Store::in_memory().unwrap();
+        let data = snapshot(100, ok(json!(1)), failed());
+        store.record_snapshot("w", 100, &data, 5).unwrap();
+        // 設定から外した collector の古い基準は比較に出さない
+        let only_dns = ["dns_config".to_string()];
+        assert!(store.last_known_good("w", &only_dns).unwrap().is_none());
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"], 1);
+        assert!(baseline["collectors"].get("dns_config").is_none());
+        assert!(store.last_known_good("other", &names()).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_earlier_snapshot_finishing_later_does_not_roll_back_the_baseline() {
+        let store = Store::in_memory().unwrap();
+        let newer = snapshot(200, ok(json!({ "n": 2 })), ok(json!({ "s": "b" })));
+        let older = snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" })));
+        store.record_snapshot("w", 200, &newer, 5).unwrap();
+        store.record_snapshot("w", 100, &older, 5).unwrap();
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 2);
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_snapshot, Some(200));
+        assert_eq!(state.last_complete_snapshot, Some(200));
+    }
+
+    #[test]
+    fn v2_file_database_is_migrated_to_a_per_collector_baseline() {
+        let db = TempDb::new("v2");
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            conn.execute_batch(&format!(
+                "{SCHEMA_V1} {HIST_BY_AGGREGATION} PRAGMA user_version = 2;"
+            ))
+            .unwrap();
+            // 版 2 では失敗した取得も最新の正常時として保存されていた
+            for (ts, data) in [
+                (
+                    100,
+                    snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" }))),
+                ),
+                (200, snapshot(200, ok(json!({ "n": 2 })), failed())),
+                (300, snapshot(300, failed(), failed())),
+            ] {
+                conn.execute(
+                    "INSERT INTO snapshots (watch, ts, data) VALUES ('w', ?1, ?2)",
+                    params![ts, data.to_string()],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO watch_state (watch, last_probe, last_snapshot, streak, active)
+                 VALUES ('w', 310, 300, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = db.open();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
+        assert_eq!(baseline["collectors"]["routes"]["data"]["n"], 2);
+        assert_eq!(baseline["collectors"]["routes"]["taken_at"], 200);
+        assert_eq!(baseline["collectors"]["dns_config"]["data"]["s"], "a");
+        assert_eq!(baseline["collectors"]["dns_config"]["taken_at"], 100);
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_probe, Some(310));
+        assert_eq!(state.last_snapshot, Some(300));
+        assert_eq!(state.last_complete_snapshot, None);
+        // 取得履歴はそのまま残る
+        assert_eq!(history_count(&store), 3);
     }
 
     #[test]
@@ -681,6 +892,7 @@ mod tests {
         let state = WatchState {
             last_probe: Some(1),
             last_snapshot: Some(2),
+            last_complete_snapshot: Some(2),
             trigger: TriggerState {
                 streak: 3,
                 since: Some(4),
@@ -699,6 +911,7 @@ mod tests {
         store.set_last_snapshot("w", 2).unwrap();
         let expected = WatchState {
             last_snapshot: Some(2),
+            last_complete_snapshot: Some(2),
             ..WatchState::default()
         };
         assert_eq!(store.load_state("w").unwrap(), expected);

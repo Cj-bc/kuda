@@ -45,9 +45,9 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Take snapshots and store them as last_known_good
+    /// Take snapshots and store each successful collector as last_known_good
     Snapshot {
-        /// Ignore snapshot_interval
+        /// Ignore snapshot_interval and the retry interval
         #[arg(long)]
         force: bool,
         /// Limit to one watch
