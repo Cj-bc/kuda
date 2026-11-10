@@ -32,10 +32,20 @@ fn truncate(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+/// 通常のファイルだけを読む。事件ディレクトリは外から渡されうるので、
+/// シンボリックリンクを辿って外のファイルを LLM へ送らない
+fn read_regular_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 fn evidence(incident_dir: &Path) -> String {
     let mut text = "ツールは使えません。次の内容だけから分析してください。\n".to_string();
     for name in EVIDENCE_FILES {
-        let Ok(contents) = std::fs::read_to_string(incident_dir.join(name)) else {
+        let Some(contents) = read_regular_file(&incident_dir.join(name)) else {
             continue;
         };
         let _ = writeln!(
@@ -187,6 +197,30 @@ mod tests {
         let url = format!("http://{}/v1", closed.local_addr().unwrap());
         drop(closed);
         assert!(backend(url).available().is_err());
+    }
+
+    #[test]
+    fn does_not_follow_symlinked_evidence() {
+        let root = std::env::temp_dir().join(format!("kuda-local-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("incident");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = root.join("secret.txt");
+        std::fs::write(&outside, "secret-marker").unwrap();
+        std::fs::write(dir.join("diff.md"), "diff-marker").unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, dir.join("summary.md"));
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, dir.join("summary.md"));
+        let text = linked.is_ok().then(|| evidence(&dir));
+        std::fs::remove_dir_all(&root).unwrap();
+        // Windows では開発者モードか管理者でないとリンクを作れないので、そのときは確かめない
+        let Some(text) = text else {
+            eprintln!("skipped: cannot create a symlink here");
+            return;
+        };
+        assert!(!text.contains("secret-marker"), "{text}");
+        assert!(text.contains("diff-marker"), "{text}");
     }
 
     #[test]
