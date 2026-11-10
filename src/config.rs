@@ -1,5 +1,6 @@
 //! config.toml の読み込みと検証。
 
+use crate::paths::is_safe_name;
 use crate::trigger::Expr;
 use anyhow::{Context, Result, bail, ensure};
 use log::LevelFilter;
@@ -350,11 +351,7 @@ impl Config {
         for watch in &self.watches {
             // ディレクトリ名と systemd のユニット名にそのまま使うので文字種を絞る
             ensure!(
-                !watch.name.is_empty()
-                    && watch
-                        .name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                is_safe_name(&watch.name),
                 "watch name must be [A-Za-z0-9_-]+: {:?}",
                 watch.name
             );
