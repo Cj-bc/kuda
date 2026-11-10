@@ -122,6 +122,12 @@ impl Tree {
         Ok(child.try_wait()?.is_some())
     }
 
+    /// 終了を確かめられなくなったときに、子孫を残さず手を引く
+    fn abandon(&mut self, child: &mut Child, _error: &std::io::Error) {
+        self.kill(child);
+        let _ = child.wait();
+    }
+
     /// 子が終了済みでも呼んでよい。その終了コードは上書きされない
     fn kill(&mut self, child: &mut Child) {
         if let Some(job) = self.job {
@@ -257,6 +263,17 @@ impl Tree {
         let _ = child.kill();
     }
 
+    /// 終了を確かめられなくなったときに、子孫を残さず手を引く。
+    /// ECHILD なら子はもう回収されていて PID（= グループ ID）が再利用されうるので、killpg しない
+    fn abandon(&mut self, child: &mut Child, error: &std::io::Error) {
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            self.release();
+        } else {
+            self.kill(child);
+            let _ = child.wait();
+        }
+    }
+
     fn release(&mut self) {
         if let Some(slot) = self.slot.take() {
             GROUPS[slot].store(0, std::sync::atomic::Ordering::SeqCst);
@@ -300,8 +317,13 @@ pub fn run(mut command: Command, stdin: Option<&str>, timeout: Duration) -> Resu
 
     let deadline = Instant::now() + timeout;
     let timed_out = loop {
-        if tree.exited(&mut child)? {
-            break false;
+        match tree.exited(&mut child) {
+            Ok(true) => break false,
+            Ok(false) => {}
+            Err(error) => {
+                tree.abandon(&mut child, &error);
+                return Err(error).context("failed to wait for the command");
+            }
         }
         if Instant::now() >= deadline {
             break true;
