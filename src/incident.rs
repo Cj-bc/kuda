@@ -1,10 +1,10 @@
 //! 事件ディレクトリ（現在のスナップショット、正常時との差分、メトリクス）の生成。
 
 use crate::baseline::{SeriesStats, Source};
-use crate::paths::create_private_dir;
+use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -99,11 +99,30 @@ pub fn create(incidents_dir: &Path, evidence: &Evidence, created: i64) -> Result
     Ok(incident)
 }
 
+/// create_unique_dir が付ける形の id（時刻と連番）か。英字を通さないので
+/// `-recovered` の回復レポートや Windows の予約名（NUL など）と重ならない
+fn is_incident_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
 pub fn load(dir: &Path) -> Result<Incident> {
     let path = dir.join(META_FILE);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let mut incident: Incident = serde_json::from_str(&text)?;
+    // watch と id はレポートの保存先パスに使う。他人から受け取った事件でも外へ書かせない
+    ensure!(
+        is_safe_name(&incident.watch),
+        "{} has an invalid watch: {:?}",
+        path.display(),
+        incident.watch
+    );
+    ensure!(
+        is_incident_id(&incident.id),
+        "{} has an invalid id: {:?}",
+        path.display(),
+        incident.id
+    );
     incident.dir = dir.to_path_buf();
     Ok(incident)
 }
@@ -515,6 +534,28 @@ mod tests {
         prune(&root, 30, 91 * 86400).unwrap();
         assert!(!old.dir.exists());
         assert!(recent.dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_names_unsafe_for_a_report_path() {
+        let root = temp_dir("incident-unsafe");
+        std::fs::create_dir_all(&root).unwrap();
+        for (watch, id) in [
+            ("w", "../../escaped"),
+            ("w", "a/b"),
+            ("w", "a\\b"),
+            ("w", ""),
+            ("w", "20260101-000000-recovered"),
+            ("w", "NUL"),
+            ("..", "20260101-000000"),
+            ("/abs", "20260101-000000"),
+            ("C:", "20260101-000000"),
+        ] {
+            let meta = json!({"watch": watch, "id": id, "created": 1000, "since": 900});
+            std::fs::write(root.join(META_FILE), meta.to_string()).unwrap();
+            assert!(load(&root).is_err(), "{watch:?} {id:?}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
