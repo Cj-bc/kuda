@@ -143,6 +143,7 @@ mod tests {
         Request {
             prompt: "prompt-marker",
             incident_dir: dir,
+            work_dir: dir,
             allowed_commands: &[],
             timeout: Duration::from_secs(5),
         }

@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 pub struct Request<'a> {
     pub prompt: &'a str,
     pub incident_dir: &'a Path,
+    /// バックエンドが一時ファイルを置くための、kuda が管理するディレクトリ。
+    /// 事件ディレクトリは外から渡されうるので、そこには書かない
+    pub work_dir: &'a Path,
     pub allowed_commands: &'a [String],
     pub timeout: Duration,
 }
@@ -126,6 +129,7 @@ pub fn investigate(
     let request = Request {
         prompt: &prompt,
         incident_dir: &incident.dir,
+        work_dir: &paths.data_dir,
         allowed_commands: diagnose.allowed_commands.current(),
         timeout: diagnose.max_duration,
     };
