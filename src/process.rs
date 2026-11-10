@@ -78,7 +78,7 @@ impl Tree {
 
     /// ジョブに入れた後に起動された孫もジョブに属する。
     /// spawn から登録までの間に子が孫を起動すると取りこぼすが、その隙間はごく短い
-    fn attach(&mut self, child: &Child) {
+    fn attach(&mut self, child: &mut Child) {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::System::JobObjects::{
@@ -110,6 +110,10 @@ impl Tree {
         };
         match result {
             Ok(job) => self.job = Some(job),
+            // すぐ終わった子は登録が拒否されるが、止める相手もいないので問題ない
+            Err(error) if matches!(child.try_wait(), Ok(Some(_))) => {
+                log::debug!("child exited before joining a job object: {error}");
+            }
             Err(error) => log::warn!("failed to put the child in a job object: {error}"),
         }
     }
@@ -144,7 +148,7 @@ impl Tree {
         Tree
     }
 
-    fn attach(&mut self, _child: &Child) {}
+    fn attach(&mut self, _child: &mut Child) {}
 
     /// 子をまだ回収していないので、グループ ID（= 子の PID）が他に再利用されることはない
     fn kill(&mut self, child: &mut Child) {
@@ -171,7 +175,7 @@ pub fn run(mut command: Command, stdin: Option<&str>, timeout: Duration) -> Resu
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {:?}", command.get_program()))?;
-    tree.attach(&child);
+    tree.attach(&mut child);
 
     if let (Some(mut pipe), Some(text)) = (child.stdin.take(), stdin) {
         let text = text.to_string();
