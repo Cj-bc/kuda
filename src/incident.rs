@@ -38,7 +38,8 @@ pub struct Evidence<'a> {
     pub stats: &'a [SeriesStats],
     pub history: &'a [MetricRow],
     pub current: &'a Value,
-    pub last_good: Option<&'a (i64, Value)>,
+    /// collector ごとの最後の成功データ（`Store::last_known_good`）
+    pub last_good: Option<&'a Value>,
 }
 
 pub fn format_time(ts: i64) -> String {
@@ -83,15 +84,12 @@ pub fn create(incidents_dir: &Path, evidence: &Evidence, created: i64) -> Result
         std::fs::write(&path, contents).with_context(|| format!("failed to write {name}"))
     };
     write("summary.md", render_summary(evidence, created))?;
-    write(
-        "diff.md",
-        render_diff(evidence.last_good.map(|(_, data)| data), evidence.current),
-    )?;
+    write("diff.md", render_diff(evidence.last_good, evidence.current))?;
     write(
         "current.json",
         serde_json::to_string_pretty(evidence.current)?,
     )?;
-    if let Some((_, data)) = evidence.last_good {
+    if let Some(data) = evidence.last_good {
         write("last_known_good.json", serde_json::to_string_pretty(data)?)?;
     }
     write("metrics.csv", render_metrics(evidence))?;
@@ -203,13 +201,43 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
     }
 
     text.push_str("\n## 最後の正常時スナップショット\n\n");
-    match evidence.last_good {
-        Some((ts, _)) => {
-            let _ = writeln!(text, "{}", format_time(*ts));
-        }
-        None => text.push_str("ありません。\n"),
+    text.push_str("collector ごとに、最後に取得に成功した時点のデータと比べます。\n\n");
+    let mut names = collector_names(evidence.current);
+    if let Some(last_good) = evidence.last_good {
+        names.extend(collector_names(last_good));
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        text.push_str("ありません。\n");
+    }
+    for name in names {
+        let taken_at = evidence
+            .last_good
+            .and_then(|last_good| last_good["collectors"][&name]["taken_at"].as_i64());
+        let time = taken_at.map_or_else(|| "成功した取得がありません".to_string(), format_time);
+        let _ = writeln!(text, "- `{name}`: {time}");
     }
     text
+}
+
+/// 比較基準の取得時刻。collector ごとに異なりうるので、異なれば範囲で示す
+fn baseline_time(last_good: &Value) -> String {
+    let times: Vec<i64> = last_good["collectors"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, entry)| entry["taken_at"].as_i64())
+        .collect();
+    match (times.iter().min(), times.iter().max()) {
+        (Some(first), Some(last)) if first == last => format_time(*first),
+        (Some(first), Some(last)) => format!(
+            "{} 〜 {}（collector ごとに最後に成功した時点）",
+            format_time(*first),
+            format_time(*last)
+        ),
+        _ => "?".to_string(),
+    }
 }
 
 fn render_metrics(evidence: &Evidence) -> String {
@@ -307,9 +335,7 @@ fn render_diff(last_good: Option<&Value>, current: &Value) -> String {
     let _ = writeln!(
         text,
         "基準: {} / 現在: {}\n",
-        last_good["taken_at"]
-            .as_i64()
-            .map_or_else(|| "?".to_string(), format_time),
+        baseline_time(last_good),
         current["taken_at"]
             .as_i64()
             .map_or_else(|| "?".to_string(), format_time),
@@ -328,10 +354,13 @@ fn render_diff(last_good: Option<&Value>, current: &Value) -> String {
             collector_data(current, &name),
         ) else {
             // 片方で取得できていないと全項目が差分に見えるので、1 行にまとめる
-            let error = current["collectors"][&name]["error"]
-                .as_str()
-                .or(last_good["collectors"][&name]["error"].as_str())
-                .unwrap_or("片方のスナップショットに含まれていません");
+            let error = match current["collectors"][&name]["error"].as_str() {
+                Some(error) => error,
+                None if current["collectors"].get(&name).is_none() => {
+                    "現在のスナップショットに含まれていません"
+                }
+                None => "正常時に取得に成功したことがありません",
+            };
             failed.push(format!("- `{name}`: {error}"));
             continue;
         };
@@ -442,6 +471,49 @@ mod tests {
         let diff = render_diff(Some(&old), &new);
         assert!(diff.contains("ip not found"));
         assert!(!diff.contains("## 削除"));
+    }
+
+    #[test]
+    fn per_collector_baseline_is_compared_with_its_own_time() {
+        // routes は 1 時間前、dns_config は 7 時間前が最後の成功
+        let last_good = json!({ "collectors": {
+            "routes": { "ok": true, "taken_at": 3600, "data": [route("0.0.0.0/0", "192.168.1.1", 10)] },
+            "dns_config": { "ok": true, "taken_at": 0, "data": { "servers": ["192.168.1.1"] } },
+        }});
+        let current = json!({ "taken_at": 7200, "collectors": {
+            "routes": { "ok": true, "data": [route("0.0.0.0/0", "192.168.1.1", 50)] },
+            "dns_config": { "ok": true, "data": { "servers": ["192.168.1.1"] } },
+            "adapters": { "ok": true, "data": [] },
+        }});
+        let diff = render_diff(Some(&last_good), &current);
+        assert!(
+            diff.contains(&format!("{} 〜 {}", format_time(0), format_time(3600))),
+            "{diff}"
+        );
+        assert!(diff.contains("10 ⇒ 50"), "{diff}");
+        assert!(
+            diff.contains("`adapters`: 正常時に取得に成功したことがありません"),
+            "{diff}"
+        );
+
+        let run = run();
+        let evidence = Evidence {
+            last_good: Some(&last_good),
+            ..evidence(&run, &current, &[])
+        };
+        let summary = render_summary(&evidence, 7200);
+        assert!(
+            summary.contains(&format!("- `dns_config`: {}", format_time(0))),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("- `routes`: {}", format_time(3600))),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("- `adapters`: 成功した取得がありません"),
+            "{summary}"
+        );
     }
 
     #[test]
