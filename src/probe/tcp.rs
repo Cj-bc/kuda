@@ -97,17 +97,16 @@ fn check_gateway(ip: IpAddr, deadline: Deadline) -> Result<Sample, String> {
         return Err(format!("timed out reaching gateway {ip}"));
     };
     let mut attempts = Vec::new();
-    let mut port_delay = Duration::ZERO;
+    let mut delay = Duration::ZERO;
     // 全ポートをフィルタするゲートウェイもあるので ICMP を優先する
     if let IpAddr::V4(ip) = ip {
         attempts.push(Attempt::icmp(move |remaining| {
             icmp::echo(ip, remaining).map_or(Reply::IcmpFailed, Reply::Rtt)
         }));
-        // ポートの試行に時間を残すため、先行時間は残り時間の 1/3 までにする
-        port_delay = ICMP_HEAD_START.min(remaining / 3);
+        delay = port_delay(remaining);
     }
     for port in GATEWAY_PORTS {
-        attempts.push(Attempt::new(port_delay, move |remaining| {
+        attempts.push(Attempt::new(delay, move |remaining| {
             match connect(SocketAddr::new(ip, port), remaining) {
                 Ok(rtt_ms) => Reply::Rtt(rtt_ms),
                 // RST が返るなら到達はできている。ただし Windows は RST 後も SYN を
@@ -117,13 +116,19 @@ fn check_gateway(ip: IpAddr, deadline: Deadline) -> Result<Sample, String> {
             }
         }));
         // 2 番目以降のポートは 1 番目と同時に始める
-        port_delay = Duration::ZERO;
+        delay = Duration::ZERO;
     }
     race(
         attempts,
         deadline,
         format!("timed out reaching gateway {ip}"),
     )
+}
+
+/// ICMP を始めてからポートを試し始めるまでの先行時間。ポートの試行に時間を
+/// 残すため、残り時間の 1/3 までにする
+fn port_delay(remaining: Duration) -> Duration {
+    ICMP_HEAD_START.min(remaining / 3)
 }
 
 /// 並行に走らせる試行 1 回の結果
@@ -459,7 +464,10 @@ mod tests {
     fn icmp_head_start_leaves_time_for_windows_refusals() {
         // 既定の timeout 3 秒でも、ポートには RST の検出に要る 2 秒以上が残る
         let timeout = Duration::from_secs(3);
-        let head_start = ICMP_HEAD_START.min(timeout / 3);
-        assert!(timeout - head_start >= Duration::from_secs(2));
+        assert!(timeout - port_delay(timeout) >= Duration::from_secs(2));
+        // 短い timeout でもポートに 2/3 は残る
+        let short = Duration::from_millis(600);
+        assert_eq!(port_delay(short), Duration::from_millis(200));
+        assert_eq!(port_delay(Duration::from_secs(60)), ICMP_HEAD_START);
     }
 }
