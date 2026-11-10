@@ -3,14 +3,36 @@
 use crate::probe::{ProbeRun, TargetResult};
 use crate::trigger::TriggerState;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
 /// `MIGRATIONS[i]` は版 i の DB を版 i + 1 へ上げる。新規 DB は版 0 から順に適用する。
 /// 版を足すときは末尾に追加し、既存の要素は書き換えない
-const MIGRATIONS: [&str; 1] = [SCHEMA_V1];
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, HIST_BY_AGGREGATION];
+
+/// 版 1 の分布に付ける `aggregate_by`。記録時の集計方式が分からない
+const HIST_V1: &str = "v1";
+/// 版 1 の分布のうち、現在の集計方式に合わず引き取れなかったもの。全体の統計にだけ使う
+const HIST_UNKNOWN: &str = "unknown";
+
+/// 版 2: bucket の意味は集計方式で変わるので、分布を集計方式ごとに分ける
+const HIST_BY_AGGREGATION: &str = "
+    CREATE TABLE baseline_hist_v2 (
+        watch TEXT NOT NULL,
+        aggregate_by TEXT NOT NULL,
+        series TEXT NOT NULL,
+        bucket INTEGER NOT NULL,
+        bin INTEGER NOT NULL,
+        count INTEGER NOT NULL,
+        PRIMARY KEY (watch, aggregate_by, series, bucket, bin)
+    ) WITHOUT ROWID;
+    INSERT INTO baseline_hist_v2 (watch, aggregate_by, series, bucket, bin, count)
+        SELECT watch, 'v1', series, bucket, bin, count FROM baseline_hist;
+    DROP TABLE baseline_hist;
+    ALTER TABLE baseline_hist_v2 RENAME TO baseline_hist;
+";
 
 const SCHEMA_V1: &str = "
     CREATE TABLE probe_results (
@@ -74,6 +96,15 @@ pub struct MetricRow {
     pub value: f64,
 }
 
+/// 版 1 から引き継いだ分布の概要
+#[derive(Debug, Clone, PartialEq)]
+pub struct V1Hist {
+    pub min_bucket: i64,
+    pub max_bucket: i64,
+    /// 系列ごとのサンプル数の最大値
+    pub samples: u64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -88,6 +119,21 @@ impl Store {
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
+    }
+
+    /// 版 1 のスキーマで `hist` (watch, series, bucket, bin, count) を記録した DB を開く
+    #[cfg(test)]
+    pub fn in_memory_v1(hist: &[(&str, &str, i64, i64, i64)]) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))?;
+        for row in hist {
+            conn.execute(
+                "INSERT INTO baseline_hist (watch, series, bucket, bin, count)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![row.0, row.1, row.2, row.3, row.4],
+            )?;
+        }
+        Self::init(conn)
     }
 
     fn init(conn: Connection) -> Result<Self> {
@@ -214,27 +260,111 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn hist_add(&self, watch: &str, series: &str, bucket: i64, bin: i64) -> Result<()> {
+    pub fn hist_add(
+        &self,
+        watch: &str,
+        aggregate_by: &str,
+        series: &str,
+        bucket: i64,
+        bin: i64,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO baseline_hist (watch, series, bucket, bin, count)
-             VALUES (?1, ?2, ?3, ?4, 1)
-             ON CONFLICT (watch, series, bucket, bin) DO UPDATE SET count = count + 1",
-            params![watch, series, bucket, bin],
+            "INSERT INTO baseline_hist (watch, aggregate_by, series, bucket, bin, count)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT (watch, aggregate_by, series, bucket, bin)
+             DO UPDATE SET count = count + 1",
+            params![watch, aggregate_by, series, bucket, bin],
         )?;
         Ok(())
     }
 
-    /// (bin, 件数) を bin の昇順で返す。`bucket` が None なら全時間帯を合算する
-    pub fn hist(&self, watch: &str, series: &str, bucket: Option<i64>) -> Result<Vec<(i64, u64)>> {
-        let mut statement = self.conn.prepare(
-            "SELECT bin, SUM(count) FROM baseline_hist
-             WHERE watch = ?1 AND series = ?2 AND (?3 IS NULL OR bucket = ?3)
-             GROUP BY bin ORDER BY bin",
+    /// (bin, 件数) を bin の昇順で返す。`bucket` は (集計方式, 時間帯) で、
+    /// None なら集計方式も時間帯も問わず全体を合算する
+    pub fn hist(
+        &self,
+        watch: &str,
+        series: &str,
+        bucket: Option<(&str, i64)>,
+    ) -> Result<Vec<(i64, u64)>> {
+        // 時間帯を指定するときは主キーの先頭 4 列で引けるよう、条件を分けた別のクエリにする
+        let mut statement;
+        let rows = match bucket {
+            Some((aggregate_by, bucket)) => {
+                statement = self.conn.prepare_cached(
+                    "SELECT bin, SUM(count) FROM baseline_hist
+                     WHERE watch = ?1 AND aggregate_by = ?2 AND series = ?3 AND bucket = ?4
+                     GROUP BY bin ORDER BY bin",
+                )?;
+                statement.query(params![watch, aggregate_by, series, bucket])?
+            }
+            None => {
+                statement = self.conn.prepare_cached(
+                    "SELECT bin, SUM(count) FROM baseline_hist
+                     WHERE watch = ?1 AND series = ?2
+                     GROUP BY bin ORDER BY bin",
+                )?;
+                statement.query(params![watch, series])?
+            }
+        };
+        Ok(rows
+            .mapped(|row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 版 1 から引き継いだ集計方式不明の分布の概要。引き取り済みなら None
+    pub fn v1_hist(&self, watch: &str) -> Result<Option<V1Hist>> {
+        let row: (Option<i64>, Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(min_bucket), MAX(max_bucket), MAX(samples) FROM (
+                 SELECT MIN(bucket) AS min_bucket, MAX(bucket) AS max_bucket,
+                        SUM(count) AS samples
+                 FROM baseline_hist WHERE watch = ?1 AND aggregate_by = ?2
+                 GROUP BY series
+             )",
+            params![watch, HIST_V1],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let rows = statement.query_map(params![watch, series, bucket], |row| {
-            Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(match row {
+            (Some(min_bucket), Some(max_bucket), Some(samples)) => Some(V1Hist {
+                min_bucket,
+                max_bucket,
+                samples: samples as u64,
+            }),
+            _ => None,
+        })
+    }
+
+    /// 保持期間内の probe の 1 時間あたりの回数。間に止まっていた時間も含めて均すので、実際の間隔より少なめに出る
+    pub fn probes_per_hour(&self, watch: &str) -> Result<f64> {
+        let (count, first, last): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT COUNT(DISTINCT ts), MIN(ts), MAX(ts) FROM metrics WHERE watch = ?1",
+            params![watch],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let hours = match (first, last) {
+            (Some(first), Some(last)) => ((last - first) as f64 / 3600.0).max(1.0),
+            _ => return Ok(0.0),
+        };
+        Ok(count as f64 / hours)
+    }
+
+    /// 版 1 の分布を `adopt_as` の集計方式で記録したものとして引き取る。
+    /// None なら記録時の方式が分からないものとして、全体の統計にだけ残す
+    pub fn resolve_v1_hist(&self, watch: &str, adopt_as: Option<&str>) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO baseline_hist (watch, aggregate_by, series, bucket, bin, count)
+             SELECT watch, ?3, series, bucket, bin, count FROM baseline_hist
+             WHERE watch = ?1 AND aggregate_by = ?2
+             ON CONFLICT (watch, aggregate_by, series, bucket, bin)
+             DO UPDATE SET count = count + excluded.count",
+            params![watch, HIST_V1, adopt_as.unwrap_or(HIST_UNKNOWN)],
+        )?;
+        tx.execute(
+            "DELETE FROM baseline_hist WHERE watch = ?1 AND aggregate_by = ?2",
+            params![watch, HIST_V1],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// 正常時のスナップショットを保存し、新しい `keep` 件だけを残す
@@ -378,7 +508,7 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         store.record_run("w", &run(100, true)).unwrap();
         store.record_run("w", &run(200, true)).unwrap();
-        store.hist_add("w", "rtt", 1, 5).unwrap();
+        store.hist_add("w", "hour", "rtt", 1, 5).unwrap();
         store.prune_metrics("w", 150).unwrap();
         assert_eq!(store.sample_count("w").unwrap(), 1);
         assert_eq!(store.hist("w", "rtt", None).unwrap(), [(5, 1)]);
@@ -387,12 +517,132 @@ mod tests {
     #[test]
     fn hist_counts_and_merges_buckets() {
         let store = Store::in_memory().unwrap();
-        store.hist_add("w", "rtt", 1, 5).unwrap();
-        store.hist_add("w", "rtt", 1, 5).unwrap();
-        store.hist_add("w", "rtt", 2, 5).unwrap();
-        store.hist_add("w", "rtt", 2, 3).unwrap();
-        assert_eq!(store.hist("w", "rtt", Some(1)).unwrap(), [(5, 2)]);
+        store.hist_add("w", "hour", "rtt", 1, 5).unwrap();
+        store.hist_add("w", "hour", "rtt", 1, 5).unwrap();
+        store.hist_add("w", "hour", "rtt", 2, 5).unwrap();
+        store.hist_add("w", "hour", "rtt", 2, 3).unwrap();
+        assert_eq!(store.hist("w", "rtt", Some(("hour", 1))).unwrap(), [(5, 2)]);
         assert_eq!(store.hist("w", "rtt", None).unwrap(), [(3, 1), (5, 3)]);
+    }
+
+    #[test]
+    fn hist_buckets_are_separated_by_aggregation() {
+        let store = Store::in_memory().unwrap();
+        store.hist_add("w", "weekday_hour", "rtt", 9, 5).unwrap();
+        store.hist_add("w", "hour", "rtt", 9, 3).unwrap();
+        assert_eq!(store.hist("w", "rtt", Some(("hour", 9))).unwrap(), [(3, 1)]);
+        assert_eq!(
+            store.hist("w", "rtt", Some(("weekday_hour", 9))).unwrap(),
+            [(5, 1)]
+        );
+        // 全体の分布は集計方式に依らないので、方式を変える前のサンプルも数える
+        assert_eq!(store.hist("w", "rtt", None).unwrap(), [(3, 1), (5, 1)]);
+    }
+
+    #[test]
+    fn v1_hist_is_kept_without_an_aggregation() {
+        let store = Store::in_memory_v1(&[
+            ("w", "rtt", 9, 5, 2),
+            ("w", "rtt", 30, 3, 1),
+            ("w", "loss", 0, 0, 5),
+        ])
+        .unwrap();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        // どの集計方式の時間帯としても読まないが、全体の分布には残る
+        for aggregate_by in ["weekday_hour", "hour", "none"] {
+            assert!(
+                store
+                    .hist("w", "rtt", Some((aggregate_by, 9)))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(store.hist("w", "rtt", None).unwrap(), [(3, 1), (5, 2)]);
+        assert_eq!(
+            store.v1_hist("w").unwrap(),
+            Some(V1Hist {
+                min_bucket: 0,
+                max_bucket: 30,
+                samples: 5
+            })
+        );
+        assert_eq!(store.v1_hist("other").unwrap(), None);
+    }
+
+    #[test]
+    fn v1_hist_is_adopted_once() {
+        let store =
+            Store::in_memory_v1(&[("w", "rtt", 9, 5, 2), ("other", "rtt", 9, 5, 1)]).unwrap();
+        store.hist_add("w", "hour", "rtt", 9, 5).unwrap();
+        store.resolve_v1_hist("w", Some("hour")).unwrap();
+        assert_eq!(store.hist("w", "rtt", Some(("hour", 9))).unwrap(), [(5, 3)]);
+        assert_eq!(store.v1_hist("w").unwrap(), None);
+        // 2 回目以降は引き取るものがない
+        store.resolve_v1_hist("w", Some("weekday_hour")).unwrap();
+        assert!(
+            store
+                .hist("w", "rtt", Some(("weekday_hour", 9)))
+                .unwrap()
+                .is_empty()
+        );
+        // 他の watch の分布はその watch が引き取るまで残る
+        assert!(store.v1_hist("other").unwrap().is_some());
+    }
+
+    #[test]
+    fn unresolved_v1_hist_counts_only_overall() {
+        let store = Store::in_memory_v1(&[("w", "rtt", 9, 5, 2)]).unwrap();
+        store.resolve_v1_hist("w", None).unwrap();
+        assert_eq!(store.v1_hist("w").unwrap(), None);
+        for aggregate_by in ["weekday_hour", "hour", "none"] {
+            assert!(
+                store
+                    .hist("w", "rtt", Some((aggregate_by, 9)))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(store.hist("w", "rtt", None).unwrap(), [(5, 2)]);
+    }
+
+    #[test]
+    fn probes_per_hour_follows_the_recorded_runs() {
+        let mut store = Store::in_memory().unwrap();
+        assert_eq!(store.probes_per_hour("w").unwrap(), 0.0);
+        // 5 分間隔で 2 時間
+        for i in 0..24 {
+            store.record_run("w", &run(i * 300, true)).unwrap();
+        }
+        let rate = store.probes_per_hour("w").unwrap();
+        assert!((rate - 12.0).abs() < 0.6, "{rate}");
+    }
+
+    #[test]
+    fn v1_file_database_is_migrated_on_open() {
+        let dir = std::env::temp_dir().join(format!("kuda-store-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kuda.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO baseline_hist (watch, series, bucket, bin, count)
+                 VALUES ('w', 'rtt', 9, 5, 2)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        assert_eq!(store.hist("w", "rtt", None).unwrap(), [(5, 2)]);
+        drop(store);
+        // 開き直しても版は進まず、データも変わらない
+        let store = Store::open(&path).unwrap();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        assert!(store.v1_hist("w").unwrap().is_some());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

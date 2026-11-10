@@ -6,7 +6,7 @@
 //! 百分位数の誤差はビン幅の半分（約 ±2.5%）に収まる。
 
 use crate::config::{AggregateBy, Baseline};
-use crate::store::Store;
+use crate::store::{Store, V1Hist};
 use crate::trigger::Variables;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
@@ -33,6 +33,53 @@ pub struct SeriesStats {
     pub samples: u64,
     pub p50: f64,
     pub p95: f64,
+}
+
+/// 永続化する集計方式の名前。bucket の値は同じ方式の中でしか比べられない
+fn aggregation_key(aggregate_by: AggregateBy) -> &'static str {
+    match aggregate_by {
+        AggregateBy::WeekdayHour => "weekday_hour",
+        AggregateBy::Hour => "hour",
+        AggregateBy::None => "none",
+    }
+}
+
+/// 集計方式がとりうる bucket の最大値
+fn max_bucket(aggregate_by: AggregateBy) -> i64 {
+    match aggregate_by {
+        AggregateBy::WeekdayHour => 7 * 24 - 1,
+        AggregateBy::Hour => 23,
+        AggregateBy::None => 0,
+    }
+}
+
+/// 集計方式を記録していなかった版の分布を、移行後に初めて使う時点の方式で記録したものとして引き取る。
+/// その方式で記録したとすると矛盾する分布は、時間帯別には使わず全体の統計にだけ残す
+fn adopt_v1(store: &Store, watch: &str, aggregate_by: AggregateBy) -> Result<()> {
+    let Some(v1) = store.v1_hist(watch)? else {
+        return Ok(());
+    };
+    let plausible = v1_recorded_by(aggregate_by, &v1, store.probes_per_hour(watch)?);
+    store.resolve_v1_hist(watch, plausible.then(|| aggregation_key(aggregate_by)))
+}
+
+/// 版 1 の分布が `aggregate_by` で記録されたとみて矛盾しないか。
+/// `probes_per_hour` は保持期間内の probe の頻度で、止まっていた時間も均すので実際より少なめに出る
+fn v1_recorded_by(aggregate_by: AggregateBy, v1: &V1Hist, probes_per_hour: f64) -> bool {
+    if v1.min_bucket < 0 || v1.max_bucket > max_bucket(aggregate_by) {
+        return false;
+    }
+    // bucket が範囲内でも、より粗い方式でも出る値（hour の 0..=23 や none の 0）しか無いと、
+    // 範囲からは方式を区別できない。本当に `aggregate_by` で記録したなら、その bucket に当たる
+    // 時刻にしか記録できていない（weekday_hour で 0..=23 だけなら月曜の 1 日、bucket 0 だけなら
+    // 0 時台の 1 時間）。その 2 倍を超えるサンプルがあれば、粗い方式で何日分も記録したとみなす。
+    // 頻度は少なめに出るので、迷う分布は引き取らない側に倒れる
+    let hours = match aggregate_by {
+        AggregateBy::WeekdayHour | AggregateBy::Hour if v1.max_bucket == 0 => 1.0,
+        AggregateBy::WeekdayHour if v1.max_bucket <= 23 => 24.0,
+        _ => return true,
+    };
+    v1.samples as f64 <= 2.0 * hours * probes_per_hour
 }
 
 fn bucket(aggregate_by: AggregateBy, time: DateTime<Local>) -> i64 {
@@ -85,19 +132,27 @@ pub fn update(
     metrics: &Variables,
     ts: i64,
 ) -> Result<()> {
+    adopt_v1(store, watch, config.aggregate_by)?;
+    let aggregate_by = aggregation_key(config.aggregate_by);
     let bucket = bucket(config.aggregate_by, local_time(ts));
     for (series, metric) in SERIES {
         // 対数ビンで表せない負の値（command の value）は統計に入れない
         if let Some(value) = metrics.get(metric).filter(|value| **value >= 0.0) {
-            store.hist_add(watch, series, bucket, bin_of(*value))?;
+            store.hist_add(watch, aggregate_by, series, bucket, bin_of(*value))?;
         }
     }
     Ok(())
 }
 
-/// `ts` の時間帯の統計を返す。全体でも min_samples に届かない系列は含まない
+/// `ts` の時間帯の統計を返す。全体でも min_samples に届かない系列は含まない。
+/// 時間帯別には現在の aggregate_by で記録した分布だけを使い、
+/// 全体の統計には方式を変える前の分布も含める（時間帯を問わないので意味が変わらない）
 pub fn stats(store: &Store, watch: &str, config: &Baseline, ts: i64) -> Result<Vec<SeriesStats>> {
-    let bucket = bucket(config.aggregate_by, local_time(ts));
+    adopt_v1(store, watch, config.aggregate_by)?;
+    let bucket = (
+        aggregation_key(config.aggregate_by),
+        bucket(config.aggregate_by, local_time(ts)),
+    );
     let mut result = Vec::new();
     for (series, _) in SERIES {
         let candidates = [(Source::Bucket, Some(bucket)), (Source::Overall, None)];
@@ -164,6 +219,144 @@ mod tests {
         assert_eq!(bucket(AggregateBy::WeekdayHour, tuesday), 33);
         assert_eq!(bucket(AggregateBy::Hour, tuesday), 9);
         assert_eq!(bucket(AggregateBy::None, tuesday), 0);
+        // 2026-11-08 は日曜
+        let sunday = local_time(at(2026, 11, 8, 23));
+        for aggregate_by in [
+            AggregateBy::WeekdayHour,
+            AggregateBy::Hour,
+            AggregateBy::None,
+        ] {
+            assert_eq!(bucket(aggregate_by, sunday), max_bucket(aggregate_by));
+        }
+    }
+
+    #[test]
+    fn changing_aggregate_by_does_not_reuse_old_buckets() {
+        let weekday_hour = config(30, AggregateBy::WeekdayHour);
+        let hour = config(30, AggregateBy::Hour);
+        // weekday_hour の bucket 9 は月曜 9 時、hour の bucket 9 は毎日 9 時
+        let (monday, tuesday) = (at(2026, 11, 2, 9), at(2026, 11, 3, 9));
+        for (before, after, recorded, queried) in [
+            (&weekday_hour, &hour, monday, tuesday),
+            (&hour, &weekday_hour, tuesday, monday),
+        ] {
+            let store = Store::in_memory().unwrap();
+            for _ in 0..30 {
+                update(&store, "w", before, &metrics(100.0), recorded).unwrap();
+            }
+            let stats = stats(&store, "w", after, queried).unwrap();
+            let rtt = stats.iter().find(|s| s.series == "rtt").unwrap();
+            // 時間帯としては使わず、全体の統計としてだけ使う
+            assert_eq!(rtt.source, Source::Overall);
+            assert_eq!(rtt.samples, 30);
+        }
+    }
+
+    const AGGREGATIONS: [AggregateBy; 3] = [
+        AggregateBy::WeekdayHour,
+        AggregateBy::Hour,
+        AggregateBy::None,
+    ];
+
+    /// 版 1 の kuda が `aggregate_by` で `start` から `hours` 時間、5 分おきに記録した DB
+    fn v1_store(aggregate_by: AggregateBy, start: i64, hours: i64) -> Store {
+        let times: Vec<i64> = (0..hours * 12).map(|i| start + i * 300).collect();
+        let mut counts = std::collections::BTreeMap::new();
+        for ts in &times {
+            *counts
+                .entry(bucket(aggregate_by, local_time(*ts)))
+                .or_insert(0) += 1;
+        }
+        let bin = bin_of(10.0);
+        let hist: Vec<_> = counts
+            .into_iter()
+            .map(|(bucket, count)| ("w", "rtt", bucket, bin, count))
+            .collect();
+        let mut store = Store::in_memory_v1(&hist).unwrap();
+        for ts in times {
+            let run = crate::probe::ProbeRun {
+                ts,
+                results: vec![crate::probe::TargetResult {
+                    target: "t".to_string(),
+                    ok: true,
+                    rtt_ms: Some(10.0),
+                    value: None,
+                    error: None,
+                }],
+            };
+            store.record_run("w", &run).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn v1_buckets_are_adopted_only_by_the_aggregation_that_recorded_them() {
+        // 月曜 0 時から 3 日分。月曜 0 時台はどの方式でも bucket 0 なので、
+        // 別の方式で記録した分布を引き取ると時間帯別の統計として使われてしまう
+        let start = at(2026, 11, 2, 0) - 30 * 60;
+        for recorded in AGGREGATIONS {
+            for current in AGGREGATIONS {
+                let store = v1_store(recorded, start, 72);
+                let stats = stats(&store, "w", &config(1, current), start).unwrap();
+                let rtt = stats.iter().find(|s| s.series == "rtt").unwrap();
+                let expected = if recorded == current {
+                    Source::Bucket
+                } else {
+                    Source::Overall
+                };
+                assert_eq!(rtt.source, expected, "{recorded:?} -> {current:?}");
+                if recorded != current {
+                    assert_eq!(rtt.samples, 3 * 24 * 12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_v1_history_is_adopted_by_weekday_hour() {
+        // 月曜の 1 日分だけなら bucket は 0..=23 に収まるが、weekday_hour の記録として矛盾しない
+        let monday = at(2026, 11, 2, 0) - 30 * 60;
+        let store = v1_store(AggregateBy::WeekdayHour, monday, 24);
+        let config = config(1, AggregateBy::WeekdayHour);
+        let stats = stats(&store, "w", &config, at(2026, 11, 2, 9)).unwrap();
+        let rtt = stats.iter().find(|s| s.series == "rtt").unwrap();
+        assert_eq!(rtt.source, Source::Bucket);
+        assert_eq!(rtt.samples, 12);
+    }
+
+    #[test]
+    fn v1_check_needs_a_known_probe_rate() {
+        // 頻度が分からなければ、範囲から区別できない分布は引き取らない
+        let v1 = V1Hist {
+            min_bucket: 0,
+            max_bucket: 23,
+            samples: 1,
+        };
+        assert!(!v1_recorded_by(AggregateBy::WeekdayHour, &v1, 0.0));
+        assert!(v1_recorded_by(AggregateBy::Hour, &v1, 0.0));
+    }
+
+    #[test]
+    fn buckets_accumulate_again_after_changing_aggregate_by() {
+        let store = Store::in_memory().unwrap();
+        let ts = at(2026, 11, 3, 9);
+        for _ in 0..30 {
+            update(
+                &store,
+                "w",
+                &config(1, AggregateBy::WeekdayHour),
+                &metrics(10.0),
+                ts,
+            )
+            .unwrap();
+        }
+        let hour = config(1, AggregateBy::Hour);
+        update(&store, "w", &hour, &metrics(100.0), ts).unwrap();
+        let stats = stats(&store, "w", &hour, ts).unwrap();
+        let rtt = stats.iter().find(|s| s.series == "rtt").unwrap();
+        assert_eq!(rtt.source, Source::Bucket);
+        assert_eq!(rtt.samples, 1);
+        assert!((rtt.p50 - 100.0).abs() < 5.0, "{}", rtt.p50);
     }
 
     #[test]

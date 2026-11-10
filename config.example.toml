@@ -29,6 +29,9 @@ interval = "5m"
 
   [watch.baseline]
   metrics_retention = "7d"
+  # 変えると時間帯別の統計は 0 から貯め直す（全体の統計は引き継ぐ）。
+  # kuda の更新と同時には変えず、更新後に 1 回 check を走らせてから変える
+  # （更新前の統計は、更新後の最初の check の設定で記録されたものとして引き継ぐため）
   aggregate_by = "weekday_hour"
   min_samples = 30                # これ未満の時間帯は全体の統計で代用
   snapshot_collectors = ["adapters", "routes", "dns_config", "traceroute:1.1.1.1"]
