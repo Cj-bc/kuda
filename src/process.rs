@@ -505,6 +505,54 @@ mod tests {
         );
     }
 
+    /// テストバイナリ自身をこの環境変数付きで起動すると、孫を起動するコマンドを run で走らせる側になる
+    #[cfg(unix)]
+    const SIGNAL_HELPER_DIR: &str = "KUDA_TEST_SIGNAL_HELPER_DIR";
+
+    #[cfg(unix)]
+    #[test]
+    fn stops_commands_when_signalled() {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(dir) = std::env::var_os(SIGNAL_HELPER_DIR) {
+            let dir = PathBuf::from(dir);
+            let command = spawns_grandchild(&dir.join("started"), &dir.join("late"), false);
+            let _ = run(command, None, Duration::from_secs(30));
+            return;
+        }
+
+        let dir = marker_dir("signal-tree");
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::stops_commands_when_signalled",
+                "--nocapture",
+            ])
+            .env(SIGNAL_HELPER_DIR, &dir)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let waiting = Instant::now() + Duration::from_secs(10);
+        while !dir.join("started").exists() && Instant::now() < waiting {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let begun = Instant::now();
+        assert!(dir.join("started").exists(), "grandchild did not start");
+
+        let pid = libc::pid_t::try_from(helper.id()).unwrap();
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let status = helper.wait().unwrap();
+        // ハンドラが既定の動作で受け直すので、シグナルによる終了になる
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(
+            !grandchild_finished(&dir, begun),
+            "grandchild kept running after kuda was signalled"
+        );
+    }
+
     #[test]
     fn passes_stdin() {
         let script = if cfg!(windows) {
