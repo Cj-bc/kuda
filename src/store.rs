@@ -261,15 +261,33 @@ impl Store {
         Ok(state.unwrap_or_default())
     }
 
+    /// last_snapshot だけを更新する。check と snapshot のどちらからも呼ばれるので、
+    /// 他の列は読み込んだ時点の値で上書きしない
+    pub fn set_last_snapshot(&self, watch: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO watch_state (watch, last_snapshot, streak, active)
+             VALUES (?1, ?2, 0, 0)
+             ON CONFLICT (watch) DO UPDATE SET last_snapshot = excluded.last_snapshot",
+            params![watch, ts],
+        )?;
+        Ok(())
+    }
+
+    /// check が所有する probe と trigger の状態を保存する。`state.last_snapshot` は
+    /// 書かない（snapshot と並行しても巻き戻さないよう、`set_last_snapshot` で更新する）
     pub fn save_state(&self, watch: &str, state: &WatchState) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO watch_state
-             (watch, last_probe, last_snapshot, streak, since, last_fired, active)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO watch_state (watch, last_probe, streak, since, last_fired, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (watch) DO UPDATE SET
+                 last_probe = excluded.last_probe,
+                 streak = excluded.streak,
+                 since = excluded.since,
+                 last_fired = excluded.last_fired,
+                 active = excluded.active",
             params![
                 watch,
                 state.last_probe,
-                state.last_snapshot,
                 state.trigger.streak,
                 state.trigger.since,
                 state.trigger.last_fired,
@@ -379,7 +397,72 @@ mod tests {
             },
         };
         store.save_state("w", &state).unwrap();
+        store.set_last_snapshot("w", 2).unwrap();
         assert_eq!(store.load_state("w").unwrap(), state);
+    }
+
+    #[test]
+    fn last_snapshot_alone_creates_default_state() {
+        let store = Store::in_memory().unwrap();
+        store.set_last_snapshot("w", 2).unwrap();
+        let expected = WatchState {
+            last_snapshot: Some(2),
+            ..WatchState::default()
+        };
+        assert_eq!(store.load_state("w").unwrap(), expected);
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kuda-store-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("kuda.db")
+    }
+
+    #[test]
+    fn snapshot_does_not_roll_back_check_state() {
+        let path = temp_db("snapshot-race");
+        let snapshot = Store::open(&path).unwrap();
+        let check = Store::open(&path).unwrap();
+
+        // snapshot が状態を読んで収集している間に、check が状態を進めて保存する
+        let stale = snapshot.load_state("w").unwrap();
+        let mut checked = check.load_state("w").unwrap();
+        checked.last_probe = Some(10);
+        checked.trigger = TriggerState {
+            streak: 3,
+            since: Some(4),
+            last_fired: Some(5),
+            active: true,
+        };
+        check.save_state("w", &checked).unwrap();
+        snapshot.set_last_snapshot("w", 20).unwrap();
+
+        let state = check.load_state("w").unwrap();
+        assert_eq!(stale, WatchState::default());
+        assert_eq!(state.last_probe, Some(10));
+        assert_eq!(state.last_snapshot, Some(20));
+        assert_eq!(state.trigger, checked.trigger);
+        drop((snapshot, check));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn check_does_not_roll_back_last_snapshot() {
+        let path = temp_db("check-race");
+        let snapshot = Store::open(&path).unwrap();
+        let check = Store::open(&path).unwrap();
+
+        // check が状態を読んだ後に snapshot が完了し、その後で check が保存する
+        let mut state = check.load_state("w").unwrap();
+        snapshot.set_last_snapshot("w", 20).unwrap();
+        state.last_probe = Some(30);
+        check.save_state("w", &state).unwrap();
+
+        let state = snapshot.load_state("w").unwrap();
+        assert_eq!(state.last_probe, Some(30));
+        assert_eq!(state.last_snapshot, Some(20));
+        drop((snapshot, check));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
