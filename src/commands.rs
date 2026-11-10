@@ -386,20 +386,27 @@ pub fn status(config: &Config, paths: &Paths) -> Result<()> {
         print_probe_status(&store, watch, &state)?;
         let stats = baseline::stats(&store, &watch.name, &watch.baseline, now())?;
         print_baseline(&stats);
-        let last_snapshot = state.last_snapshot.map_or("none".to_string(), format_time);
-        if state.last_snapshot == state.last_complete_snapshot {
-            println!("  last snapshot: {last_snapshot}");
-        } else {
-            let complete = state
-                .last_complete_snapshot
-                .map_or("none".to_string(), format_time);
-            println!(
-                "  last snapshot: {last_snapshot} (some collectors failed; last complete: {complete})"
-            );
-        }
+        println!("  last snapshot: {}", snapshot_status(&state));
         print_trigger_status(watch, &state, now());
     }
     Ok(())
+}
+
+/// 最後の取得時刻と、そのとき失敗した collector があったか。
+/// 全 collector が成功した記録がまだ無いとき（版 3 へ上げた直後を含む）は、失敗とは言い切らない
+fn snapshot_status(state: &WatchState) -> String {
+    let Some(last) = state.last_snapshot else {
+        return "none".to_string();
+    };
+    match state.last_complete_snapshot {
+        Some(complete) if complete == last => format_time(last),
+        Some(complete) => format!(
+            "{} (some collectors failed; last complete: {})",
+            format_time(last),
+            format_time(complete)
+        ),
+        None => format!("{} (no complete snapshot recorded yet)", format_time(last)),
+    }
 }
 
 fn print_probe_status(store: &Store, watch: &Watch, state: &WatchState) -> Result<()> {
@@ -553,6 +560,25 @@ mod tests {
             last_complete_snapshot: complete,
             ..WatchState::default()
         }
+    }
+
+    #[test]
+    fn snapshot_status_tells_failures_from_unknown() {
+        assert_eq!(snapshot_status(&snapshot_state(None, None)), "none");
+        assert_eq!(
+            snapshot_status(&snapshot_state(Some(100), Some(100))),
+            format_time(100)
+        );
+        let failed = snapshot_status(&snapshot_state(Some(200), Some(100)));
+        assert!(failed.contains("some collectors failed"), "{failed}");
+        assert!(failed.contains(&format_time(100)), "{failed}");
+        // 版 3 へ上げた直後は成否の記録が無いので、失敗とは表示しない
+        let unknown = snapshot_status(&snapshot_state(Some(200), None));
+        assert!(!unknown.contains("failed"), "{unknown}");
+        assert!(
+            unknown.contains("no complete snapshot recorded yet"),
+            "{unknown}"
+        );
     }
 
     #[test]
