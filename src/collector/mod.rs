@@ -22,19 +22,33 @@ fn collect(spec: &CollectorSpec) -> Result<Value> {
 
 /// 全 collector を並列に実行する。個別の失敗はスナップショット内に記録して続行する
 pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64) -> Value {
+    take_snapshot_with(specs, taken_at, collect)
+}
+
+/// `collect` で各 collector を実行する。panic も失敗として記録する。
+/// 結果から落とすと、全 collector が成功した取得に見えてしまう
+fn take_snapshot_with(
+    specs: &[CollectorSpec],
+    taken_at: i64,
+    collect: fn(&CollectorSpec) -> Result<Value>,
+) -> Value {
     let results: Vec<(String, Value)> = std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
-            .map(|spec| scope.spawn(move || (spec.name(), collect(spec))))
+            .map(|spec| (spec.name(), scope.spawn(move || collect(spec))))
             .collect();
         handles
             .into_iter()
-            .filter_map(|handle| handle.join().ok())
-            .map(|(name, result)| match result {
-                Ok(data) => (name, json!({ "ok": true, "data": data })),
-                Err(error) => {
-                    log::warn!("collector {name} failed: {error:#}");
-                    (name, json!({ "ok": false, "error": format!("{error:#}") }))
+            .map(|(name, handle)| {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("collector panicked")));
+                match result {
+                    Ok(data) => (name, json!({ "ok": true, "data": data })),
+                    Err(error) => {
+                        log::warn!("collector {name} failed: {error:#}");
+                        (name, json!({ "ok": false, "error": format!("{error:#}") }))
+                    }
                 }
             })
             .collect()
@@ -73,6 +87,25 @@ mod tests {
                 .get("traceroute:kuda.invalid")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_panicking_collector_is_recorded_as_failed() {
+        fn collect(spec: &CollectorSpec) -> Result<Value> {
+            match spec {
+                CollectorSpec::Routes => panic!("boom"),
+                _ => Ok(json!([])),
+            }
+        }
+        let specs = [CollectorSpec::Routes, CollectorSpec::DnsConfig];
+        let snapshot = take_snapshot_with(&specs, 42, collect);
+        assert_eq!(snapshot["collectors"]["routes"]["ok"], false);
+        assert_eq!(
+            snapshot["collectors"]["routes"]["error"],
+            "collector panicked"
+        );
+        assert_eq!(snapshot["collectors"]["dns_config"]["ok"], true);
+        assert_eq!(failed_collectors(&snapshot), ["routes"]);
     }
 
     #[test]
