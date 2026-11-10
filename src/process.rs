@@ -141,19 +141,86 @@ impl Drop for Tree {
     }
 }
 
+/// 実行中の子のプロセスグループ ID。0 は空き。
+/// 別グループにした子には端末の Ctrl-C などが届かないので、kuda が受けたシグナルで
+/// ここに載っているグループを止める。シグナルハンドラから読むので固定長のアトミックにする
 #[cfg(unix)]
-struct Tree;
+static GROUPS: [std::sync::atomic::AtomicI32; 64] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; 64];
+
+/// 載っているグループをすべて止めてから、既定の動作（終了）でシグナルを受け直す。
+/// async-signal-safe な処理だけを使う
+#[cfg(unix)]
+extern "C" fn on_terminating_signal(signal: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    for slot in &GROUPS {
+        let pgid = slot.load(Ordering::SeqCst);
+        if pgid > 0 {
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// SIGINT / SIGTERM / SIGHUP のハンドラを一度だけ入れる。
+/// 既定以外（nohup による無視など）になっているシグナルはそのままにする
+#[cfg(unix)]
+fn install_signal_handlers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            unsafe {
+                let mut current: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(signal, std::ptr::null(), &mut current) != 0
+                    || current.sa_sigaction != libc::SIG_DFL
+                {
+                    continue;
+                }
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction =
+                    on_terminating_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+struct Tree {
+    /// GROUPS の中で使っている枠。埋まっていたときは None で、シグナル時に止められない
+    slot: Option<usize>,
+}
 
 #[cfg(unix)]
 impl Tree {
     /// 子を新しいプロセスグループの長にする。孫は特に何もしなければ同じグループに入る
     fn prepare(command: &mut Command) -> Self {
         use std::os::unix::process::CommandExt;
+        install_signal_handlers();
         command.process_group(0);
-        Tree
+        Tree { slot: None }
     }
 
-    fn attach(&mut self, _child: &mut Child) {}
+    /// シグナルで止める対象に載せる。spawn からここまでの間に届いたシグナルでは止められない
+    fn attach(&mut self, child: &mut Child) {
+        use std::sync::atomic::Ordering;
+        let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
+            return;
+        };
+        self.slot = GROUPS.iter().position(|slot| {
+            slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        });
+        if self.slot.is_none() {
+            log::debug!("too many running commands to stop them on signals");
+        }
+    }
 
     /// 子が終わったかを、回収（reap）せずに調べる。回収するまで子の PID は再利用されないので、
     /// 終了後でもグループ ID（= 子の PID）を安全に killpg できる
@@ -179,14 +246,28 @@ impl Tree {
         Ok(unsafe { info.si_pid() } != 0)
     }
 
-    /// 子を回収する前に呼ぶ。回収前なのでグループ ID（= 子の PID）が他に再利用されることはない
+    /// 子を回収する前に呼ぶ。シグナル用の枠も、回収後に別のグループを止めないようここで外す
     fn kill(&mut self, child: &mut Child) {
         if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
             unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
             }
         }
+        self.release();
         let _ = child.kill();
+    }
+
+    fn release(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            GROUPS[slot].store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Tree {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
