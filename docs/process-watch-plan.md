@@ -416,14 +416,17 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 
 # Linux（WSL の Nix の devShell）。Windows 側の target/ と混ざらないように target を分ける
-wsl -e env CARGO_TARGET_DIR=/tmp/kuda-target /root/.nix-profile/bin/nix develop -c cargo test
-wsl -e env CARGO_TARGET_DIR=/tmp/kuda-target /root/.nix-profile/bin/nix develop -c cargo clippy --all-targets -- -D warnings
+# flake は `path:.` で開く。worktree の .git は Windows のパスを指していて、git の flake としては開けないため
+# e2e は並列だと WSL 上で不安定（変更前の develop でも再現）なので、1 スレッドで流す
+wsl -e env CARGO_TARGET_DIR=/tmp/kuda-target /root/.nix-profile/bin/nix develop path:. -c cargo clippy --all-targets -- -D warnings
+wsl -e env CARGO_TARGET_DIR=/tmp/kuda-target /root/.nix-profile/bin/nix develop path:. -c cargo test --lib
+wsl -e env CARGO_TARGET_DIR=/tmp/kuda-target /root/.nix-profile/bin/nix develop path:. -c cargo test --test e2e -- --test-threads=1
 
 # Windows 向けのリリースビルド（T9 で確認）
 wsl -e /root/.nix-profile/bin/nix build .#kuda-windows
 ```
 
-Linux のコマンドがこの形で動くかは未確認。オーケストレーターは T0 の段階で一度試し、必要ならこの節を直してから実装担当に渡す。
+Linux のコマンドは T1/T2 の時点で、この形で動くことを確かめた。worktree で並行して動かすときは、`CARGO_TARGET_DIR` をタスクごとに分ける。
 
 ---
 
