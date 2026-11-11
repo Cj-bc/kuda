@@ -13,6 +13,7 @@ mod config;
 mod detach;
 mod diagnosis;
 mod incident;
+mod known_set;
 mod lock;
 mod logging;
 mod notify;
