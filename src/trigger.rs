@@ -4,24 +4,36 @@
 //! 値が無い変数（データ不足のベースラインや、全滅時の RTT）を含む比較は
 //! 「不明」になる。最終結果が不明なら発火しない。
 
-use crate::config::Trigger;
+use crate::config::{ProbeKind, Trigger};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-/// 条件式で使える変数
-pub const VARIABLES: [&str; 11] = [
-    "loss",
-    "rtt_p50",
-    "rtt_p95",
-    "rtt_max",
-    "value",
-    "baseline.rtt_p50",
-    "baseline.rtt_p95",
-    "baseline.loss_p50",
-    "baseline.loss_p95",
-    "baseline.value_p50",
-    "baseline.value_p95",
-];
+/// probe の種類ごとに、条件式で使える変数。
+///
+/// 式のパースでは検査しない。変数は probe の種類で決まり、パースの時点では
+/// どの probe の式か分からないので、`Config::validate_watch` が照合する。
+/// 網羅的に match しているのは、probe の種類を足したときに許可リストの決め忘れを防ぐため。
+pub fn variables_for(kind: ProbeKind) -> &'static [&'static str] {
+    match kind {
+        ProbeKind::Tcp
+        | ProbeKind::Icmp
+        | ProbeKind::Dns
+        | ProbeKind::Http
+        | ProbeKind::Command => &[
+            "loss",
+            "rtt_p50",
+            "rtt_p95",
+            "rtt_max",
+            "value",
+            "baseline.rtt_p50",
+            "baseline.rtt_p95",
+            "baseline.loss_p50",
+            "baseline.loss_p95",
+            "baseline.value_p50",
+            "baseline.value_p95",
+        ],
+    }
+}
 
 pub type Variables = BTreeMap<String, f64>;
 
@@ -220,11 +232,7 @@ impl Parser {
         self.pos += 1;
         match token {
             Some(Token::Number(n)) => Ok(Num::Literal(n)),
-            Some(Token::Ident(name)) if VARIABLES.contains(&name.as_str()) => Ok(Num::Var(name)),
-            Some(Token::Ident(name)) => Err(format!(
-                "unknown variable: {name} (available: {})",
-                VARIABLES.join(", ")
-            )),
+            Some(Token::Ident(name)) => Ok(Num::Var(name)),
             Some(Token::Op(op)) => Err(format!("unexpected {op:?}")),
             None => Err("unexpected end of expression".to_string()),
         }
@@ -253,6 +261,13 @@ impl Expr {
         &self.source
     }
 
+    /// 式の中で使っている変数名（出現順、重複なし）
+    pub fn variables(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        self.root.collect_variables(&mut names);
+        names
+    }
+
     /// 不明（判定材料が足りない）場合は発火させない
     pub fn matches(&self, vars: &Variables) -> bool {
         self.root.eval(vars) == Some(true)
@@ -260,6 +275,20 @@ impl Expr {
 }
 
 impl Cond {
+    fn collect_variables<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            Self::Or(a, b) | Self::And(a, b) => {
+                a.collect_variables(names);
+                b.collect_variables(names);
+            }
+            Self::Not(inner) => inner.collect_variables(names),
+            Self::Cmp(_, a, b) => {
+                a.collect_variables(names);
+                b.collect_variables(names);
+            }
+        }
+    }
+
     fn eval(&self, vars: &Variables) -> Option<bool> {
         match self {
             Self::Or(a, b) => match (a.eval(vars), b.eval(vars)) {
@@ -289,6 +318,22 @@ impl Cond {
 }
 
 impl Num {
+    fn collect_variables<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            Self::Literal(_) => {}
+            Self::Var(name) => {
+                if !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
+            }
+            Self::Neg(inner) => inner.collect_variables(names),
+            Self::Arith(_, a, b) => {
+                a.collect_variables(names);
+                b.collect_variables(names);
+            }
+        }
+    }
+
     fn eval(&self, vars: &Variables) -> Option<f64> {
         match self {
             Self::Literal(value) => Some(*value),
@@ -429,12 +474,33 @@ mod tests {
             "loss >= 0.5 ||",
             "(loss > 1",
             "loss > 1 2",
-            "nope > 1",
-            "baseline.nope > 1",
             "loss @ 1",
             "1.2.3 > 1",
         ] {
             assert!(Expr::try_from(bad.to_string()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn lists_variables_in_order_without_duplicates() {
+        let e = expr("loss > 0 || -rtt_p50 > baseline.rtt_p95 * 2 && (loss + value) > 1");
+        assert_eq!(
+            e.variables(),
+            ["loss", "rtt_p50", "baseline.rtt_p95", "value"]
+        );
+        assert!(expr("1 > 0").variables().is_empty());
+    }
+
+    #[test]
+    fn existing_probe_kinds_share_the_original_variables() {
+        for kind in [
+            ProbeKind::Tcp,
+            ProbeKind::Icmp,
+            ProbeKind::Dns,
+            ProbeKind::Http,
+            ProbeKind::Command,
+        ] {
+            assert_eq!(variables_for(kind).len(), 11, "{kind:?}");
         }
     }
 

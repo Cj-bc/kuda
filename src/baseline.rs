@@ -434,7 +434,8 @@ mod tests {
         update(&store, "w", &config, &metrics(10.0), ts).unwrap();
         let variables = variables(&stats(&store, "w", &config, ts).unwrap());
         for name in variables.keys() {
-            assert!(crate::trigger::VARIABLES.contains(&name.as_str()), "{name}");
+            let available = crate::trigger::variables_for(crate::config::ProbeKind::Tcp);
+            assert!(available.contains(&name.as_str()), "{name}");
         }
         assert!(variables.contains_key("baseline.rtt_p95"));
         assert_eq!(variables["baseline.loss_p95"], 0.0);

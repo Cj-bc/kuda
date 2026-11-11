@@ -1,7 +1,7 @@
 //! config.toml の読み込みと検証。
 
 use crate::paths::is_safe_name;
-use crate::trigger::Expr;
+use crate::trigger::{self, Expr};
 use anyhow::{Context, Result, bail, ensure};
 use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
@@ -370,6 +370,15 @@ impl Config {
         watch.probe.validate()?;
         if let Some(trigger) = &watch.trigger {
             ensure!(trigger.consecutive >= 1, "consecutive must be at least 1");
+            // 式の変数は probe の種類で決まるので、パースではなくここで照合する
+            let available = trigger::variables_for(watch.probe.kind);
+            for name in trigger.when.variables() {
+                ensure!(
+                    available.contains(&name),
+                    "unknown variable: {name} (available: {})",
+                    available.join(", ")
+                );
+            }
         }
         if let Some(diagnose) = &watch.diagnose {
             for kind in std::iter::once(diagnose.backend).chain(diagnose.fallback) {
@@ -533,6 +542,18 @@ mod tests {
         assert!(Config::parse(&with_allowed_commands(unknown)).is_err());
         let flat = "allowed_commands = [\"ping\"]\n";
         assert!(Config::parse(&with_allowed_commands(flat)).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_variable_in_trigger_and_lists_available() {
+        let with_when =
+            |when: &str| format!("{MINIMAL_WATCH}\n[watch.trigger]\nwhen = \"{when}\"\n");
+        assert!(Config::parse(&with_when("loss >= 0.5")).is_ok());
+        for bad in ["nope > 1", "loss > 1 || baseline.nope > 1"] {
+            let error = format!("{:#}", Config::parse(&with_when(bad)).unwrap_err());
+            assert!(error.contains("unknown variable"), "{error}");
+            assert!(error.contains("rtt_p50"), "{error}");
+        }
     }
 
     #[test]
