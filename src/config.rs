@@ -131,6 +131,7 @@ pub enum ProbeKind {
     Dns,
     Http,
     Command,
+    Process,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +396,10 @@ impl Config {
 
 impl Probe {
     fn validate(&self) -> Result<()> {
+        if self.kind == ProbeKind::Process {
+            // expected / ignore の検査は後続のタスクで足す
+            return Ok(());
+        }
         if self.kind == ProbeKind::Command {
             ensure!(!self.command.is_empty(), "command probe needs `command`");
             ensure!(self.targets.is_empty(), "command probe takes no `targets`");
@@ -416,7 +421,7 @@ impl Probe {
                         bail!("http target must be a URL: {target}");
                     }
                 }
-                ProbeKind::Icmp | ProbeKind::Dns | ProbeKind::Command => {}
+                ProbeKind::Icmp | ProbeKind::Dns | ProbeKind::Command | ProbeKind::Process => {}
             }
         }
         Ok(())

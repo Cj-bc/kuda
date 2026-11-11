@@ -529,6 +529,7 @@ mod tests {
 
     fn run() -> ProbeRun {
         ProbeRun {
+            processes: None,
             ts: 1000,
             results: vec![TargetResult {
                 target: "192.0.2.1:443".to_string(),

@@ -573,6 +573,7 @@ mod tests {
 
     fn run(ts: i64, ok: bool) -> ProbeRun {
         ProbeRun {
+            processes: None,
             ts,
             results: vec![TargetResult {
                 target: "t".to_string(),

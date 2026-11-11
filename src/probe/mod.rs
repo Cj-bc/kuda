@@ -4,11 +4,13 @@ mod command;
 mod dns;
 mod http;
 mod icmp;
+mod process;
 mod tcp;
 
 use crate::collector;
 use crate::config::{Probe, ProbeKind};
 use crate::trigger::Variables;
+pub use process::ProcessInfo;
 use serde::Serialize;
 use std::net::IpAddr;
 
@@ -58,6 +60,9 @@ impl TargetResult {
 pub struct ProbeRun {
     pub ts: i64,
     pub results: Vec<TargetResult>,
+    /// kind = "process" の列挙結果。他の kind では None
+    #[allow(dead_code)] // 読むのは分類側。後続のタスクで使う
+    pub processes: Option<Vec<ProcessInfo>>,
 }
 
 impl ProbeRun {
@@ -100,6 +105,8 @@ fn run_target(probe: &Probe, target: &str, gateway: Option<IpAddr>) -> Result<Sa
         ProbeKind::Dns => dns::check(target, probe.server.as_deref(), probe.timeout),
         ProbeKind::Http => http::check(target, probe.expect_status, probe.timeout),
         ProbeKind::Command => command::check(&probe.command, probe.timeout),
+        // run が先に分岐するので、ここには来ない
+        ProbeKind::Process => Err("process probe has no targets".to_string()),
     }
 }
 
@@ -114,6 +121,9 @@ fn expand_gateway(target: &str, gateway: Option<IpAddr>) -> Result<String, Strin
 
 /// 全ターゲットを並列に試す。所要時間は最も遅いターゲットで決まる
 pub fn run(probe: &Probe, ts: i64) -> ProbeRun {
+    if probe.kind == ProbeKind::Process {
+        return run_process(ts);
+    }
     let gateway = collector::default_gateway();
     let targets = match probe.kind {
         ProbeKind::Command => probe.command[..1].to_vec(),
@@ -136,7 +146,24 @@ pub fn run(probe: &Probe, ts: i64) -> ProbeRun {
             })
             .collect()
     });
-    ProbeRun { ts, results }
+    ProbeRun {
+        ts,
+        results,
+        processes: None,
+    }
+}
+
+/// 列挙の成否を、target = "processes" の 1 件で表す
+fn run_process(ts: i64) -> ProbeRun {
+    let (result, processes) = match process::enumerate() {
+        Ok(processes) => (Ok(Sample::default()), Some(processes)),
+        Err(e) => (Err(format!("{e:#}")), None),
+    };
+    ProbeRun {
+        ts,
+        results: vec![TargetResult::new("processes", result)],
+        processes,
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +183,7 @@ mod tests {
     #[test]
     fn metrics_aggregate_across_targets() {
         let run = ProbeRun {
+            processes: None,
             ts: 0,
             results: vec![
                 result(true, Some(30.0)),
@@ -174,12 +202,24 @@ mod tests {
     #[test]
     fn total_loss_has_no_rtt_metrics() {
         let run = ProbeRun {
+            processes: None,
             ts: 0,
             results: vec![result(false, None), result(false, None)],
         };
         let metrics = run.metrics();
         assert_eq!(metrics["loss"], 1.0);
         assert!(!metrics.contains_key("rtt_p50"));
+    }
+
+    #[test]
+    fn process_run_reports_enumeration_as_loss_only() {
+        let run = run_process(0);
+        assert_eq!(run.results.len(), 1);
+        assert_eq!(run.results[0].target, "processes");
+        assert!(run.processes.as_ref().is_some_and(|p| !p.is_empty()));
+        let metrics = run.metrics();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics["loss"], 0.0);
     }
 
     #[test]

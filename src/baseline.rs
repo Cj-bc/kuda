@@ -275,6 +275,7 @@ mod tests {
         let mut store = Store::in_memory_v1(&hist).unwrap();
         for ts in times {
             let run = crate::probe::ProbeRun {
+                processes: None,
                 ts,
                 results: vec![crate::probe::TargetResult {
                     target: "t".to_string(),
