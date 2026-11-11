@@ -32,6 +32,8 @@ pub fn variables_for(kind: ProbeKind) -> &'static [&'static str] {
             "baseline.value_p50",
             "baseline.value_p95",
         ],
+        // process の変数は分類を組み込むタスクで埋める
+        ProbeKind::Process => &[],
     }
 }
 
