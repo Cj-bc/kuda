@@ -6,6 +6,7 @@ use crate::config::{BackendKind, Config, Watch};
 use crate::detach;
 use crate::diagnosis;
 use crate::incident::{self, Evidence, Incident, format_time};
+use crate::investigation;
 use crate::known_set::{self, Classification, Roots};
 use crate::lock;
 use crate::logging;
@@ -109,7 +110,7 @@ fn check_watch(
     let mut metrics = run.metrics();
     let classification = match &run.processes {
         Some(processes) => {
-            let classification = classify_processes(store, watch, processes, &metrics, now)?;
+            let classification = classify_processes(store, paths, watch, processes, &metrics, now)?;
             metrics.extend(classification.metrics.clone());
             Some(classification)
         }
@@ -226,6 +227,15 @@ fn build_incident(
     incident::create(&paths.incidents_dir, &evidence, created)
 }
 
+fn register_investigation(paths: &Paths, watch: &str) -> Option<investigation::Registration> {
+    let result =
+        probe::enumerate().and_then(|processes| investigation::register(paths, watch, &processes));
+    result.unwrap_or_else(|error| {
+        log::warn!("{watch}: could not record the investigation: {error:#}");
+        None
+    })
+}
+
 fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
     watch
         .trigger
@@ -240,13 +250,16 @@ fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
 /// 何も学習しない前提でやり直す。やり直すと pending が増えるだけなので、成立したままになる
 fn classify_processes(
     store: &Store,
+    paths: &Paths,
     watch: &Watch,
     processes: &[ProcessInfo],
     metrics: &Variables,
     now: i64,
 ) -> Result<Classification> {
     let roots = Roots::from_env();
-    let excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
+    // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
+    let mut excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
+    excluded.extend(investigation::running(paths, processes));
     let classify =
         |learn| known_set::classify(store, watch, processes, &excluded, &roots, now, learn);
     let classification = classify(true)?;
@@ -393,6 +406,8 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         println!("an investigation for {} is already running", watch.name);
         return Ok(());
     }
+    // 調査の間だけ記録し、check のプロセス監視が調査プロセスを未知として数えないようにする
+    let _registration = register_investigation(paths, &watch.name);
     let notify = options.notify && config.general.notify;
     if notify {
         notify::send(&Event::Started { watch: &watch.name });
@@ -702,7 +717,7 @@ mod tests {
     }
 
     /// 実際に列挙して check_watch を通す。学習期間が無い watch なので、初回に見えたものは
-    /// すべて pending になって発火し、報告済みになる。次の回は何も数えず、事件も増えない
+    /// すべて pending になって発火し、報告済みになる。次の回でも報告済みのまま残る
     #[test]
     fn process_watch_reports_unknown_processes_once() {
         let dir = std::env::temp_dir().join(format!("kuda-check-{}", std::process::id()));
@@ -744,7 +759,13 @@ mod tests {
         assert_eq!(incidents(), 1);
 
         check_watch(&mut store, &paths, watch, true, 2000).unwrap();
-        assert_eq!(incidents(), 1);
+        // 並行するテストが新しいプロセスを起こすので、事件の数は数えない。報告済みは戻らない
+        let after = store.identity_statuses("p").unwrap();
+        assert!(
+            statuses
+                .keys()
+                .all(|key| after[key] == crate::store::IdentityStatus::Reported)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
