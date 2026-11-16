@@ -3,9 +3,10 @@
   "checkpoint_id": "01M7HDDG0SRYFZ1H4NW207144H",
   "strategy": "manual-commit",
   "branch": "feature/process-watch",
-  "checkpoints_count": 2,
+  "checkpoints_count": 3,
   "files_touched": [
     "src/commands.rs",
+    "src/known_set.rs",
     "src/store.rs"
   ],
   "sessions": [
@@ -15,20 +16,27 @@
       "compact_transcript": "/0/transcript.jsonl",
       "content_hash": "/0/content_hash.txt",
       "prompt": ""
+    },
+    {
+      "metadata": "/1/metadata.json",
+      "transcript": "/1/full.jsonl",
+      "compact_transcript": "/1/transcript.jsonl",
+      "content_hash": "/1/content_hash.txt",
+      "prompt": "/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 0,
-    "cache_creation_tokens": 0,
-    "cache_read_tokens": 0,
-    "output_tokens": 0,
-    "api_call_count": 0,
+    "input_tokens": 12,
+    "cache_creation_tokens": 19473,
+    "cache_read_tokens": 390074,
+    "output_tokens": 3443,
+    "api_call_count": 5,
     "subagent_tokens": {
-      "input_tokens": 46,
-      "cache_creation_tokens": 39061,
-      "cache_read_tokens": 3033207,
-      "output_tokens": 28954,
-      "api_call_count": 23
+      "input_tokens": 70,
+      "cache_creation_tokens": 47030,
+      "cache_read_tokens": 3916239,
+      "output_tokens": 34359,
+      "api_call_count": 35
     },
     "subagent_tokens_complete": true
   },
