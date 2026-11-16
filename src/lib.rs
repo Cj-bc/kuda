@@ -57,6 +57,8 @@ enum Command {
     },
     /// Build an incident directory and investigate it with an LLM
     Diagnose {
+        /// Name of the watch to investigate (the `name` of a [[watch]] in the config;
+        /// it must have a [watch.diagnose] table)
         #[arg(long)]
         watch: String,
         /// Only build the incident directory; do not call an LLM
