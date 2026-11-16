@@ -1,0 +1,14 @@
+{
+  "tool_use_id": "toolu_01Y8YHnk3EpgWGmy4efJ3rJC",
+  "agent_id": "a4bd3e4bc4affc0aa",
+  "task_description": "Implement T4 process watch",
+  "token_usage": {
+    "input_tokens": 112,
+    "cache_creation_tokens": 165678,
+    "cache_read_tokens": 6995182,
+    "output_tokens": 51319,
+    "api_call_count": 55
+  },
+  "started_at": "2026-11-16T14:25:11.4320641+09:00",
+  "completed_at": "2026-11-16T14:35:56.5651786+09:00"
+}
