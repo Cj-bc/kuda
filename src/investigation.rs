@@ -12,12 +12,12 @@ use std::path::PathBuf;
 
 const PREFIX: &str = "investigating-";
 
-/// 記録を、Drop で消す。異常終了で残っても、`running` が生きていないものとして掃除する
+/// 記録を、Drop で消す。異常終了で残っても、`running` が生きていないものとして無視する
 pub struct Registration(PathBuf);
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        // 消せなくても出来ることがない。残っても次の check が掃除する
+        // 消せなくても出来ることがない。残っても害はない（`running` が無視し、次の調査が上書きする）
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -39,7 +39,8 @@ pub fn register(
 }
 
 /// 生きている調査プロセスの (PID, 起動時刻)。
-/// PID と起動時刻が一致するプロセスがいない記録は、前回の異常終了の残りなので消す
+/// 一致するプロセスがいない記録は無視するだけで消さない。check の列挙の直後に始まった調査の
+/// 記録も、列挙結果には一致しないので、消すと生きている調査を巻き込む
 pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
     let Ok(entries) = std::fs::read_dir(&paths.data_dir) else {
         return Vec::new();
@@ -61,8 +62,6 @@ pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
             .any(|p| p.pid == root.0 && p.started == Some(root.1))
         {
             roots.push(root);
-        } else {
-            let _ = std::fs::remove_file(entry.path());
         }
     }
     roots
@@ -114,12 +113,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_records_are_ignored_and_cleaned_up() {
+    fn stale_records_are_ignored_but_kept() {
         let paths = paths("stale");
         let registration = register(&paths, "w", &[me(42)]).unwrap().unwrap();
         // 同じ PID でも起動時刻が違えば、別のプロセスが PID を再利用している
         assert!(running(&paths, &[me(43)]).is_empty());
-        assert!(!registration.0.exists());
+        // 消さない。列挙の直後に始まった調査の記録かもしれない
+        assert!(registration.0.exists());
+        assert_eq!(running(&paths, &[me(42)]).len(), 1);
         std::mem::forget(registration);
         std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
