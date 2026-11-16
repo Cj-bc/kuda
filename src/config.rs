@@ -149,6 +149,13 @@ pub struct Probe {
     /// kind = "command": 実行するコマンドと引数
     #[serde(default)]
     pub command: Vec<String>,
+    /// kind = "process": いるはずのプロセス。正規化後のパスに対する glob で、
+    /// 1 つも動いていないパターンを `missing` に数える
+    #[serde(default)]
+    pub expected: Vec<String>,
+    /// kind = "process": 監視しないパス（glob）。数えもせず、学習もしない
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -207,6 +214,9 @@ pub struct Baseline {
     #[serde(deserialize_with = "duration")]
     pub snapshot_interval: Duration,
     pub keep_good_snapshots: u32,
+    /// kind = "process": 最初の probe から、見たものをすべて既知として登録する期間。必須
+    #[serde(deserialize_with = "optional_duration")]
+    pub learn_for: Option<Duration>,
 }
 
 impl Default for Baseline {
@@ -218,6 +228,7 @@ impl Default for Baseline {
             snapshot_collectors: Vec::new(),
             snapshot_interval: Duration::from_secs(6 * 3600),
             keep_good_snapshots: 5,
+            learn_for: None,
         }
     }
 }
@@ -299,6 +310,15 @@ fn duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::E
     parse_duration(&text).map_err(serde::de::Error::custom)
 }
 
+fn optional_duration<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    parse_duration(&text)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 /// "500ms" "3s" "5m" "6h" "7d" 形式の期間を解釈する
 pub fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
     let error = || format!("invalid duration: {text:?} (expected e.g. 500ms, 3s, 5m, 6h, 7d)");
@@ -369,6 +389,17 @@ impl Config {
 
     fn validate_watch(&self, watch: &Watch) -> Result<()> {
         watch.probe.validate()?;
+        if watch.probe.kind == ProbeKind::Process {
+            ensure!(
+                watch.baseline.learn_for.is_some(),
+                "process probe needs `learn_for` in [watch.baseline]"
+            );
+        } else {
+            ensure!(
+                watch.baseline.learn_for.is_none(),
+                "`learn_for` is only for kind = \"process\""
+            );
+        }
         if let Some(trigger) = &watch.trigger {
             ensure!(trigger.consecutive >= 1, "consecutive must be at least 1");
             // 式の変数は probe の種類で決まるので、パースではなくここで照合する
@@ -397,9 +428,14 @@ impl Config {
 impl Probe {
     fn validate(&self) -> Result<()> {
         if self.kind == ProbeKind::Process {
-            // expected / ignore の検査は後続のタスクで足す
+            ensure!(self.targets.is_empty(), "process probe takes no `targets`");
+            ensure!(self.command.is_empty(), "process probe takes no `command`");
             return Ok(());
         }
+        ensure!(
+            self.expected.is_empty() && self.ignore.is_empty(),
+            "`expected` and `ignore` are only for kind = \"process\""
+        );
         if self.kind == ProbeKind::Command {
             ensure!(!self.command.is_empty(), "command probe needs `command`");
             ensure!(self.targets.is_empty(), "command probe takes no `targets`");
@@ -559,6 +595,58 @@ mod tests {
             assert!(error.contains("unknown variable"), "{error}");
             assert!(error.contains("rtt_p50"), "{error}");
         }
+    }
+
+    const PROCESS_WATCH: &str = r#"
+        [[watch]]
+        name = "p"
+        [watch.probe]
+        kind = "process"
+        expected = ['c:\windows\*']
+        ignore = ['c:\tmp\*']
+        [watch.baseline]
+        learn_for = "7d"
+        [watch.trigger]
+        when = "masquerade >= 1 || unknown >= 3"
+    "#;
+
+    #[test]
+    fn process_watch_is_valid() {
+        let config = Config::parse(PROCESS_WATCH).unwrap();
+        let watch = config.watch("p").unwrap();
+        assert_eq!(watch.probe.kind, ProbeKind::Process);
+        assert_eq!(watch.probe.expected.len(), 1);
+        assert_eq!(watch.probe.ignore.len(), 1);
+        assert_eq!(watch.baseline.learn_for, Some(Duration::from_secs(604800)));
+        // timeout は使わないので既定値のままでよい
+        assert_eq!(watch.probe.timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn process_watch_rejects_wrong_combinations() {
+        let with = |extra: &str| {
+            PROCESS_WATCH.replace(
+                "kind = \"process\"",
+                &format!("kind = \"process\"\n{extra}"),
+            )
+        };
+        assert!(Config::parse(&with("targets = [\"a:1\"]")).is_err());
+        assert!(Config::parse(&with("command = [\"x\"]")).is_err());
+        assert!(Config::parse(&PROCESS_WATCH.replace("learn_for = \"7d\"", "")).is_err());
+        let bad = PROCESS_WATCH.replace("masquerade >= 1", "baseline.rtt_p95 > 1");
+        let error = format!("{:#}", Config::parse(&bad).unwrap_err());
+        assert!(error.contains("unknown variable"), "{error}");
+        assert!(error.contains("unknown_user_writable"), "{error}");
+    }
+
+    #[test]
+    fn process_only_keys_are_rejected_for_other_kinds() {
+        for extra in ["expected = [\"a\"]", "ignore = [\"a\"]"] {
+            let text = MINIMAL_WATCH.replace("kind = \"tcp\"", &format!("kind = \"tcp\"\n{extra}"));
+            assert!(Config::parse(&text).is_err(), "{extra}");
+        }
+        let text = format!("{MINIMAL_WATCH}\n[watch.baseline]\nlearn_for = \"7d\"\n");
+        assert!(Config::parse(&text).is_err());
     }
 
     #[test]

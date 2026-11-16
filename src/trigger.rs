@@ -32,8 +32,15 @@ pub fn variables_for(kind: ProbeKind) -> &'static [&'static str] {
             "baseline.value_p50",
             "baseline.value_p95",
         ],
-        // process の変数は分類を組み込むタスクで埋める
-        ProbeKind::Process => &[],
+        // baseline.* は無い。時間帯の統計ではなく、既知の集合と比べる
+        ProbeKind::Process => &[
+            "loss",
+            "unknown",
+            "unknown_user_writable",
+            "masquerade",
+            "missing",
+            "process_count",
+        ],
     }
 }
 
@@ -504,6 +511,14 @@ mod tests {
         ] {
             assert_eq!(variables_for(kind).len(), 11, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn process_probe_has_its_own_variables() {
+        let vars = variables_for(ProbeKind::Process);
+        assert_eq!(vars.len(), 6);
+        assert!(vars.contains(&"masquerade"));
+        assert!(!vars.iter().any(|v| v.starts_with("baseline.")));
     }
 
     fn trigger(consecutive: u32, cooldown_secs: u64) -> Trigger {
