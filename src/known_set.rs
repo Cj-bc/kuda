@@ -1,14 +1,15 @@
-//! プロセスの識別と分類のうち、ストアに触れない純関数。
+//! プロセスの識別と分類。
 //!
-//! 環境変数や実行中の OS は関数の中で読まない。呼び出し側が [`Os`] と [`Roots`] を渡す。
-//! こうしておくと、Windows のパス規則のテストを Linux 上でも走らせられる。
-//! ストアを使う分類（`classify`）は別のタスクで足す。
+//! 識別・フラグ判定・除外・glob は純関数で、環境変数や実行中の OS は関数の中で読まない。
+//! 呼び出し側が [`Os`] と [`Roots`] を渡す。こうしておくと、Windows のパス規則のテストを
+//! Linux 上でも走らせられる。ストアを使う分類は [`classify`]。
 
-// 呼ぶのは分類と check 側。T4 で使うまで未使用になる
-#![allow(dead_code)]
-
+use crate::config::Watch;
 use crate::probe::ProcessInfo;
-use std::collections::{HashMap, HashSet};
+use crate::store::{IdentityStatus, Store};
+use crate::trigger::Variables;
+use anyhow::Result;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// パス規則を切り替えるための OS。実行中の OS とは限らない（テストのため）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +321,158 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     pattern[p..].iter().all(|&c| c == '*')
+}
+
+/// 自プロセスを `without_descendants` の根にするための (PID, 起動時刻)。
+/// 起動時刻は列挙結果から自 PID を引いて得る。見つからなければ除外できない
+pub fn own_root(processes: &[ProcessInfo]) -> Option<(u32, i64)> {
+    let pid = std::process::id();
+    processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .and_then(|p| p.started.map(|started| (pid, started)))
+}
+
+/// 1 回の probe で報告対象（pending）になった識別キーと、その代表のプロセス
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingProcess {
+    pub identity: Identity,
+    /// 同じ識別キーのプロセスのうち、PID が最小のもの
+    pub process: ProcessInfo,
+    pub user_writable: bool,
+    pub masquerade: bool,
+}
+
+/// 分類の結果。ストアには `record` を呼ぶまで書かない
+/// （異常と判定されたとき、学習しない形でやり直すため）
+#[derive(Debug, Clone, PartialEq)]
+pub struct Classification {
+    /// unknown / unknown_user_writable / masquerade / missing / process_count
+    pub metrics: Variables,
+    /// 今 動いている pending。事件の証拠にする
+    pub pending: Vec<PendingProcess>,
+    /// 新しく known として登録する識別キーの数
+    pub learned: usize,
+    /// 今回見た識別キーと、新規のときに登録する status
+    seen: Vec<(String, IdentityStatus)>,
+}
+
+impl Classification {
+    pub fn pending_identities(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .map(|p| p.identity.key.clone())
+            .collect()
+    }
+
+    /// 今回見た識別キーを記録する。学習期間の起点もここで決まる
+    pub fn record(&self, store: &mut Store, watch: &str, now: i64) -> Result<()> {
+        store.start_learning(watch, now)?;
+        store.observe_identities(watch, now, &self.seen)
+    }
+}
+
+/// 識別キーごとにまとめた、今 動いているプロセス
+struct Observed<'a> {
+    identity: Identity,
+    process: &'a ProcessInfo,
+    user_writable: bool,
+    masquerade: bool,
+}
+
+/// 動いているプロセスを既知の集合と照らして分類する。ストアは読むだけ。
+///
+/// `learn` が true で学習期間中なら、新しく見た識別キーを known にする（masquerade を除く）。
+/// それ以外の新しい識別キーは pending にする。`excluded` は kuda 自身と調査プロセスの根
+pub fn classify(
+    store: &Store,
+    watch: &Watch,
+    processes: &[ProcessInfo],
+    excluded: &[(u32, i64)],
+    roots: &Roots,
+    now: i64,
+    learn: bool,
+) -> Result<Classification> {
+    let os = roots.os;
+    let probe = &watch.probe;
+    let mut observed: BTreeMap<String, Observed> = BTreeMap::new();
+    for process in without_descendants(processes, excluded) {
+        let Some(identity) = identify(os, process) else {
+            continue;
+        };
+        if probe.ignore.iter().any(|g| glob_match(g, &identity.key)) {
+            continue;
+        }
+        let path = process.path.as_deref();
+        let masquerade = is_masquerade(roots, &process.name, path);
+        let user_writable = path.is_some_and(|p| is_user_writable(roots, p));
+        let entry = observed
+            .entry(identity.key.clone())
+            .or_insert_with(|| Observed {
+                identity,
+                process,
+                user_writable,
+                masquerade,
+            });
+        // 代表は PID が最小のもの。列挙の順序に結果を依存させない
+        if process.pid < entry.process.pid {
+            entry.process = process;
+        }
+        entry.masquerade |= masquerade;
+    }
+
+    let started = store.learning_started(&watch.name)?.unwrap_or(now);
+    let learning = watch
+        .baseline
+        .learn_for
+        .is_some_and(|d| now < started.saturating_add(d.as_secs() as i64));
+    let statuses = store.identity_statuses(&watch.name)?;
+
+    let mut seen = Vec::new();
+    let mut pending = Vec::new();
+    let mut learned = 0;
+    for (key, o) in &observed {
+        let status = match statuses.get(key) {
+            Some(status) => *status,
+            // 偽装は、学習期間中でも正常として覚えない
+            None if learn && learning && !o.masquerade => {
+                learned += 1;
+                IdentityStatus::Known
+            }
+            None => IdentityStatus::Pending,
+        };
+        seen.push((key.clone(), status));
+        if status == IdentityStatus::Pending {
+            pending.push(PendingProcess {
+                identity: o.identity.clone(),
+                process: o.process.clone(),
+                user_writable: o.user_writable,
+                masquerade: o.masquerade,
+            });
+        }
+    }
+
+    let count = |f: fn(&PendingProcess) -> bool| pending.iter().filter(|p| f(p)).count() as f64;
+    let missing = probe
+        .expected
+        .iter()
+        .filter(|g| !observed.keys().any(|key| glob_match(g, key)))
+        .count();
+    let mut metrics = Variables::new();
+    metrics.insert("unknown".to_string(), pending.len() as f64);
+    metrics.insert(
+        "unknown_user_writable".to_string(),
+        count(|p| p.user_writable),
+    );
+    metrics.insert("masquerade".to_string(), count(|p| p.masquerade));
+    metrics.insert("missing".to_string(), missing as f64);
+    metrics.insert("process_count".to_string(), observed.len() as f64);
+    Ok(Classification {
+        metrics,
+        pending,
+        learned,
+        seen,
+    })
 }
 
 #[cfg(test)]
@@ -691,5 +844,237 @@ mod tests {
             r"c:\users\*\documents\projects\*\target\*",
             r"c:\users\alice\documents\projects\github.com\a\target\debug\a.exe"
         ));
+    }
+
+    // ---- classify ----
+
+    use crate::config::{Baseline, Probe, ProbeKind};
+    use std::time::Duration;
+
+    const DAY: i64 = 86_400;
+
+    fn watch(expected: &[&str], ignore: &[&str]) -> Watch {
+        Watch {
+            name: "w".to_string(),
+            interval: Duration::from_secs(300),
+            probe: Probe {
+                kind: ProbeKind::Process,
+                targets: Vec::new(),
+                timeout: Duration::from_secs(3),
+                server: None,
+                expect_status: None,
+                command: Vec::new(),
+                expected: expected.iter().map(|s| s.to_string()).collect(),
+                ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            },
+            baseline: Baseline {
+                learn_for: Some(Duration::from_secs(7 * 86_400)),
+                ..Baseline::default()
+            },
+            trigger: None,
+            diagnose: None,
+        }
+    }
+
+    fn proc(pid: u32, name: &str, path: Option<&str>) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: None,
+            name: name.to_string(),
+            path: path.map(str::to_string),
+            user: None,
+            started: Some(1),
+        }
+    }
+
+    const NOTEPAD: &str = r"C:\Windows\System32\notepad.exe";
+    const DROPPER: &str = r"C:\Users\Alice\AppData\Local\Temp\x.exe";
+    const FAKE_SVCHOST: &str = r"C:\Users\Alice\svchost.exe";
+
+    /// 分類して、ストアに記録する
+    fn observe(
+        store: &mut Store,
+        watch: &Watch,
+        processes: &[ProcessInfo],
+        now: i64,
+        learn: bool,
+    ) -> Classification {
+        let c = classify(store, watch, processes, &[], &win_roots(), now, learn).unwrap();
+        c.record(store, &watch.name, now).unwrap();
+        c
+    }
+
+    fn metric(c: &Classification, name: &str) -> f64 {
+        c.metrics[name]
+    }
+
+    fn status(store: &Store, key: &str) -> Option<IdentityStatus> {
+        store.identity_statuses("w").unwrap().get(key).copied()
+    }
+
+    #[test]
+    fn everything_seen_while_learning_is_known() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        let procs = [proc(10, "notepad.exe", Some(NOTEPAD))];
+        let c = observe(&mut store, &w, &procs, 1000, true);
+        assert_eq!(metric(&c, "unknown"), 0.0);
+        assert_eq!(metric(&c, "process_count"), 1.0);
+        assert_eq!(c.learned, 1);
+        assert_eq!(
+            status(&store, r"c:\windows\system32\notepad.exe"),
+            Some(IdentityStatus::Known)
+        );
+    }
+
+    #[test]
+    fn new_identities_after_the_learning_period_are_pending() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        let notepad = proc(10, "notepad.exe", Some(NOTEPAD));
+        observe(&mut store, &w, std::slice::from_ref(&notepad), 1000, true);
+        // 起点は最初の probe。ちょうど 7 日後で期間は終わる
+        let end = 1000 + 7 * DAY;
+        let procs = [notepad.clone(), proc(11, "x.exe", Some(DROPPER))];
+        let c = observe(&mut store, &w, &procs, end - 1, true);
+        assert_eq!(metric(&c, "unknown"), 0.0, "期間内は学習する");
+        let procs = [notepad, proc(12, "y.exe", Some(r"C:\Users\Alice\y.exe"))];
+        let c = observe(&mut store, &w, &procs, end, true);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        assert_eq!(metric(&c, "unknown_user_writable"), 1.0);
+        assert_eq!(c.pending.len(), 1);
+        assert_eq!(c.pending[0].process.pid, 12);
+        assert_eq!(c.learned, 0);
+    }
+
+    #[test]
+    fn shortening_learn_for_ends_the_period_and_keeps_the_set() {
+        let mut store = Store::in_memory().unwrap();
+        let mut w = watch(&[], &[]);
+        let notepad = proc(10, "notepad.exe", Some(NOTEPAD));
+        observe(&mut store, &w, std::slice::from_ref(&notepad), 1000, true);
+        w.baseline.learn_for = Some(Duration::from_secs(60));
+        let procs = [notepad, proc(11, "x.exe", Some(DROPPER))];
+        let c = observe(&mut store, &w, &procs, 1100, true);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+    }
+
+    #[test]
+    fn masquerade_is_not_learned_as_normal() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        let procs = [
+            proc(10, "notepad.exe", Some(NOTEPAD)),
+            proc(11, "svchost.exe", Some(FAKE_SVCHOST)),
+        ];
+        let c = observe(&mut store, &w, &procs, 1000, true);
+        assert_eq!(metric(&c, "masquerade"), 1.0);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        assert_eq!(c.learned, 1);
+        assert_eq!(
+            status(&store, r"c:\users\alice\svchost.exe"),
+            Some(IdentityStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn nothing_is_learned_when_learning_is_not_allowed() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        let procs = [proc(10, "notepad.exe", Some(NOTEPAD))];
+        let c = observe(&mut store, &w, &procs, 1000, false);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        assert_eq!(c.learned, 0);
+        // pending の登録は行う。学習の再開後も、登録済みの status は変わらない
+        let c = observe(&mut store, &w, &procs, 1300, true);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        assert_eq!(store.identity_statuses("w").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reported_identities_are_not_counted_and_stay_reported() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        observe(&mut store, &w, &[], 1000, true);
+        let procs = [proc(11, "x.exe", Some(DROPPER))];
+        let c = observe(&mut store, &w, &procs, 1000 + 8 * DAY, true);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        store.mark_reported("w", &c.pending_identities()).unwrap();
+        let c = observe(&mut store, &w, &procs, 1000 + 9 * DAY, true);
+        assert_eq!(metric(&c, "unknown"), 0.0);
+        assert!(c.pending.is_empty());
+        assert_eq!(metric(&c, "process_count"), 1.0);
+        assert_eq!(
+            status(&store, r"c:\users\alice\appdata\local\temp\x.exe"),
+            Some(IdentityStatus::Reported)
+        );
+    }
+
+    #[test]
+    fn pending_remains_until_reported() {
+        // 抑制中は事件を作らず mark_reported も呼ばないので、次の回も pending のまま数える
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        observe(&mut store, &w, &[], 1000, true);
+        let procs = [proc(11, "x.exe", Some(DROPPER))];
+        for hours in [200, 201, 202] {
+            let c = observe(&mut store, &w, &procs, 1000 + hours * 3600, true);
+            assert_eq!(metric(&c, "unknown"), 1.0);
+        }
+    }
+
+    #[test]
+    fn expected_ignore_and_exclusions() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(
+            &[r"c:\windows\system32\notepad.exe", r"c:\nothing\*"],
+            &[r"c:\users\*\target\*"],
+        );
+        let mut kuda = proc(100, "kuda.exe", Some(r"C:\kuda\kuda.exe"));
+        kuda.started = Some(5);
+        let mut child = proc(101, "git.exe", Some(r"C:\git\git.exe"));
+        child.ppid = Some(100);
+        child.started = Some(6);
+        let procs = [
+            proc(10, "notepad.exe", Some(NOTEPAD)),
+            proc(11, "a.exe", Some(r"C:\Users\Alice\target\a.exe")),
+            kuda,
+            child,
+            proc(12, "svc", None),
+        ];
+        let c = classify(&store, &w, &procs, &[(100, 5)], &win_roots(), 1000, true).unwrap();
+        c.record(&mut store, "w", 1000).unwrap();
+        // ignore と kuda 自身（と子孫）は数えない。パスの無いプロセスは name: キーになる
+        assert_eq!(metric(&c, "process_count"), 2.0);
+        assert_eq!(metric(&c, "missing"), 1.0);
+        assert_eq!(status(&store, "name:svc"), Some(IdentityStatus::Known));
+        assert_eq!(status(&store, r"c:\users\alice\target\a.exe"), None);
+        assert_eq!(status(&store, r"c:\kuda\kuda.exe"), None);
+        assert_eq!(status(&store, r"c:\git\git.exe"), None);
+    }
+
+    #[test]
+    fn instances_share_one_identity() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        observe(&mut store, &w, &[], 1000, true);
+        let procs = [
+            proc(30, "x.exe", Some(DROPPER)),
+            proc(20, "x.exe", Some(DROPPER)),
+        ];
+        let c = observe(&mut store, &w, &procs, 1000 + 8 * DAY, true);
+        assert_eq!(metric(&c, "unknown"), 1.0);
+        assert_eq!(c.pending[0].process.pid, 20);
+    }
+
+    #[test]
+    fn own_root_finds_this_process() {
+        let me = std::process::id();
+        let mut p = proc(me, "kuda", None);
+        p.started = Some(42);
+        assert_eq!(own_root(&[proc(me + 1, "x", None), p]), Some((me, 42)));
+        let mut unknown_start = proc(me, "kuda", None);
+        unknown_start.started = None;
+        assert_eq!(own_root(&[unknown_start]), None);
     }
 }

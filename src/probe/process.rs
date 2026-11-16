@@ -3,7 +3,6 @@
 use anyhow::Result;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // 読むのは分類側（known_set）。後続のタスクで使う
 pub struct ProcessInfo {
     pub pid: u32,
     pub ppid: Option<u32>,

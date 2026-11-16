@@ -6,11 +6,12 @@ use crate::config::{BackendKind, Config, Watch};
 use crate::detach;
 use crate::diagnosis;
 use crate::incident::{self, Evidence, Incident, format_time};
+use crate::known_set::{self, Classification, Roots};
 use crate::lock;
 use crate::logging;
 use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
-use crate::probe::{self, ProbeRun};
+use crate::probe::{self, ProbeRun, ProcessInfo};
 use crate::process;
 use crate::store::{Store, WatchState};
 use crate::trigger::{self, Outcome, Variables};
@@ -105,18 +106,26 @@ fn check_watch(
     }
 
     let run = probe::run(&watch.probe, now);
-    let metrics = run.metrics();
+    let mut metrics = run.metrics();
+    let classification = match &run.processes {
+        Some(processes) => {
+            let classification = classify_processes(store, watch, processes, &metrics, now)?;
+            metrics.extend(classification.metrics.clone());
+            Some(classification)
+        }
+        None => None,
+    };
     log_run(watch, &run, &metrics);
 
     let stats = baseline::stats(store, &watch.name, &watch.baseline, now)?;
     let mut variables = metrics.clone();
     variables.extend(baseline::variables(&stats));
-    let matched = watch
-        .trigger
-        .as_ref()
-        .is_some_and(|trigger| trigger.when.matches(&variables));
+    let matched = trigger_matches(watch, &variables);
 
     store.record_run(&watch.name, &run)?;
+    if let Some(classification) = &classification {
+        classification.record(store, &watch.name, now)?;
+    }
     let retention = watch.baseline.metrics_retention.as_secs() as i64;
     store.prune_metrics(&watch.name, now - retention)?;
     state.last_probe = Some(now);
@@ -150,7 +159,11 @@ fn check_watch(
                 trigger.when.source(),
                 state.trigger.streak
             );
-            fire(store, paths, watch, &run, &stats, since, &reason)
+            let pending = classification
+                .as_ref()
+                .map(Classification::pending_identities)
+                .unwrap_or_default();
+            fire(store, paths, watch, &run, &stats, since, &reason, &pending)
         }
         Outcome::Suppressed => {
             log::info!("{}: in cooldown, not firing", watch.name);
@@ -213,14 +226,51 @@ fn build_incident(
     incident::create(&paths.incidents_dir, &evidence, created)
 }
 
-fn fire(
+fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
+    watch
+        .trigger
+        .as_ref()
+        .is_some_and(|trigger| trigger.when.matches(variables))
+}
+
+/// プロセスを既知の集合と照らして分類する。
+///
+/// 学習してよいのは正常な回だけ。正常かどうかは条件式の成否で決まるが、その式の変数は
+/// 分類の結果に依存する。そこで、まず学習する前提で分類し、式が成立したら（異常なら）
+/// 何も学習しない前提でやり直す。やり直すと pending が増えるだけなので、成立したままになる
+fn classify_processes(
     store: &Store,
+    watch: &Watch,
+    processes: &[ProcessInfo],
+    metrics: &Variables,
+    now: i64,
+) -> Result<Classification> {
+    let roots = Roots::from_env();
+    let excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
+    let classify =
+        |learn| known_set::classify(store, watch, processes, &excluded, &roots, now, learn);
+    let classification = classify(true)?;
+    if classification.learned == 0 {
+        return Ok(classification);
+    }
+    let mut variables = metrics.clone();
+    variables.extend(classification.metrics.clone());
+    if trigger_matches(watch, &variables) {
+        return classify(false);
+    }
+    Ok(classification)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fire(
+    store: &mut Store,
     paths: &Paths,
     watch: &Watch,
     run: &ProbeRun,
     stats: &[SeriesStats],
     since: i64,
     reason: &str,
+    pending: &[String],
 ) -> Result<()> {
     let incident = build_incident(store, paths, watch, run, stats, since, reason)?;
     log::warn!(
@@ -228,6 +278,8 @@ fn fire(
         watch.name,
         incident.dir.display()
     );
+    // 事件に含めた分は報告済みにする。同じプロセスでは、クールダウンが明けても再発火しない
+    store.mark_reported(&watch.name, pending)?;
     if watch.diagnose.is_some() {
         detach::spawn_diagnose(&watch.name, &incident.dir)?;
     }
@@ -647,5 +699,52 @@ mod tests {
         let interval = Duration::from_secs(21600);
         assert!(!is_due(Some(0), 21569, interval));
         assert!(is_due(Some(0), 21570, interval));
+    }
+
+    /// 実際に列挙して check_watch を通す。学習期間が無い watch なので、初回に見えたものは
+    /// すべて pending になって発火し、報告済みになる。次の回は何も数えず、事件も増えない
+    #[test]
+    fn process_watch_reports_unknown_processes_once() {
+        let dir = std::env::temp_dir().join(format!("kuda-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[[watch]]\nname = \"p\"\n[watch.probe]\nkind = \"process\"\n\
+             [watch.baseline]\nlearn_for = \"0s\"\n\
+             [watch.trigger]\nwhen = \"unknown >= 1\"\nconsecutive = 1\ncooldown = \"0s\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let watch = config.watch("p").unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            data_dir: dir.clone(),
+            incidents_dir: dir.join("incidents"),
+            logs_dir: dir.join("logs"),
+            reports_dir: dir.join("reports"),
+            lock_dir: dir.clone(),
+            lock_fallback: false,
+        };
+        let mut store = Store::in_memory().unwrap();
+
+        check_watch(&mut store, &paths, watch, true, 1000).unwrap();
+        let statuses = store.identity_statuses("p").unwrap();
+        assert!(!statuses.is_empty());
+        assert!(
+            statuses
+                .values()
+                .all(|s| *s == crate::store::IdentityStatus::Reported)
+        );
+        let incidents = || {
+            std::fs::read_dir(paths.incidents_dir.join("p"))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(incidents(), 1);
+
+        check_watch(&mut store, &paths, watch, true, 2000).unwrap();
+        assert_eq!(incidents(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

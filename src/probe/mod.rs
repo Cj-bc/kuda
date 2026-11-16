@@ -61,7 +61,6 @@ pub struct ProbeRun {
     pub ts: i64,
     pub results: Vec<TargetResult>,
     /// kind = "process" の列挙結果。他の kind では None
-    #[allow(dead_code)] // 読むのは分類側。後続のタスクで使う
     pub processes: Option<Vec<ProcessInfo>>,
 }
 

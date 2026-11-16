@@ -5,12 +5,18 @@ use crate::trigger::TriggerState;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 /// `MIGRATIONS[i]` は版 i の DB を版 i + 1 へ上げる。新規 DB は版 0 から順に適用する。
 /// 版を足すときは末尾に追加し、既存の要素は書き換えない
-const MIGRATIONS: [&str; 3] = [SCHEMA_V1, HIST_BY_AGGREGATION, KNOWN_GOOD];
+const MIGRATIONS: [&str; 4] = [
+    SCHEMA_V1,
+    HIST_BY_AGGREGATION,
+    KNOWN_GOOD,
+    PROCESS_IDENTITIES,
+];
 
 /// 版 1 の分布に付ける `aggregate_by`。記録時の集計方式が分からない
 const HIST_V1: &str = "v1";
@@ -64,6 +70,21 @@ const KNOWN_GOOD: &str = "
         GROUP BY s.watch, c.key;
     ALTER TABLE watch_state ADD COLUMN last_complete_snapshot INTEGER;
     ALTER TABLE watch_state ADD COLUMN last_snapshot_complete INTEGER;
+";
+
+/// 版 4: プロセスの既知の集合。status は 'known' | 'pending' | 'reported'。
+/// 学習期間の起点は、check が所有する他の列と書き込みが混ざらないよう watch_state の別の列に持つ
+const PROCESS_IDENTITIES: &str = "
+    CREATE TABLE process_identities (
+        watch TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        first_seen INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL,
+        seen_count INTEGER NOT NULL,
+        PRIMARY KEY (watch, identity)
+    ) WITHOUT ROWID;
+    ALTER TABLE watch_state ADD COLUMN learning_started INTEGER;
 ";
 
 const SCHEMA_V1: &str = "
@@ -125,6 +146,36 @@ pub struct WatchState {
     /// 成功と失敗の取得が同じ秒に重なると時刻では見分けられないので、時刻とは別に持つ
     pub last_snapshot_complete: Option<bool>,
     pub trigger: TriggerState,
+}
+
+/// プロセスの識別キーの扱い
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityStatus {
+    /// 既知。数えない
+    Known,
+    /// 未知。まだ報告していない
+    Pending,
+    /// 事件に載せて報告済み。`kuda baseline accept` まで既知にならず、数えない
+    Reported,
+}
+
+impl IdentityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Known => "known",
+            Self::Pending => "pending",
+            Self::Reported => "reported",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "known" => Ok(Self::Known),
+            "pending" => Ok(Self::Pending),
+            "reported" => Ok(Self::Reported),
+            other => bail!("unknown identity status: {other}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -562,6 +613,87 @@ impl Store {
                 state.trigger.active
             ],
         )?;
+        Ok(())
+    }
+
+    /// 学習期間の起点（最初に分類した時刻）。まだ無ければ None
+    pub fn learning_started(&self, watch: &str) -> Result<Option<i64>> {
+        let started = self
+            .conn
+            .query_row(
+                "SELECT learning_started FROM watch_state WHERE watch = ?1",
+                params![watch],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(started.flatten())
+    }
+
+    /// 学習期間の起点を記録する。既にあれば変えない。
+    /// `save_state` と同じ行を触るが、列が別なので互いを巻き戻さない
+    pub fn start_learning(&self, watch: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO watch_state (watch, streak, active, learning_started)
+             VALUES (?1, 0, 0, ?2)
+             ON CONFLICT (watch) DO UPDATE SET
+                 learning_started = coalesce(learning_started, excluded.learning_started)",
+            params![watch, ts],
+        )?;
+        Ok(())
+    }
+
+    /// watch の識別キーと status を全件返す
+    pub fn identity_statuses(&self, watch: &str) -> Result<HashMap<String, IdentityStatus>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT identity, status FROM process_identities WHERE watch = ?1")?;
+        let rows = statement.query_map(params![watch], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut statuses = HashMap::new();
+        for row in rows {
+            let (identity, status) = row?;
+            statuses.insert(identity, IdentityStatus::parse(&status)?);
+        }
+        Ok(statuses)
+    }
+
+    /// 今回見た識別キーを記録する。新しいものは `status` で登録し、
+    /// 既にあるものは `last_seen` と `seen_count` だけを更新して status は変えない
+    pub fn observe_identities(
+        &mut self,
+        watch: &str,
+        ts: i64,
+        seen: &[(String, IdentityStatus)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (identity, status) in seen {
+            tx.execute(
+                "INSERT INTO process_identities
+                     (watch, identity, status, first_seen, last_seen, seen_count)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                 ON CONFLICT (watch, identity) DO UPDATE SET
+                     last_seen = excluded.last_seen,
+                     seen_count = seen_count + 1",
+                params![watch, identity, status.as_str(), ts],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 指定した識別キーのうち pending のものを reported にする。
+    /// 報告を始めた後に accept された known を巻き戻さないよう、pending だけを対象にする
+    pub fn mark_reported(&mut self, watch: &str, identities: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for identity in identities {
+            tx.execute(
+                "UPDATE process_identities SET status = 'reported'
+                 WHERE watch = ?1 AND identity = ?2 AND status = 'pending'",
+                params![watch, identity],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -1016,6 +1148,99 @@ mod tests {
         let store = db.open();
         assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
         assert!(store.last_known_good("w", &names()).unwrap().is_none());
+    }
+
+    #[test]
+    fn v3_database_is_migrated_to_process_identities() {
+        let db = TempDb::new("v3");
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch(&format!(
+            "{SCHEMA_V1} {HIST_BY_AGGREGATION} {KNOWN_GOOD} PRAGMA user_version = 3;
+             INSERT INTO watch_state (watch, last_probe, streak, active) VALUES ('w', 310, 2, 1);"
+        ))
+        .unwrap();
+        drop(conn);
+        let mut store = db.open();
+        assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
+        // 既存の状態はそのまま残り、学習期間の起点は未設定になる
+        let state = store.load_state("w").unwrap();
+        assert_eq!(state.last_probe, Some(310));
+        assert_eq!(state.trigger.streak, 2);
+        assert_eq!(store.learning_started("w").unwrap(), None);
+        assert!(store.identity_statuses("w").unwrap().is_empty());
+        store
+            .observe_identities("w", 1, &[("a".to_string(), IdentityStatus::Known)])
+            .unwrap();
+        assert_eq!(store.identity_statuses("w").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn observing_updates_counters_but_keeps_the_status() {
+        let mut store = Store::in_memory().unwrap();
+        let seen = |status| [("a".to_string(), status)];
+        store
+            .observe_identities("w", 10, &seen(IdentityStatus::Pending))
+            .unwrap();
+        store
+            .observe_identities("w", 20, &seen(IdentityStatus::Known))
+            .unwrap();
+        assert_eq!(
+            store.identity_statuses("w").unwrap()["a"],
+            IdentityStatus::Pending
+        );
+        let (first, last, count): (i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT first_seen, last_seen, seen_count FROM process_identities",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((first, last, count), (10, 20, 2));
+    }
+
+    #[test]
+    fn only_pending_identities_become_reported() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .observe_identities(
+                "w",
+                10,
+                &[
+                    ("p".to_string(), IdentityStatus::Pending),
+                    ("k".to_string(), IdentityStatus::Known),
+                ],
+            )
+            .unwrap();
+        store
+            .mark_reported("w", &["p".to_string(), "k".to_string()])
+            .unwrap();
+        let statuses = store.identity_statuses("w").unwrap();
+        assert_eq!(statuses["p"], IdentityStatus::Reported);
+        assert_eq!(statuses["k"], IdentityStatus::Known);
+        // watch ごとに分かれる
+        assert!(store.identity_statuses("other").unwrap().is_empty());
+    }
+
+    #[test]
+    fn learning_start_is_set_once_and_independent_of_check_state() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.learning_started("w").unwrap(), None);
+        store.start_learning("w", 100).unwrap();
+        store.start_learning("w", 200).unwrap();
+        assert_eq!(store.learning_started("w").unwrap(), Some(100));
+        store
+            .save_state(
+                "w",
+                &WatchState {
+                    last_probe: Some(300),
+                    ..WatchState::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.learning_started("w").unwrap(), Some(100));
+        store.start_learning("w", 400).unwrap();
+        assert_eq!(store.load_state("w").unwrap().last_probe, Some(300));
     }
 
     #[test]
