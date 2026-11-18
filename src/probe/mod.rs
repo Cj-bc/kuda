@@ -8,7 +8,7 @@ mod process;
 mod tcp;
 
 use crate::collector;
-use crate::config::{Probe, ProbeKind};
+use crate::config::ProbeSpec;
 use crate::trigger::Variables;
 pub use process::{ProcessInfo, enumerate};
 use serde::Serialize;
@@ -94,21 +94,6 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn run_target(probe: &Probe, target: &str, gateway: Option<IpAddr>) -> Result<Sample, String> {
-    match probe.kind {
-        ProbeKind::Tcp => tcp::check(target, gateway, probe.timeout),
-        ProbeKind::Icmp => {
-            let host = expand_gateway(target, gateway)?;
-            icmp::check(&host, probe.timeout)
-        }
-        ProbeKind::Dns => dns::check(target, probe.server.as_deref(), probe.timeout),
-        ProbeKind::Http => http::check(target, probe.expect_status, probe.timeout),
-        ProbeKind::Command => command::check(&probe.command, probe.timeout),
-        // run が先に分岐するので、ここには来ない
-        ProbeKind::Process => Err("process probe has no targets".to_string()),
-    }
-}
-
 fn expand_gateway(target: &str, gateway: Option<IpAddr>) -> Result<String, String> {
     if target != "gateway" {
         return Ok(target.to_string());
@@ -119,25 +104,58 @@ fn expand_gateway(target: &str, gateway: Option<IpAddr>) -> Result<String, Strin
 }
 
 /// 全ターゲットを並列に試す。所要時間は最も遅いターゲットで決まる
-pub fn run(probe: &Probe, ts: i64) -> ProbeRun {
-    if probe.kind == ProbeKind::Process {
-        return run_process(ts);
+pub fn run(probe: &ProbeSpec, ts: i64) -> ProbeRun {
+    match probe {
+        ProbeSpec::Tcp { targets, timeout } => {
+            let gateway = collector::default_gateway();
+            run_targets(ts, targets, |target| tcp::check(target, gateway, *timeout))
+        }
+        ProbeSpec::Icmp { targets, timeout } => {
+            let gateway = collector::default_gateway();
+            run_targets(ts, targets, |target| {
+                icmp::check(&expand_gateway(target, gateway)?, *timeout)
+            })
+        }
+        ProbeSpec::Dns {
+            targets,
+            server,
+            timeout,
+        } => run_targets(ts, targets, |target| {
+            dns::check(target, server.as_deref(), *timeout)
+        }),
+        ProbeSpec::Http {
+            targets,
+            expect_status,
+            timeout,
+        } => run_targets(ts, targets, |target| {
+            http::check(target, *expect_status, *timeout)
+        }),
+        // 結果の target 名はコマンド名にする
+        ProbeSpec::Command {
+            program,
+            args,
+            timeout,
+        } => run_targets(ts, std::slice::from_ref(program), |program| {
+            command::check(program, args, *timeout)
+        }),
+        ProbeSpec::Process(_) => run_process(ts),
     }
-    let gateway = collector::default_gateway();
-    let targets = match probe.kind {
-        ProbeKind::Command => probe.command[..1].to_vec(),
-        _ => probe.targets.clone(),
-    };
+}
+
+fn run_targets(
+    ts: i64,
+    targets: &[String],
+    check: impl Fn(&str) -> Result<Sample, String> + Sync,
+) -> ProbeRun {
+    let check = &check;
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|target| {
-                scope.spawn(move || TargetResult::new(target, run_target(probe, target, gateway)))
-            })
+            .map(|target| scope.spawn(move || TargetResult::new(target, check(target))))
             .collect();
         handles
             .into_iter()
-            .zip(&targets)
+            .zip(targets)
             .map(|(handle, target)| {
                 handle.join().unwrap_or_else(|_| {
                     TargetResult::new(target, Err("probe thread panicked".to_string()))

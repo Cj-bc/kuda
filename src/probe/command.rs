@@ -3,9 +3,9 @@ use crate::exec;
 use std::time::{Duration, Instant};
 
 /// 終了コード 0 を成功とする。標準出力の最終行が数値なら `value` 指標になる
-pub fn check(argv: &[String], timeout: Duration) -> Result<Sample, String> {
-    let mut command = exec::command(&argv[0]);
-    command.args(&argv[1..]);
+pub fn check(program: &str, args: &[String], timeout: Duration) -> Result<Sample, String> {
+    let mut command = exec::command(program);
+    command.args(args);
     let started = Instant::now();
     let output = exec::run(command, None, timeout).map_err(|e| format!("{e:#}"))?;
     let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -43,24 +43,25 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn shell(script: &str) -> Vec<String> {
-        let argv: &[&str] = if cfg!(windows) {
-            &["powershell", "-NoProfile", "-Command", script]
+    fn run(script: &str) -> Result<Sample, String> {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("powershell", &["-NoProfile", "-Command", script])
         } else {
-            &["sh", "-c", script]
+            ("sh", &["-c", script])
         };
-        argv.iter().map(|arg| arg.to_string()).collect()
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        check(program, &args, TIMEOUT)
     }
 
     #[test]
     fn reads_numeric_stdout_as_value() {
-        let sample = check(&shell("echo 42.5"), TIMEOUT).unwrap();
+        let sample = run("echo 42.5").unwrap();
         assert_eq!(sample.value, Some(42.5));
     }
 
     #[test]
     fn non_zero_exit_is_a_failure() {
-        assert!(check(&shell("exit 2"), TIMEOUT).is_err());
+        assert!(run("exit 2").is_err());
     }
 
     #[test]

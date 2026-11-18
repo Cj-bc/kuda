@@ -10,15 +10,24 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+/// 検証済みの設定。TOML の形そのままの型は `Raw*` で、ここへは検証を通ったものだけが来る
+#[derive(Debug)]
+pub struct Config {
+    pub general: General,
+    pub backends: Backends,
+    pub watches: Vec<Watch>,
+}
+
+/// config.toml の形そのまま。不正な組み合わせの検出と振り分けは `Config::from_raw` が受け持つ
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
+struct RawConfig {
     #[serde(default)]
-    pub general: General,
+    general: General,
     #[serde(default)]
-    pub backends: Backends,
+    backends: Backends,
     #[serde(default, rename = "watch")]
-    pub watches: Vec<Watch>,
+    watches: Vec<RawWatch>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,18 +119,29 @@ impl BackendKind {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Watch {
     pub name: String,
     /// 前回の probe から何秒経っていれば実行するか
-    #[serde(default = "default_interval", deserialize_with = "duration")]
     pub interval: Duration,
-    pub probe: Probe,
-    #[serde(default)]
-    pub baseline: Baseline,
+    pub probe: ProbeSpec,
+    pub stats: StatsConfig,
+    pub snapshots: SnapshotConfig,
     pub trigger: Option<Trigger>,
     pub diagnose: Option<Diagnose>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWatch {
+    name: String,
+    #[serde(default = "default_interval", deserialize_with = "duration")]
+    interval: Duration,
+    probe: RawProbe,
+    #[serde(default)]
+    baseline: RawBaseline,
+    trigger: Option<Trigger>,
+    diagnose: Option<Diagnose>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -135,28 +155,81 @@ pub enum ProbeKind {
     Process,
 }
 
+/// probe の種類ごとに、その種類で意味のある設定だけを持つ
+#[derive(Debug)]
+pub enum ProbeSpec {
+    Tcp {
+        targets: Vec<String>,
+        timeout: Duration,
+    },
+    Icmp {
+        targets: Vec<String>,
+        timeout: Duration,
+    },
+    Dns {
+        targets: Vec<String>,
+        /// 問い合わせ先。省略時は OS のリゾルバを使う
+        server: Option<String>,
+        timeout: Duration,
+    },
+    Http {
+        targets: Vec<String>,
+        /// 期待するステータス。省略時は 2xx/3xx を成功とする
+        expect_status: Option<u16>,
+        timeout: Duration,
+    },
+    /// 実行するコマンドと引数。program が結果の target 名になる
+    Command {
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+    },
+    /// プロセスの列挙に timeout は要らない
+    Process(ProcessSpec),
+}
+
+impl ProbeSpec {
+    pub fn kind(&self) -> ProbeKind {
+        match self {
+            Self::Tcp { .. } => ProbeKind::Tcp,
+            Self::Icmp { .. } => ProbeKind::Icmp,
+            Self::Dns { .. } => ProbeKind::Dns,
+            Self::Http { .. } => ProbeKind::Http,
+            Self::Command { .. } => ProbeKind::Command,
+            Self::Process(_) => ProbeKind::Process,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessSpec {
+    /// いるはずのプロセス。正規化後のパスに対する glob で、
+    /// 1 つも動いていないパターンを `missing` に数える
+    pub expected: Vec<String>,
+    /// 監視しないパス（glob）。数えもせず、学習もしない
+    pub ignore: Vec<String>,
+    /// 最初の probe から、見たものをすべて既知として登録する期間
+    pub learn_for: Duration,
+}
+
+/// `[watch.probe]` の形そのまま。種類に関わらず全部のキーを受け、`RawProbe::into_spec` が
+/// 種類に合うものだけを `ProbeSpec` へ移す
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Probe {
-    pub kind: ProbeKind,
+struct RawProbe {
+    kind: ProbeKind,
     #[serde(default)]
-    pub targets: Vec<String>,
+    targets: Vec<String>,
     #[serde(default = "default_probe_timeout", deserialize_with = "duration")]
-    pub timeout: Duration,
-    /// kind = "dns": 問い合わせ先。省略時は OS のリゾルバを使う
-    pub server: Option<String>,
-    /// kind = "http": 期待するステータス。省略時は 2xx/3xx を成功とする
-    pub expect_status: Option<u16>,
-    /// kind = "command": 実行するコマンドと引数
+    timeout: Duration,
+    server: Option<String>,
+    expect_status: Option<u16>,
     #[serde(default)]
-    pub command: Vec<String>,
-    /// kind = "process": いるはずのプロセス。正規化後のパスに対する glob で、
-    /// 1 つも動いていないパターンを `missing` に数える
+    command: Vec<String>,
     #[serde(default)]
-    pub expected: Vec<String>,
-    /// kind = "process": 監視しないパス（glob）。数えもせず、学習もしない
+    expected: Vec<String>,
     #[serde(default)]
-    pub ignore: Vec<String>,
+    ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -203,32 +276,72 @@ impl TryFrom<String> for CollectorSpec {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Baseline {
-    #[serde(deserialize_with = "duration")]
+/// 時間帯ごとの平常値の統計
+#[derive(Debug)]
+pub struct StatsConfig {
     pub metrics_retention: Duration,
     pub aggregate_by: AggregateBy,
     /// これ未満の時間帯は全体の統計で代用する
     pub min_samples: u64,
-    pub snapshot_collectors: Vec<CollectorSpec>,
-    #[serde(deserialize_with = "duration")]
-    pub snapshot_interval: Duration,
-    pub keep_good_snapshots: u32,
-    /// kind = "process": 最初の probe から、見たものをすべて既知として登録する期間。必須
-    #[serde(deserialize_with = "optional_duration")]
-    pub learn_for: Option<Duration>,
 }
 
-impl Default for Baseline {
+impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             metrics_retention: Duration::from_secs(7 * 86400),
             aggregate_by: AggregateBy::WeekdayHour,
             min_samples: 30,
-            snapshot_collectors: Vec::new(),
-            snapshot_interval: Duration::from_secs(6 * 3600),
-            keep_good_snapshots: 5,
+        }
+    }
+}
+
+/// 異常時に見比べる、平常時の状態の snapshot
+#[derive(Debug)]
+pub struct SnapshotConfig {
+    pub collectors: Vec<CollectorSpec>,
+    pub interval: Duration,
+    pub keep_good: u32,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            collectors: Vec::new(),
+            interval: Duration::from_secs(6 * 3600),
+            keep_good: 5,
+        }
+    }
+}
+
+/// `[watch.baseline]` の形そのまま。TOML ではこの 1 つの表に、統計・snapshot・
+/// プロセスの既知集合の設定が並ぶ。使う側は別々なので `RawWatch::into_watch` が分ける
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawBaseline {
+    #[serde(deserialize_with = "duration")]
+    metrics_retention: Duration,
+    aggregate_by: AggregateBy,
+    min_samples: u64,
+    snapshot_collectors: Vec<CollectorSpec>,
+    #[serde(deserialize_with = "duration")]
+    snapshot_interval: Duration,
+    keep_good_snapshots: u32,
+    /// kind = "process" でだけ使い、その場合は必須
+    #[serde(deserialize_with = "optional_duration")]
+    learn_for: Option<Duration>,
+}
+
+impl Default for RawBaseline {
+    fn default() -> Self {
+        let stats = StatsConfig::default();
+        let snapshots = SnapshotConfig::default();
+        Self {
+            metrics_retention: stats.metrics_retention,
+            aggregate_by: stats.aggregate_by,
+            min_samples: stats.min_samples,
+            snapshot_collectors: snapshots.collectors,
+            snapshot_interval: snapshots.interval,
+            keep_good_snapshots: snapshots.keep_good,
             learn_for: None,
         }
     }
@@ -351,9 +464,7 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let config: Self = toml::from_str(text)?;
-        config.validate()?;
-        Ok(config)
+        Self::from_raw(toml::from_str(text)?)
     }
 
     pub fn watch(&self, name: &str) -> Result<&Watch> {
@@ -363,51 +474,61 @@ impl Config {
             .with_context(|| format!("no such watch: {name}"))
     }
 
-    fn backend_defined(&self, kind: BackendKind) -> bool {
-        match kind {
-            BackendKind::ClaudeCode => self.backends.claude_code.is_some(),
-            BackendKind::Codex => self.backends.codex.is_some(),
-            BackendKind::Local => self.backends.local.is_some(),
-        }
-    }
-
-    fn validate(&self) -> Result<()> {
+    fn from_raw(raw: RawConfig) -> Result<Self> {
         let mut names = HashSet::new();
-        for watch in &self.watches {
+        let mut watches = Vec::new();
+        for raw_watch in raw.watches {
             // ディレクトリ名と systemd のユニット名にそのまま使うので文字種を絞る
             ensure!(
-                is_safe_name(&watch.name),
+                is_safe_name(&raw_watch.name),
                 "watch name must be [A-Za-z0-9_-]+: {:?}",
-                watch.name
+                raw_watch.name
             );
             ensure!(
-                names.insert(&watch.name),
+                names.insert(raw_watch.name.clone()),
                 "duplicate watch name: {}",
-                watch.name
+                raw_watch.name
             );
-            self.validate_watch(watch)
-                .with_context(|| format!("watch {:?}", watch.name))?;
+            let name = raw_watch.name.clone();
+            let watch = raw_watch
+                .into_watch(&raw.backends)
+                .with_context(|| format!("watch {name:?}"))?;
+            watches.push(watch);
         }
-        Ok(())
+        Ok(Self {
+            general: raw.general,
+            backends: raw.backends,
+            watches,
+        })
     }
+}
 
-    fn validate_watch(&self, watch: &Watch) -> Result<()> {
-        watch.probe.validate()?;
-        if watch.probe.kind == ProbeKind::Process {
-            ensure!(
-                watch.baseline.learn_for.is_some(),
-                "process probe needs `learn_for` in [watch.baseline]"
-            );
-        } else {
-            ensure!(
-                watch.baseline.learn_for.is_none(),
-                "`learn_for` is only for kind = \"process\""
-            );
+impl Backends {
+    fn is_defined(&self, kind: BackendKind) -> bool {
+        match kind {
+            BackendKind::ClaudeCode => self.claude_code.is_some(),
+            BackendKind::Codex => self.codex.is_some(),
+            BackendKind::Local => self.local.is_some(),
         }
-        if let Some(trigger) = &watch.trigger {
+    }
+}
+
+impl RawWatch {
+    fn into_watch(self, backends: &Backends) -> Result<Watch> {
+        let RawBaseline {
+            metrics_retention,
+            aggregate_by,
+            min_samples,
+            snapshot_collectors,
+            snapshot_interval,
+            keep_good_snapshots,
+            learn_for,
+        } = self.baseline;
+        let probe = self.probe.into_spec(learn_for)?;
+        if let Some(trigger) = &self.trigger {
             ensure!(trigger.consecutive >= 1, "consecutive must be at least 1");
             // 式の変数は probe の種類で決まるので、パースではなくここで照合する
-            let available = trigger::variables_for(watch.probe.kind);
+            let available = trigger::variables_for(probe.kind());
             for name in trigger.when.variables() {
                 ensure!(
                     available.contains(&name),
@@ -416,39 +537,88 @@ impl Config {
                 );
             }
         }
-        if let Some(diagnose) = &watch.diagnose {
+        if let Some(diagnose) = &self.diagnose {
             for kind in std::iter::once(diagnose.backend).chain(diagnose.fallback) {
                 ensure!(
-                    self.backend_defined(kind),
+                    backends.is_defined(kind),
                     "backend {} is not configured in [backends]",
                     kind.name()
                 );
             }
         }
-        Ok(())
+        Ok(Watch {
+            name: self.name,
+            interval: self.interval,
+            probe,
+            stats: StatsConfig {
+                metrics_retention,
+                aggregate_by,
+                min_samples,
+            },
+            snapshots: SnapshotConfig {
+                collectors: snapshot_collectors,
+                interval: snapshot_interval,
+                keep_good: keep_good_snapshots,
+            },
+            trigger: self.trigger,
+            diagnose: self.diagnose,
+        })
     }
 }
 
-impl Probe {
-    fn validate(&self) -> Result<()> {
-        if self.kind == ProbeKind::Process {
-            ensure!(self.targets.is_empty(), "process probe takes no `targets`");
-            ensure!(self.command.is_empty(), "process probe takes no `command`");
-            return Ok(());
+impl RawProbe {
+    /// `learn_for` は `[watch.baseline]` のキーだが process の設定なので、呼び出し側から受ける
+    fn into_spec(self, learn_for: Option<Duration>) -> Result<ProbeSpec> {
+        let Self {
+            kind,
+            targets,
+            timeout,
+            server,
+            expect_status,
+            command,
+            expected,
+            ignore,
+        } = self;
+        if kind != ProbeKind::Process {
+            ensure!(
+                expected.is_empty() && ignore.is_empty(),
+                "`expected` and `ignore` are only for kind = \"process\""
+            );
+            ensure!(
+                learn_for.is_none(),
+                "`learn_for` is only for kind = \"process\""
+            );
         }
-        ensure!(
-            self.expected.is_empty() && self.ignore.is_empty(),
-            "`expected` and `ignore` are only for kind = \"process\""
-        );
-        if self.kind == ProbeKind::Command {
-            ensure!(!self.command.is_empty(), "command probe needs `command`");
-            ensure!(self.targets.is_empty(), "command probe takes no `targets`");
-            return Ok(());
-        }
-        ensure!(!self.targets.is_empty(), "probe needs `targets`");
-        for target in &self.targets {
-            match self.kind {
-                ProbeKind::Tcp => {
+        let need_targets = || -> Result<()> {
+            ensure!(!targets.is_empty(), "probe needs `targets`");
+            Ok(())
+        };
+        match kind {
+            ProbeKind::Process => {
+                ensure!(targets.is_empty(), "process probe takes no `targets`");
+                ensure!(command.is_empty(), "process probe takes no `command`");
+                let learn_for =
+                    learn_for.context("process probe needs `learn_for` in [watch.baseline]")?;
+                Ok(ProbeSpec::Process(ProcessSpec {
+                    expected,
+                    ignore,
+                    learn_for,
+                }))
+            }
+            ProbeKind::Command => {
+                ensure!(targets.is_empty(), "command probe takes no `targets`");
+                let (program, args) = command
+                    .split_first()
+                    .context("command probe needs `command`")?;
+                Ok(ProbeSpec::Command {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                    timeout,
+                })
+            }
+            ProbeKind::Tcp => {
+                need_targets()?;
+                for target in &targets {
                     let has_port = target
                         .rsplit_once(':')
                         .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
@@ -456,15 +626,34 @@ impl Probe {
                         bail!("tcp target needs a port: {target}");
                     }
                 }
-                ProbeKind::Http => {
+                Ok(ProbeSpec::Tcp { targets, timeout })
+            }
+            ProbeKind::Http => {
+                need_targets()?;
+                for target in &targets {
                     if !target.starts_with("http://") && !target.starts_with("https://") {
                         bail!("http target must be a URL: {target}");
                     }
                 }
-                ProbeKind::Icmp | ProbeKind::Dns | ProbeKind::Command | ProbeKind::Process => {}
+                Ok(ProbeSpec::Http {
+                    targets,
+                    expect_status,
+                    timeout,
+                })
+            }
+            ProbeKind::Icmp => {
+                need_targets()?;
+                Ok(ProbeSpec::Icmp { targets, timeout })
+            }
+            ProbeKind::Dns => {
+                need_targets()?;
+                Ok(ProbeSpec::Dns {
+                    targets,
+                    server,
+                    timeout,
+                })
             }
         }
-        Ok(())
     }
 }
 
@@ -485,10 +674,10 @@ mod tests {
         let config = Config::parse(include_str!("../config.example.toml")).unwrap();
         let watch = config.watch("network-reachability").unwrap();
         assert_eq!(watch.interval, Duration::from_secs(300));
-        assert_eq!(watch.probe.kind, ProbeKind::Tcp);
-        assert_eq!(watch.baseline.aggregate_by, AggregateBy::WeekdayHour);
+        assert_eq!(watch.probe.kind(), ProbeKind::Tcp);
+        assert_eq!(watch.stats.aggregate_by, AggregateBy::WeekdayHour);
         assert_eq!(
-            watch.baseline.snapshot_collectors.last(),
+            watch.snapshots.collectors.last(),
             Some(&CollectorSpec::Traceroute("1.1.1.1".to_string()))
         );
         let diagnose = watch.diagnose.as_ref().unwrap();
@@ -506,8 +695,11 @@ mod tests {
         let config = Config::parse(MINIMAL_WATCH).unwrap();
         let watch = config.watch("w").unwrap();
         assert_eq!(watch.interval, Duration::from_secs(300));
-        assert_eq!(watch.probe.timeout, Duration::from_secs(3));
-        assert_eq!(watch.baseline.min_samples, 30);
+        assert!(matches!(
+            watch.probe,
+            ProbeSpec::Tcp { timeout, .. } if timeout == Duration::from_secs(3)
+        ));
+        assert_eq!(watch.stats.min_samples, 30);
         assert!(watch.trigger.is_none());
         assert_eq!(config.general.log_retention_days, 14);
     }
@@ -618,12 +810,31 @@ mod tests {
     fn process_watch_is_valid() {
         let config = Config::parse(PROCESS_WATCH).unwrap();
         let watch = config.watch("p").unwrap();
-        assert_eq!(watch.probe.kind, ProbeKind::Process);
-        assert_eq!(watch.probe.expected.len(), 1);
-        assert_eq!(watch.probe.ignore.len(), 1);
-        assert_eq!(watch.baseline.learn_for, Some(Duration::from_secs(604800)));
-        // timeout は使わないので既定値のままでよい
-        assert_eq!(watch.probe.timeout, Duration::from_secs(3));
+        assert_eq!(watch.probe.kind(), ProbeKind::Process);
+        let ProbeSpec::Process(spec) = &watch.probe else {
+            panic!("process probe expected: {:?}", watch.probe);
+        };
+        assert_eq!(spec.expected.len(), 1);
+        assert_eq!(spec.ignore.len(), 1);
+        assert_eq!(spec.learn_for, Duration::from_secs(604800));
+    }
+
+    #[test]
+    fn command_probe_is_split_into_program_and_args() {
+        let text = r#"
+            [[watch]]
+            name = "c"
+            [watch.probe]
+            kind = "command"
+            command = ["check", "--fast"]
+        "#;
+        let config = Config::parse(text).unwrap();
+        let ProbeSpec::Command { program, args, .. } = &config.watch("c").unwrap().probe else {
+            panic!("command probe expected");
+        };
+        assert_eq!(program, "check");
+        assert_eq!(args, &["--fast"]);
+        assert!(Config::parse(&text.replace(r#"["check", "--fast"]"#, "[]")).is_err());
     }
 
     #[test]

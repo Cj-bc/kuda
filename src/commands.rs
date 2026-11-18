@@ -2,7 +2,7 @@
 
 use crate::baseline::{self, SeriesStats, Source};
 use crate::collector::{self, CollectorResult, Snapshot};
-use crate::config::{BackendKind, Config, Watch};
+use crate::config::{BackendKind, Config, ProbeSpec, ProcessSpec, Watch};
 use crate::detach;
 use crate::diagnosis;
 use crate::exec;
@@ -56,8 +56,8 @@ fn is_snapshot_due(state: &WatchState, now: i64, interval: Duration) -> bool {
 
 /// スナップショットを取り、取得履歴と比較基準に記録する
 fn take_snapshot(store: &Store, watch: &Watch, now: i64) -> Result<Snapshot> {
-    let snapshot = collector::take_snapshot(&watch.baseline.snapshot_collectors, now);
-    let keep = watch.baseline.keep_good_snapshots;
+    let snapshot = collector::take_snapshot(&watch.snapshots.collectors, now);
+    let keep = watch.snapshots.keep_good;
     store.record_snapshot(&watch.name, now, &snapshot, keep)?;
     Ok(snapshot)
 }
@@ -108,17 +108,18 @@ fn check_watch(
 
     let run = probe::run(&watch.probe, now);
     let mut metrics = run.metrics();
-    let classification = match &run.processes {
-        Some(processes) => {
-            let classification = classify_processes(store, paths, watch, processes, &metrics, now)?;
+    let classification = match (&watch.probe, &run.processes) {
+        (ProbeSpec::Process(spec), Some(processes)) => {
+            let classification =
+                classify_processes(store, paths, watch, spec, processes, &metrics, now)?;
             metrics.extend(classification.metrics.clone());
             Some(classification)
         }
-        None => None,
+        _ => None,
     };
     log_run(watch, &run, &metrics);
 
-    let stats = baseline::stats(store, &watch.name, &watch.baseline, now)?;
+    let stats = baseline::stats(store, &watch.name, &watch.stats, now)?;
     let mut variables = metrics.clone();
     variables.extend(baseline::variables(&stats));
     let matched = trigger_matches(watch, &variables);
@@ -127,16 +128,16 @@ fn check_watch(
     if let Some(classification) = &classification {
         classification.record(store, &watch.name, now)?;
     }
-    let retention = watch.baseline.metrics_retention.as_secs() as i64;
+    let retention = watch.stats.metrics_retention.as_secs() as i64;
     store.prune_metrics(&watch.name, now - retention)?;
     state.last_probe = Some(now);
 
     // 異常時の値でベースラインと last_known_good を汚さない
     let healthy = !matched && metrics["loss"] < 1.0;
     if healthy {
-        baseline::update(store, &watch.name, &watch.baseline, &metrics, now)?;
-        if is_snapshot_due(&state, now, watch.baseline.snapshot_interval)
-            && !watch.baseline.snapshot_collectors.is_empty()
+        baseline::update(store, &watch.name, &watch.stats, &metrics, now)?;
+        if is_snapshot_due(&state, now, watch.snapshots.interval)
+            && !watch.snapshots.collectors.is_empty()
         {
             take_snapshot(store, watch, now)?;
         }
@@ -205,10 +206,10 @@ fn build_incident(
     reason: &str,
 ) -> Result<Incident> {
     let created = now();
-    let current = collector::take_snapshot(&watch.baseline.snapshot_collectors, created);
+    let current = collector::take_snapshot(&watch.snapshots.collectors, created);
     let collectors: Vec<String> = watch
-        .baseline
-        .snapshot_collectors
+        .snapshots
+        .collectors
         .iter()
         .map(|spec| spec.name())
         .collect();
@@ -252,6 +253,7 @@ fn classify_processes(
     store: &Store,
     paths: &Paths,
     watch: &Watch,
+    spec: &ProcessSpec,
     processes: &[ProcessInfo],
     metrics: &Variables,
     now: i64,
@@ -260,8 +262,18 @@ fn classify_processes(
     // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
     let mut excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
     excluded.extend(investigation::running(paths, processes));
-    let classify =
-        |learn| known_set::classify(store, watch, processes, &excluded, &roots, now, learn);
+    let classify = |learn| {
+        known_set::classify(
+            store,
+            &watch.name,
+            spec,
+            processes,
+            &excluded,
+            &roots,
+            now,
+            learn,
+        )
+    };
     let classification = classify(true)?;
     if classification.learned == 0 {
         return Ok(classification);
@@ -325,7 +337,7 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
         .iter()
         .filter(|watch| only.is_none_or(|name| name == watch.name));
     for watch in selected {
-        let collectors = &watch.baseline.snapshot_collectors;
+        let collectors = &watch.snapshots.collectors;
         if collectors.is_empty() {
             println!("{}: no snapshot_collectors configured", watch.name);
             continue;
@@ -334,7 +346,7 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
         // 書かない。ここで読んだ状態を save_state で書き戻すと、収集中に check が保存した状態を巻き戻す
         let state = store.load_state(&watch.name)?;
         let now = now();
-        if !force && !is_snapshot_due(&state, now, watch.baseline.snapshot_interval) {
+        if !force && !is_snapshot_due(&state, now, watch.snapshots.interval) {
             println!(
                 "{}: not due yet (snapshot_interval, or the retry interval after a failure)",
                 watch.name
@@ -436,7 +448,7 @@ fn manual_incident(paths: &Paths, watch: &Watch) -> Result<Incident> {
     let store = Store::open(&paths.db_file())?;
     let now = now();
     let run = probe::run(&watch.probe, now);
-    let stats = baseline::stats(&store, &watch.name, &watch.baseline, now)?;
+    let stats = baseline::stats(&store, &watch.name, &watch.stats, now)?;
     let since = store.load_state(&watch.name)?.trigger.since.unwrap_or(now);
     build_incident(&store, paths, watch, &run, &stats, since, "手動実行")
 }
@@ -447,7 +459,7 @@ pub fn status(config: &Config, paths: &Paths) -> Result<()> {
         let state = store.load_state(&watch.name)?;
         println!("{}", watch.name);
         print_probe_status(&store, watch, &state)?;
-        let stats = baseline::stats(&store, &watch.name, &watch.baseline, now())?;
+        let stats = baseline::stats(&store, &watch.name, &watch.stats, now())?;
         print_baseline(&stats);
         println!("  last snapshot: {}", snapshot_status(&state));
         print_trigger_status(watch, &state, now());

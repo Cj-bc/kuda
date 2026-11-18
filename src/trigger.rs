@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 /// probe の種類ごとに、条件式で使える変数。
 ///
 /// 式のパースでは検査しない。変数は probe の種類で決まり、パースの時点では
-/// どの probe の式か分からないので、`Config::validate_watch` が照合する。
+/// どの probe の式か分からないので、`RawWatch::into_watch`（config.rs）が照合する。
 /// 網羅的に match しているのは、probe の種類を足したときに許可リストの決め忘れを防ぐため。
 pub fn variables_for(kind: ProbeKind) -> &'static [&'static str] {
     match kind {

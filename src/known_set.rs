@@ -4,7 +4,7 @@
 //! 呼び出し側が [`Os`] と [`Roots`] を渡す。こうしておくと、Windows のパス規則のテストを
 //! Linux 上でも走らせられる。ストアを使う分類は [`classify`]。
 
-use crate::config::Watch;
+use crate::config::ProcessSpec;
 use crate::os::Os;
 use crate::probe::ProcessInfo;
 use crate::store::{IdentityStatus, Store};
@@ -361,9 +361,11 @@ struct Observed<'a> {
 ///
 /// `learn` が true で学習期間中なら、新しく見た識別キーを known にする（masquerade を除く）。
 /// それ以外の新しい識別キーは pending にする。`excluded` は kuda 自身と調査プロセスの根
+#[allow(clippy::too_many_arguments)]
 pub fn classify(
     store: &Store,
-    watch: &Watch,
+    watch: &str,
+    spec: &ProcessSpec,
     processes: &[ProcessInfo],
     excluded: &[(u32, i64)],
     roots: &Roots,
@@ -371,13 +373,12 @@ pub fn classify(
     learn: bool,
 ) -> Result<Classification> {
     let os = roots.os;
-    let probe = &watch.probe;
     let mut observed: BTreeMap<String, Observed> = BTreeMap::new();
     for process in without_descendants(processes, excluded) {
         let Some(identity) = identify(os, process) else {
             continue;
         };
-        if probe.ignore.iter().any(|g| glob_match(g, &identity.key)) {
+        if spec.ignore.iter().any(|g| glob_match(g, &identity.key)) {
             continue;
         }
         let path = process.path.as_deref();
@@ -398,12 +399,9 @@ pub fn classify(
         entry.masquerade |= masquerade;
     }
 
-    let started = store.learning_started(&watch.name)?.unwrap_or(now);
-    let learning = watch
-        .baseline
-        .learn_for
-        .is_some_and(|d| now < started.saturating_add(d.as_secs() as i64));
-    let statuses = store.identity_statuses(&watch.name)?;
+    let started = store.learning_started(watch)?.unwrap_or(now);
+    let learning = now < started.saturating_add(spec.learn_for.as_secs() as i64);
+    let statuses = store.identity_statuses(watch)?;
 
     let mut seen = Vec::new();
     let mut pending = Vec::new();
@@ -430,7 +428,7 @@ pub fn classify(
     }
 
     let count = |f: fn(&PendingProcess) -> bool| pending.iter().filter(|p| f(p)).count() as f64;
-    let missing = probe
+    let missing = spec
         .expected
         .iter()
         .filter(|g| !observed.keys().any(|key| glob_match(g, key)))
@@ -825,31 +823,15 @@ mod tests {
 
     // ---- classify ----
 
-    use crate::config::{Baseline, Probe, ProbeKind};
     use std::time::Duration;
 
     const DAY: i64 = 86_400;
 
-    fn watch(expected: &[&str], ignore: &[&str]) -> Watch {
-        Watch {
-            name: "w".to_string(),
-            interval: Duration::from_secs(300),
-            probe: Probe {
-                kind: ProbeKind::Process,
-                targets: Vec::new(),
-                timeout: Duration::from_secs(3),
-                server: None,
-                expect_status: None,
-                command: Vec::new(),
-                expected: expected.iter().map(|s| s.to_string()).collect(),
-                ignore: ignore.iter().map(|s| s.to_string()).collect(),
-            },
-            baseline: Baseline {
-                learn_for: Some(Duration::from_secs(7 * 86_400)),
-                ..Baseline::default()
-            },
-            trigger: None,
-            diagnose: None,
+    fn watch(expected: &[&str], ignore: &[&str]) -> ProcessSpec {
+        ProcessSpec {
+            expected: expected.iter().map(|s| s.to_string()).collect(),
+            ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            learn_for: Duration::from_secs(7 * 86_400),
         }
     }
 
@@ -871,13 +853,13 @@ mod tests {
     /// 分類して、ストアに記録する
     fn observe(
         store: &mut Store,
-        watch: &Watch,
+        spec: &ProcessSpec,
         processes: &[ProcessInfo],
         now: i64,
         learn: bool,
     ) -> Classification {
-        let c = classify(store, watch, processes, &[], &win_roots(), now, learn).unwrap();
-        c.record(store, &watch.name, now).unwrap();
+        let c = classify(store, "w", spec, processes, &[], &win_roots(), now, learn).unwrap();
+        c.record(store, "w", now).unwrap();
         c
     }
 
@@ -930,7 +912,7 @@ mod tests {
         let mut w = watch(&[], &[]);
         let notepad = proc(10, "notepad.exe", Some(NOTEPAD));
         observe(&mut store, &w, std::slice::from_ref(&notepad), 1000, true);
-        w.baseline.learn_for = Some(Duration::from_secs(60));
+        w.learn_for = Duration::from_secs(60);
         let procs = [notepad, proc(11, "x.exe", Some(DROPPER))];
         let c = observe(&mut store, &w, &procs, 1100, true);
         assert_eq!(metric(&c, "unknown"), 1.0);
@@ -1019,7 +1001,17 @@ mod tests {
             child,
             proc(12, "svc", None),
         ];
-        let c = classify(&store, &w, &procs, &[(100, 5)], &win_roots(), 1000, true).unwrap();
+        let c = classify(
+            &store,
+            "w",
+            &w,
+            &procs,
+            &[(100, 5)],
+            &win_roots(),
+            1000,
+            true,
+        )
+        .unwrap();
         c.record(&mut store, "w", 1000).unwrap();
         // ignore と kuda 自身（と子孫）は数えない。パスの無いプロセスは name: キーになる
         assert_eq!(metric(&c, "process_count"), 2.0);

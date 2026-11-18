@@ -5,7 +5,7 @@
 //! そのため対数ビンのヒストグラムとして、保持期間と無関係に蓄積する。
 //! 百分位数の誤差はビン幅の半分（約 ±2.5%）に収まる。
 
-use crate::config::{AggregateBy, Baseline};
+use crate::config::{AggregateBy, StatsConfig};
 use crate::store::{Store, V1Hist};
 use crate::trigger::Variables;
 use anyhow::Result;
@@ -128,7 +128,7 @@ fn hist_percentile(hist: &[(i64, u64)], total: u64, fraction: f64) -> f64 {
 pub fn update(
     store: &Store,
     watch: &str,
-    config: &Baseline,
+    config: &StatsConfig,
     metrics: &Variables,
     ts: i64,
 ) -> Result<()> {
@@ -147,7 +147,12 @@ pub fn update(
 /// `ts` の時間帯の統計を返す。全体でも min_samples に届かない系列は含まない。
 /// 時間帯別には現在の aggregate_by で記録した分布だけを使い、
 /// 全体の統計には方式を変える前の分布も含める（時間帯を問わないので意味が変わらない）
-pub fn stats(store: &Store, watch: &str, config: &Baseline, ts: i64) -> Result<Vec<SeriesStats>> {
+pub fn stats(
+    store: &Store,
+    watch: &str,
+    config: &StatsConfig,
+    ts: i64,
+) -> Result<Vec<SeriesStats>> {
     adopt_v1(store, watch, config.aggregate_by)?;
     let bucket = (
         aggregation_key(config.aggregate_by),
@@ -188,11 +193,11 @@ pub fn variables(stats: &[SeriesStats]) -> Variables {
 mod tests {
     use super::*;
 
-    fn config(min_samples: u64, aggregate_by: AggregateBy) -> Baseline {
-        Baseline {
+    fn config(min_samples: u64, aggregate_by: AggregateBy) -> StatsConfig {
+        StatsConfig {
             min_samples,
             aggregate_by,
-            ..Baseline::default()
+            ..StatsConfig::default()
         }
     }
 
