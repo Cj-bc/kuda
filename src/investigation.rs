@@ -75,19 +75,15 @@ fn parse(text: &str) -> Option<(u32, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
 
-    fn paths(name: &str) -> Paths {
-        let dir = std::env::temp_dir().join(format!("kuda-inv-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Paths {
-            config_dir: dir.clone(),
-            data_dir: dir.clone(),
-            incidents_dir: dir.clone(),
-            logs_dir: dir.clone(),
-            reports_dir: dir.clone(),
-            lock_dir: dir,
-            lock_fallback: false,
-        }
+    /// 記録ファイルは data_dir に置かれるので、そこだけ用意する。
+    /// 一時ディレクトリは Paths より長く生かす（返り値を `_dir` に受ける）
+    fn paths(name: &str) -> (TempDir, Paths) {
+        let dir = TempDir::new(&format!("inv-{name}"));
+        let paths = dir.paths();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        (dir, paths)
     }
 
     fn me(started: i64) -> ProcessInfo {
@@ -103,18 +99,17 @@ mod tests {
 
     #[test]
     fn registration_is_visible_while_alive_and_removed_on_drop() {
-        let paths = paths("live");
+        let (_dir, paths) = paths("live");
         let processes = [me(42)];
         let registration = register(&paths, "w", &processes).unwrap().unwrap();
         assert_eq!(running(&paths, &processes), [(std::process::id(), 42)]);
         drop(registration);
         assert!(running(&paths, &processes).is_empty());
-        std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
 
     #[test]
     fn stale_records_are_ignored_but_kept() {
-        let paths = paths("stale");
+        let (_dir, paths) = paths("stale");
         let registration = register(&paths, "w", &[me(42)]).unwrap().unwrap();
         // 同じ PID でも起動時刻が違えば、別のプロセスが PID を再利用している
         assert!(running(&paths, &[me(43)]).is_empty());
@@ -122,25 +117,22 @@ mod tests {
         assert!(registration.0.exists());
         assert_eq!(running(&paths, &[me(42)]).len(), 1);
         std::mem::forget(registration);
-        std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
 
     #[test]
     fn nothing_is_recorded_without_a_start_time() {
-        let paths = paths("nostart");
+        let (_dir, paths) = paths("nostart");
         let mut unknown = me(1);
         unknown.started = None;
         assert!(register(&paths, "w", &[unknown]).unwrap().is_none());
-        std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
 
     #[test]
     fn unreadable_records_are_left_alone() {
-        let paths = paths("garbage");
+        let (_dir, paths) = paths("garbage");
         let file = paths.data_dir.join(format!("{PREFIX}w"));
         std::fs::write(&file, "12").unwrap();
         assert!(running(&paths, &[me(1)]).is_empty());
         assert!(file.exists());
-        std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
 }

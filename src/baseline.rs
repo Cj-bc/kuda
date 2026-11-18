@@ -188,6 +188,7 @@ pub fn variables(stats: &[SeriesStats]) -> Variables {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{probe_run, target_result};
 
     fn config(min_samples: u64, aggregate_by: AggregateBy) -> StatsConfig {
         StatsConfig {
@@ -275,17 +276,7 @@ mod tests {
             .collect();
         let mut store = Store::in_memory_v1(&hist).unwrap();
         for ts in times {
-            let run = crate::probe::ProbeRun {
-                processes: None,
-                ts,
-                results: vec![crate::probe::TargetResult {
-                    target: "t".to_string(),
-                    ok: true,
-                    rtt_ms: Some(10.0),
-                    value: None,
-                    error: None,
-                }],
-            };
+            let run = probe_run(ts, vec![target_result(true, Some(10.0))]);
             store.record_run("w", &run, &run.metrics()).unwrap();
         }
         store

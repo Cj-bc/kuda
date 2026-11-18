@@ -1,21 +1,18 @@
 use super::*;
 use crate::collector::{CollectorResult, Snapshot};
 use crate::probe::{ProbeRun, TargetResult};
+use crate::testutil::{TempDir, probe_run, target_result};
 use crate::trigger::TriggerState;
 use serde_json::{Value, json};
 
 fn run(ts: i64, ok: bool) -> ProbeRun {
-    ProbeRun {
-        processes: None,
+    probe_run(
         ts,
-        results: vec![TargetResult {
-            target: "t".to_string(),
-            ok,
-            rtt_ms: ok.then_some(10.0),
-            value: None,
+        vec![TargetResult {
             error: (!ok).then(|| "boom".to_string()),
+            ..target_result(ok, ok.then_some(10.0))
         }],
-    }
+    )
 }
 
 /// probe の集計だけを指標として記録する（分類の指標を足さない probe と同じ）
@@ -653,15 +650,14 @@ fn last_snapshot_never_moves_backwards() {
 
 /// 別プロセスの代わりに同じファイルを複数の接続で開くための DB。drop で片付ける
 struct TempDb {
-    dir: std::path::PathBuf,
+    dir: TempDir,
 }
 
 impl TempDb {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("kuda-store-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Self { dir }
+        Self {
+            dir: TempDir::new(&format!("store-{name}")),
+        }
     }
 
     fn path(&self) -> std::path::PathBuf {
@@ -670,12 +666,6 @@ impl TempDb {
 
     fn open(&self) -> Store {
         Store::open(&self.path()).unwrap()
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

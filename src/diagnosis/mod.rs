@@ -241,16 +241,7 @@ mod tests {
     }
 
     fn paths() -> Paths {
-        let root = PathBuf::from("home");
-        Paths {
-            config_dir: root.clone(),
-            data_dir: root.clone(),
-            incidents_dir: root.join("incidents"),
-            logs_dir: root.join("logs"),
-            reports_dir: root.join("reports"),
-            lock_dir: root,
-            lock_fallback: false,
-        }
+        Paths::single_root(PathBuf::from("home"))
     }
 
     #[test]

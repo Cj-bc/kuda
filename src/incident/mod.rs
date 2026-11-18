@@ -241,6 +241,7 @@ fn render_metrics(evidence: &Evidence) -> String {
 mod tests {
     use super::*;
     use crate::probe::TargetResult;
+    use crate::testutil::{TempDir, probe_run, target_result};
     use serde_json::{Value, json};
 
     fn snapshot(routes: Value) -> Snapshot {
@@ -300,24 +301,15 @@ mod tests {
         );
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuda-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
     fn run() -> ProbeRun {
-        ProbeRun {
-            processes: None,
-            ts: 1000,
-            results: vec![TargetResult {
+        probe_run(
+            1000,
+            vec![TargetResult {
                 target: "192.0.2.1:443".to_string(),
-                ok: false,
-                rtt_ms: None,
-                value: None,
                 error: Some("timed | out".to_string()),
+                ..target_result(false, None)
             }],
-        }
+        )
     }
 
     fn evidence<'a>(
@@ -341,7 +333,7 @@ mod tests {
 
     #[test]
     fn creates_all_files_and_can_be_reloaded() {
-        let root = temp_dir("incident");
+        let root = TempDir::new("incident");
         let run = run();
         let metrics = run.metrics();
         let current = snapshot(json!([]));
@@ -365,7 +357,6 @@ mod tests {
         let loaded = load(&incident.dir).unwrap();
         assert_eq!(loaded.since, 900);
         assert_eq!(loaded.watch, "w");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// 分類の指標は ProbeRun からは作り直せない。summary.md には渡された指標を載せる
@@ -382,19 +373,18 @@ mod tests {
 
     #[test]
     fn same_second_incidents_get_distinct_dirs() {
-        let root = temp_dir("incident-dup");
+        let root = TempDir::new("incident-dup");
         let run = run();
         let metrics = run.metrics();
         let current = snapshot(json!([]));
         let first = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
         let second = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
         assert_ne!(first.dir, second.dir);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn prune_removes_only_expired_incidents() {
-        let root = temp_dir("incident-prune");
+        let root = TempDir::new("incident-prune");
         let run = run();
         let metrics = run.metrics();
         let current = snapshot(json!([]));
@@ -403,13 +393,11 @@ mod tests {
         prune(&root, 30, 91 * 86400).unwrap();
         assert!(!old.dir.exists());
         assert!(recent.dir.exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn load_rejects_names_unsafe_for_a_report_path() {
-        let root = temp_dir("incident-unsafe");
-        std::fs::create_dir_all(&root).unwrap();
+        let root = TempDir::new("incident-unsafe");
         for (watch, id) in [
             ("w", "../../escaped"),
             ("w", "a/b"),
@@ -425,6 +413,5 @@ mod tests {
             std::fs::write(root.join(META_FILE), meta.to_string()).unwrap();
             assert!(load(&root).is_err(), "{watch:?} {id:?}");
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

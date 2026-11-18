@@ -680,6 +680,7 @@ pub fn log_paths(paths: &Paths, config_path: &Path) {
 mod tests {
     use super::*;
     use crate::probe::{ProcessInfo, TargetResult};
+    use crate::testutil::TempDir;
 
     #[test]
     fn never_probed_is_due() {
@@ -789,16 +790,9 @@ mod tests {
         assert!(is_due(Some(0), 21570, interval));
     }
 
+    /// パスが無ければ識別キーは名前になり、OS の規則に左右されない
     fn process(pid: u32, name: &str) -> ProcessInfo {
-        ProcessInfo {
-            pid,
-            ppid: None,
-            name: name.to_string(),
-            // パスが無ければ識別キーは名前になり、OS の規則に左右されない
-            path: None,
-            user: None,
-            started: Some(1),
-        }
+        crate::testutil::process(pid, name, None)
     }
 
     /// 与えたプロセス一覧を 1 回の check として観測し、記録と判定まで通す。
@@ -835,9 +829,7 @@ mod tests {
     /// 報告済みになる。次の回では報告済みのものでは発火せず、新しく現れたものだけで発火する
     #[test]
     fn process_watch_reports_unknown_processes_once() {
-        let dir = std::env::temp_dir().join(format!("kuda-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("check");
         let config_path = dir.join("config.toml");
         std::fs::write(
             &config_path,
@@ -848,15 +840,7 @@ mod tests {
         .unwrap();
         let config = Config::load(&config_path).unwrap();
         let watch = config.watch("p").unwrap();
-        let paths = Paths {
-            config_dir: dir.clone(),
-            data_dir: dir.clone(),
-            incidents_dir: dir.join("incidents"),
-            logs_dir: dir.join("logs"),
-            reports_dir: dir.join("reports"),
-            lock_dir: dir.clone(),
-            lock_fallback: false,
-        };
+        let paths = dir.paths();
         let mut store = Store::in_memory().unwrap();
 
         let incidents = || {
@@ -896,6 +880,5 @@ mod tests {
         check_with(&mut store, &paths, watch, procs, 3000);
         assert_eq!(incidents(), 2);
         assert!(reported(&store, "name:gamma-helper") && reported(&store, "name:alpha-agent"));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

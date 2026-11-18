@@ -186,29 +186,19 @@ fn run_process(ts: i64) -> ProbeRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn result(ok: bool, rtt_ms: Option<f64>) -> TargetResult {
-        TargetResult {
-            target: "t".to_string(),
-            ok,
-            rtt_ms,
-            value: None,
-            error: None,
-        }
-    }
+    use crate::testutil::{probe_run, target_result as result};
 
     #[test]
     fn metrics_aggregate_across_targets() {
-        let run = ProbeRun {
-            processes: None,
-            ts: 0,
-            results: vec![
+        let run = probe_run(
+            0,
+            vec![
                 result(true, Some(30.0)),
                 result(true, Some(10.0)),
                 result(true, Some(20.0)),
                 result(false, None),
             ],
-        };
+        );
         let metrics = run.metrics();
         assert_eq!(metrics["loss"], 0.25);
         assert_eq!(metrics["rtt_p50"], 20.0);
@@ -218,11 +208,7 @@ mod tests {
 
     #[test]
     fn total_loss_has_no_rtt_metrics() {
-        let run = ProbeRun {
-            processes: None,
-            ts: 0,
-            results: vec![result(false, None), result(false, None)],
-        };
+        let run = probe_run(0, vec![result(false, None), result(false, None)]);
         let metrics = run.metrics();
         assert_eq!(metrics["loss"], 1.0);
         assert!(!metrics.contains_key("rtt_p50"));

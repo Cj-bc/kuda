@@ -141,12 +141,9 @@ mod tests {
     }
 
     fn with_incident_dir<T>(name: &str, test: impl FnOnce(&Path) -> T) -> T {
-        let dir = std::env::temp_dir().join(format!("kuda-local-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::TempDir::new(&format!("local-{name}"));
         std::fs::write(dir.join("summary.md"), "summary-marker").unwrap();
-        let result = test(&dir);
-        std::fs::remove_dir_all(dir).unwrap();
-        result
+        test(&dir)
     }
 
     fn request(dir: &Path) -> Request<'_> {
@@ -201,8 +198,7 @@ mod tests {
 
     #[test]
     fn does_not_follow_symlinked_evidence() {
-        let root = std::env::temp_dir().join(format!("kuda-local-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testutil::TempDir::new("local-link");
         let dir = root.join("incident");
         std::fs::create_dir_all(&dir).unwrap();
         let outside = root.join("secret.txt");
@@ -213,7 +209,6 @@ mod tests {
         #[cfg(windows)]
         let linked = std::os::windows::fs::symlink_file(&outside, dir.join("summary.md"));
         let text = linked.is_ok().then(|| evidence(&dir));
-        std::fs::remove_dir_all(&root).unwrap();
         // Windows では開発者モードか管理者でないとリンクを作れないので、そのときは確かめない
         let Some(text) = text else {
             eprintln!("skipped: cannot create a symlink here");

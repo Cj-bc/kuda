@@ -100,8 +100,7 @@ mod tests {
 
     #[test]
     fn prune_removes_only_expired_kuda_logs() {
-        let dir = std::env::temp_dir().join(format!("kuda-logs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::TempDir::new("logs");
         let today = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
         for name in ["kuda-2026-11-06.log", "kuda-2026-11-05.log", "other.log"] {
             std::fs::write(dir.join(name), "").unwrap();
@@ -110,6 +109,5 @@ mod tests {
         assert!(dir.join("kuda-2026-11-06.log").exists());
         assert!(!dir.join("kuda-2026-11-05.log").exists());
         assert!(dir.join("other.log").exists());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

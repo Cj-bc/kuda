@@ -76,7 +76,7 @@ impl Paths {
         })
     }
 
-    fn single_root(root: PathBuf) -> Self {
+    pub(crate) fn single_root(root: PathBuf) -> Self {
         Self {
             data_dir: root.join("data"),
             lock_dir: root.join("data"),

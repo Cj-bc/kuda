@@ -835,16 +835,7 @@ mod tests {
         }
     }
 
-    fn proc(pid: u32, name: &str, path: Option<&str>) -> ProcessInfo {
-        ProcessInfo {
-            pid,
-            ppid: None,
-            name: name.to_string(),
-            path: path.map(str::to_string),
-            user: None,
-            started: Some(1),
-        }
-    }
+    use crate::testutil::process as proc;
 
     const NOTEPAD: &str = r"C:\Windows\System32\notepad.exe";
     const DROPPER: &str = r"C:\Users\Alice\AppData\Local\Temp\x.exe";

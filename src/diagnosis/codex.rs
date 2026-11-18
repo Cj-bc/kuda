@@ -200,8 +200,7 @@ mod tests {
 
     #[test]
     fn removes_only_stale_scratches_on_create() {
-        let parent = std::env::temp_dir().join(format!("kuda-codex-stale-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&parent);
+        let parent = crate::testutil::TempDir::new("codex-stale");
         let outside = parent.join("outside");
         std::fs::create_dir_all(outside.join("keep")).unwrap();
         let now = SystemTime::now()
@@ -226,7 +225,6 @@ mod tests {
             outside.join("keep").is_dir(),
         );
         drop(scratch);
-        std::fs::remove_dir_all(&parent).unwrap();
         assert!(!results.0, "a stale scratch must be removed");
         assert_eq!(results.1, [true; 4], "other entries must be kept");
         assert!(results.2, "a symlink must not be followed");
@@ -274,8 +272,7 @@ mod tests {
 
     /// 事件ディレクトリに出力ファイルと同名のファイルを仕込んだうえで codex を走らせる
     fn run_with_planted_file(name: &str, written: Option<&str>) -> (Result<String>, String) {
-        let root = std::env::temp_dir().join(format!("kuda-codex-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testutil::TempDir::new(&format!("codex-{name}"));
         let (incident_dir, work_dir) = (root.join("incident"), root.join("work"));
         std::fs::create_dir_all(&incident_dir).unwrap();
         std::fs::create_dir_all(&work_dir).unwrap();
@@ -293,7 +290,6 @@ mod tests {
         });
         let planted = std::fs::read_to_string(&planted).unwrap();
         let leftovers = std::fs::read_dir(&work_dir).unwrap().count();
-        std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(leftovers, 0, "the scratch directory must be removed");
         (result, planted)
     }

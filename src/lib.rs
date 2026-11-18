@@ -24,6 +24,8 @@ mod os;
 mod paths;
 mod probe;
 mod store;
+#[cfg(test)]
+pub(crate) mod testutil;
 mod time;
 mod trigger;
 
