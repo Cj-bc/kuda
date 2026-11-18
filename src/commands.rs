@@ -14,7 +14,7 @@ use crate::logging;
 use crate::metrics::{self, Variables};
 use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
-use crate::probe::{self, ProbeRun, ProcessInfo};
+use crate::probe::{self, ProbeRun};
 use crate::store::{Store, WatchState};
 use crate::time::format_time;
 use crate::trigger::{self, Outcome};
@@ -101,32 +101,82 @@ fn check_watch(
     force: bool,
     now: i64,
 ) -> Result<()> {
-    let mut state = store.load_state(&watch.name)?;
+    let state = store.load_state(&watch.name)?;
     if !force && !is_due(state.last_probe, now, watch.interval) {
         log::debug!("{}: interval has not elapsed", watch.name);
         return Ok(());
     }
 
+    let observation = observe(store, paths, watch, now, true)?;
+    apply(store, paths, watch, state, &observation, now)
+}
+
+/// 1 回の check で見たもの。probe の結果と、それを既知の集合やベースラインと比べた結果。
+/// 観測（`observe`）と、その結果に基づく記録・判定（`apply`）を分けるための境界
+struct Observation {
+    run: ProbeRun,
+    /// probe の集計に、分類の指標（kind = "process" のとき）を足したもの
+    metrics: Variables,
+    stats: Vec<SeriesStats>,
+    classification: Option<Classification>,
+}
+
+/// probe を実行して観測する。`learn` が false なら、学習期間中でも新しい識別キーを known にしない
+fn observe(
+    store: &Store,
+    paths: &Paths,
+    watch: &Watch,
+    now: i64,
+    learn: bool,
+) -> Result<Observation> {
     let run = probe::run(&watch.probe, now);
+    observe_run(store, paths, watch, run, now, learn)
+}
+
+/// probe の結果を分類し、ベースラインと比べる。ストアは読むだけ
+fn observe_run(
+    store: &Store,
+    paths: &Paths,
+    watch: &Watch,
+    run: ProbeRun,
+    now: i64,
+    learn: bool,
+) -> Result<Observation> {
     let mut metrics = run.metrics();
     let classification = match (&watch.probe, &run.processes) {
-        (ProbeSpec::Process(spec), Some(processes)) => {
-            let classification =
-                classify_processes(store, paths, watch, spec, processes, &metrics, now)?;
+        (ProbeSpec::Process(spec), Some(_)) => {
+            let classification = classify_processes(store, paths, watch, spec, &run, now, learn)?;
             metrics.extend(classification.metrics.clone());
             Some(classification)
         }
         _ => None,
     };
     log_run(watch, &run, &metrics);
-
     let stats = baseline::stats(store, &watch.name, &watch.stats, now)?;
+    Ok(Observation {
+        run,
+        metrics,
+        stats,
+        classification,
+    })
+}
+
+/// 観測を記録し、条件式を評価して、発火の処理までを行う。実際の probe や列挙には触れない
+fn apply(
+    store: &mut Store,
+    paths: &Paths,
+    watch: &Watch,
+    mut state: WatchState,
+    observation: &Observation,
+    now: i64,
+) -> Result<()> {
+    let metrics = &observation.metrics;
     let mut variables = metrics.clone();
-    variables.extend(baseline::variables(&stats));
+    variables.extend(baseline::variables(&observation.stats));
     let matched = trigger_matches(watch, &variables);
 
-    store.record_run(&watch.name, &run)?;
-    if let Some(classification) = &classification {
+    store.record_run(&watch.name, &observation.run)?;
+    if let Some(classification) = &observation.classification {
         classification.record(store, &watch.name, now)?;
     }
     let retention = watch.stats.metrics_retention.as_secs() as i64;
@@ -136,7 +186,7 @@ fn check_watch(
     // 異常時の値でベースラインと last_known_good を汚さない
     let healthy = !matched && metrics[metrics::LOSS] < 1.0;
     if healthy {
-        baseline::update(store, &watch.name, &watch.stats, &metrics, now)?;
+        baseline::update(store, &watch.name, &watch.stats, metrics, now)?;
         if is_snapshot_due(&state, now, watch.snapshots.interval)
             && !watch.snapshots.collectors.is_empty()
         {
@@ -162,11 +212,7 @@ fn check_watch(
                 trigger.when.source(),
                 state.trigger.streak
             );
-            let pending = classification
-                .as_ref()
-                .map(Classification::pending_identities)
-                .unwrap_or_default();
-            fire(store, paths, watch, &run, &stats, since, &reason, &pending)
+            fire(store, paths, watch, observation, since, &reason)
         }
         Outcome::Suppressed => {
             log::info!("{}: in cooldown, not firing", watch.name);
@@ -201,8 +247,7 @@ fn build_incident(
     store: &Store,
     paths: &Paths,
     watch: &Watch,
-    run: &ProbeRun,
-    stats: &[SeriesStats],
+    observation: &Observation,
     since: i64,
     reason: &str,
 ) -> Result<Incident> {
@@ -220,8 +265,8 @@ fn build_incident(
         watch: &watch.name,
         reason,
         since,
-        run,
-        stats,
+        run: &observation.run,
+        stats: &observation.stats,
         history: &history,
         current: &current,
         last_good: last_good.as_ref(),
@@ -249,16 +294,18 @@ fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
 ///
 /// 学習してよいのは正常な回だけ。正常かどうかは条件式の成否で決まるが、その式の変数は
 /// 分類の結果に依存する。そこで、まず学習する前提で分類し、式が成立したら（異常なら）
-/// 何も学習しない前提でやり直す。やり直すと pending が増えるだけなので、成立したままになる
+/// 何も学習しない前提でやり直す。やり直すと pending が増えるだけなので、成立したままになる。
+/// `learn` が false なら最初から学習しない（手動の調査用）
 fn classify_processes(
     store: &Store,
     paths: &Paths,
     watch: &Watch,
     spec: &ProcessSpec,
-    processes: &[ProcessInfo],
-    metrics: &Variables,
+    run: &ProbeRun,
     now: i64,
+    learn: bool,
 ) -> Result<Classification> {
+    let processes = run.processes.as_deref().unwrap_or_default();
     let roots = Roots::from_env();
     // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
     let mut excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
@@ -275,11 +322,14 @@ fn classify_processes(
             learn,
         )
     };
+    if !learn {
+        return classify(false);
+    }
     let classification = classify(true)?;
     if classification.learned == 0 {
         return Ok(classification);
     }
-    let mut variables = metrics.clone();
+    let mut variables = run.metrics();
     variables.extend(classification.metrics.clone());
     if trigger_matches(watch, &variables) {
         return classify(false);
@@ -287,25 +337,27 @@ fn classify_processes(
     Ok(classification)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fire(
     store: &mut Store,
     paths: &Paths,
     watch: &Watch,
-    run: &ProbeRun,
-    stats: &[SeriesStats],
+    observation: &Observation,
     since: i64,
     reason: &str,
-    pending: &[String],
 ) -> Result<()> {
-    let incident = build_incident(store, paths, watch, run, stats, since, reason)?;
+    let incident = build_incident(store, paths, watch, observation, since, reason)?;
+    let pending = observation
+        .classification
+        .as_ref()
+        .map(Classification::pending_identities)
+        .unwrap_or_default();
     log::warn!(
         "{}: fired ({reason}); incident {}",
         watch.name,
         incident.dir.display()
     );
     // 事件に含めた分は報告済みにする。同じプロセスでは、クールダウンが明けても再発火しない
-    store.mark_reported(&watch.name, pending)?;
+    store.mark_reported(&watch.name, &pending)?;
     if watch.diagnose.is_some() {
         detach::spawn_diagnose(&watch.name, &incident.dir)?;
     }
@@ -444,14 +496,14 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
     Ok(())
 }
 
-/// 手動の調査用に、今の状態から事件を作る。ベースラインには記録しない
+/// 手動の調査用に、今の状態から事件を作る。ベースラインにも既知の集合にも記録せず、
+/// 学習もしない（手で調べただけで、見えたプロセスを正常として覚えない）
 fn manual_incident(paths: &Paths, watch: &Watch) -> Result<Incident> {
     let store = Store::open(&paths.db_file())?;
     let now = now();
-    let run = probe::run(&watch.probe, now);
-    let stats = baseline::stats(&store, &watch.name, &watch.stats, now)?;
+    let observation = observe(&store, paths, watch, now, false)?;
     let since = store.load_state(&watch.name)?.trigger.since.unwrap_or(now);
-    build_incident(&store, paths, watch, &run, &stats, since, "手動実行")
+    build_incident(&store, paths, watch, &observation, since, "手動実行")
 }
 
 pub fn status(config: &Config, paths: &Paths) -> Result<()> {
@@ -618,6 +670,7 @@ pub fn log_paths(paths: &Paths, config_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::{ProcessInfo, TargetResult};
 
     #[test]
     fn never_probed_is_due() {
@@ -728,11 +781,54 @@ mod tests {
         assert!(is_due(Some(0), 21570, interval));
     }
 
-    /// 実際に列挙して check_watch を通す。学習期間が無い watch なので、初回に見えたものは
-    /// すべて pending になって発火し、報告済みになる。次の回でも報告済みのまま残る
+    fn process(pid: u32, name: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            ppid: None,
+            name: name.to_string(),
+            // パスが無ければ識別キーは名前になり、OS の規則に左右されない
+            path: None,
+            user: None,
+            started: Some(1),
+        }
+    }
+
+    /// 与えたプロセス一覧を 1 回の check として観測し、記録と判定まで通す。
+    /// 実際の列挙を使わないので、並行して動く他のテストのプロセスに左右されない
+    fn check_with(
+        store: &mut Store,
+        paths: &Paths,
+        watch: &Watch,
+        processes: Vec<ProcessInfo>,
+        now: i64,
+    ) {
+        let run = ProbeRun {
+            ts: now,
+            results: vec![TargetResult {
+                target: "processes".to_string(),
+                ok: true,
+                rtt_ms: None,
+                value: None,
+                error: None,
+            }],
+            processes: Some(processes),
+        };
+        let state = store.load_state(&watch.name).unwrap();
+        let observation = observe_run(store, paths, watch, run, now, true).unwrap();
+        apply(store, paths, watch, state, &observation, now).unwrap();
+    }
+
+    fn reported(store: &Store, key: &str) -> bool {
+        store.identity_statuses("p").unwrap().get(key)
+            == Some(&crate::store::IdentityStatus::Reported)
+    }
+
+    /// 学習期間が無い watch なので、初回に見えたものはすべて pending になって発火し、
+    /// 報告済みになる。次の回では報告済みのものでは発火せず、新しく現れたものだけで発火する
     #[test]
     fn process_watch_reports_unknown_processes_once() {
         let dir = std::env::temp_dir().join(format!("kuda-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.toml");
         std::fs::write(
@@ -755,29 +851,25 @@ mod tests {
         };
         let mut store = Store::in_memory().unwrap();
 
-        check_watch(&mut store, &paths, watch, true, 1000).unwrap();
-        let statuses = store.identity_statuses("p").unwrap();
-        assert!(!statuses.is_empty());
-        assert!(
-            statuses
-                .values()
-                .all(|s| *s == crate::store::IdentityStatus::Reported)
-        );
         let incidents = || {
             std::fs::read_dir(paths.incidents_dir.join("p"))
                 .unwrap()
                 .count()
         };
+        let mut procs = vec![process(10, "alpha-agent"), process(11, "beta-daemon")];
+
+        check_with(&mut store, &paths, watch, procs.clone(), 1000);
+        assert_eq!(store.identity_statuses("p").unwrap().len(), 2);
+        assert!(reported(&store, "name:alpha-agent") && reported(&store, "name:beta-daemon"));
         assert_eq!(incidents(), 1);
 
-        check_watch(&mut store, &paths, watch, true, 2000).unwrap();
-        // 並行するテストが新しいプロセスを起こすので、事件の数は数えない。報告済みは戻らない
-        let after = store.identity_statuses("p").unwrap();
-        assert!(
-            statuses
-                .keys()
-                .all(|key| after[key] == crate::store::IdentityStatus::Reported)
-        );
+        check_with(&mut store, &paths, watch, procs.clone(), 2000);
+        assert_eq!(incidents(), 1, "報告済みでは再発火しない");
+
+        procs.push(process(12, "gamma-helper"));
+        check_with(&mut store, &paths, watch, procs, 3000);
+        assert_eq!(incidents(), 2);
+        assert!(reported(&store, "name:gamma-helper") && reported(&store, "name:alpha-agent"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
