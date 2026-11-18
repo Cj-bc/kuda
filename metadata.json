@@ -1,0 +1,46 @@
+{
+  "cli_version": "0.13.2",
+  "checkpoint_id": "01M7PHEA6M6Z0BVRN653MEQTKB",
+  "strategy": "manual-commit",
+  "branch": "worktree-agent-a129d2da38c9bf30d",
+  "checkpoints_count": 1,
+  "files_touched": null,
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "compact_transcript": "/0/transcript.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 10,
+    "cache_creation_tokens": 13365,
+    "cache_read_tokens": 1161483,
+    "output_tokens": 10293,
+    "api_call_count": 5,
+    "subagent_tokens": {
+      "input_tokens": 198,
+      "cache_creation_tokens": 373791,
+      "cache_read_tokens": 9129166,
+      "output_tokens": 88536,
+      "api_call_count": 99
+    },
+    "subagent_tokens_complete": true
+  },
+  "redaction": {
+    "replacements": 0,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 0,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
