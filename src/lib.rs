@@ -19,6 +19,7 @@ mod known_set;
 mod lock;
 mod logging;
 mod notify;
+mod os;
 mod paths;
 mod probe;
 mod store;

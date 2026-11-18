@@ -1,5 +1,6 @@
 //! config.toml の読み込みと検証。
 
+use crate::os::Os;
 use crate::paths::is_safe_name;
 use crate::trigger::{self, Expr};
 use anyhow::{Context, Result, bail, ensure};
@@ -268,11 +269,14 @@ pub struct AllowedCommands {
 impl AllowedCommands {
     /// 実行中の OS の分だけを返す
     pub fn current(&self) -> &[String] {
-        self.for_os(cfg!(windows))
+        self.for_os(Os::current())
     }
 
-    fn for_os(&self, windows: bool) -> &[String] {
-        if windows { &self.windows } else { &self.linux }
+    fn for_os(&self, os: Os) -> &[String] {
+        match os {
+            Os::Windows => &self.windows,
+            Os::Linux => &self.linux,
+        }
     }
 }
 
@@ -565,8 +569,8 @@ mod tests {
         );
         let config = Config::parse(&text).unwrap();
         let diagnose = config.watch("w").unwrap().diagnose.as_ref().unwrap();
-        assert_eq!(diagnose.allowed_commands.for_os(true), ["tracert"]);
-        assert_eq!(diagnose.allowed_commands.for_os(false), ["traceroute"]);
+        assert_eq!(diagnose.allowed_commands.for_os(Os::Windows), ["tracert"]);
+        assert_eq!(diagnose.allowed_commands.for_os(Os::Linux), ["traceroute"]);
     }
 
     #[test]
@@ -574,7 +578,7 @@ mod tests {
         let text = with_allowed_commands("[watch.diagnose.allowed_commands]\nlinux = [\"ping\"]\n");
         let config = Config::parse(&text).unwrap();
         let diagnose = config.watch("w").unwrap().diagnose.as_ref().unwrap();
-        assert!(diagnose.allowed_commands.for_os(true).is_empty());
+        assert!(diagnose.allowed_commands.for_os(Os::Windows).is_empty());
     }
 
     #[test]

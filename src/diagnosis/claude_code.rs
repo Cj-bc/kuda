@@ -1,6 +1,7 @@
 use super::{Backend, Request};
 use crate::config::ClaudeCodeBackend;
 use crate::exec;
+use crate::os::Os;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
@@ -8,9 +9,9 @@ pub struct ClaudeCode(pub ClaudeCodeBackend);
 
 /// allowed_commands を許可ルールへ変換する。Windows では Claude Code のシェルが
 /// Git Bash になるので、PowerShell コマンドレットは powershell 経由の形にする
-fn allow_rule(command: &str, windows: bool) -> String {
+fn allow_rule(command: &str, os: Os) -> String {
     let is_cmdlet = command.contains('-') && command.starts_with(char::is_uppercase);
-    if windows && is_cmdlet {
+    if os == Os::Windows && is_cmdlet {
         format!("Bash(powershell -NoProfile -Command {command}:*)")
     } else {
         format!("Bash({command}:*)")
@@ -32,7 +33,7 @@ fn allow_rule(command: &str, windows: bool) -> String {
 /// `--restricted` はほかに、ファイル系ツールを作業ディレクトリに閉じ込め、`--tools` に
 /// 無いコード実行ツールを外すが、どちらも上の方針（`Read(./**)` と Read・Bash だけ）と一致する。
 /// `--bare` は OAuth のログインを読まなくなるので使わない
-fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<String> {
+fn args(max_turns: u32, allowed_commands: &[String], os: Os) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--output-format",
@@ -53,7 +54,7 @@ fn args(max_turns: u32, allowed_commands: &[String], windows: bool) -> Vec<Strin
         args.push("Bash".to_string());
     }
     args.extend(["--allowedTools".to_string(), "Read(./**)".to_string()]);
-    args.extend(allowed_commands.iter().map(|c| allow_rule(c, windows)));
+    args.extend(allowed_commands.iter().map(|c| allow_rule(c, os)));
     args
 }
 
@@ -114,7 +115,7 @@ impl Backend for ClaudeCode {
             .args(args(
                 self.0.max_turns,
                 request.allowed_commands,
-                cfg!(windows),
+                Os::current(),
             ))
             .current_dir(request.incident_dir);
         // プロンプトは複数行なので、.cmd ラッパーでも壊れないよう標準入力で渡す
@@ -140,20 +141,20 @@ mod tests {
 
     #[test]
     fn converts_allowed_commands_to_rules() {
-        assert_eq!(allow_rule("tracert", true), "Bash(tracert:*)");
+        assert_eq!(allow_rule("tracert", Os::Windows), "Bash(tracert:*)");
         assert_eq!(
-            allow_rule("Test-NetConnection", true),
+            allow_rule("Test-NetConnection", Os::Windows),
             "Bash(powershell -NoProfile -Command Test-NetConnection:*)"
         );
         assert_eq!(
-            allow_rule("Test-NetConnection", false),
+            allow_rule("Test-NetConnection", Os::Linux),
             "Bash(Test-NetConnection:*)"
         );
     }
 
     #[test]
     fn locks_down_tools() {
-        let args = args(20, &strings(&["ping"]), false);
+        let args = args(20, &strings(&["ping"]), Os::Linux);
         let joined = args.join(" ");
         assert!(joined.contains("--tools Read Bash --allowedTools Read(./**) Bash(ping:*)"));
         assert!(joined.contains("--max-turns 20"));
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn loads_no_setting_sources() {
-        let args = args(20, &[], false);
+        let args = args(20, &[], Os::Linux);
         let at = args.iter().position(|arg| arg == "--setting-sources");
         assert_eq!(args.get(at.unwrap() + 1).map(String::as_str), Some(""));
         assert!(args.iter().any(|arg| arg == "--restricted"));
@@ -171,7 +172,7 @@ mod tests {
 
     #[test]
     fn no_allowed_commands_means_no_bash() {
-        let args = args(20, &[], false);
+        let args = args(20, &[], Os::Linux);
         assert!(!args.iter().any(|arg| arg.starts_with("Bash")));
     }
 

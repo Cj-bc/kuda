@@ -5,35 +5,12 @@
 //! Linux 上でも走らせられる。ストアを使う分類は [`classify`]。
 
 use crate::config::Watch;
+use crate::os::Os;
 use crate::probe::ProcessInfo;
 use crate::store::{IdentityStatus, Store};
 use crate::trigger::Variables;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-/// パス規則を切り替えるための OS。実行中の OS とは限らない（テストのため）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Os {
-    Windows,
-    Linux,
-}
-
-impl Os {
-    pub fn current() -> Os {
-        if cfg!(windows) {
-            Os::Windows
-        } else {
-            Os::Linux
-        }
-    }
-
-    fn separator(self) -> char {
-        match self {
-            Os::Windows => '\\',
-            Os::Linux => '/',
-        }
-    }
-}
 
 /// 正規化の結果
 #[derive(Debug, Clone, PartialEq, Eq)]

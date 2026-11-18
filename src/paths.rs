@@ -1,5 +1,6 @@
 //! OS 別のディレクトリ解決。Linux は XDG Base Directory Specification に従う。
 
+use crate::os::Os;
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
@@ -29,10 +30,10 @@ impl Paths {
     }
 
     pub fn from_env() -> Result<Self> {
-        Self::resolve(cfg!(windows), |key| std::env::var(key).ok())
+        Self::resolve(Os::current(), |key| std::env::var(key).ok())
     }
 
-    fn resolve(windows: bool, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
+    fn resolve(os: Os, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let var = |key: &str| env(key).filter(|v| !v.is_empty());
 
         if let Some(home) = var("KUDA_HOME") {
@@ -40,7 +41,7 @@ impl Paths {
                 std::path::absolute(&home).with_context(|| format!("invalid KUDA_HOME: {home}"))?;
             return Ok(Self::single_root(root));
         }
-        if windows {
+        if os == Os::Windows {
             // 設定はユーザーに付いて回るもの、それ以外はこの PC に固有のもの
             let roaming = var("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;
             let local = var("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
@@ -129,12 +130,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn resolve(windows: bool, vars: &[(&str, &str)]) -> Result<Paths> {
+    fn resolve(os: Os, vars: &[(&str, &str)]) -> Result<Paths> {
         let vars: HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        Paths::resolve(windows, |key| vars.get(key).cloned())
+        Paths::resolve(os, |key| vars.get(key).cloned())
     }
 
     // Windows 上で実行しても比較が成り立つよう、期待値も join で組み立てる
@@ -144,7 +145,7 @@ mod tests {
 
     #[test]
     fn linux_defaults_when_unset_or_empty() {
-        let paths = resolve(false, &[("HOME", "/home/u"), ("XDG_STATE_HOME", "")]).unwrap();
+        let paths = resolve(Os::Linux, &[("HOME", "/home/u"), ("XDG_STATE_HOME", "")]).unwrap();
         let state = path("/home/u", &[".local/state", "kuda"]);
         assert_eq!(
             paths.config_file(),
@@ -166,7 +167,7 @@ mod tests {
             return;
         }
         let paths = resolve(
-            false,
+            Os::Linux,
             &[
                 ("HOME", "/home/u"),
                 ("XDG_CONFIG_HOME", "/c"),
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn linux_ignores_relative_xdg_values() {
         let paths = resolve(
-            false,
+            Os::Linux,
             &[
                 ("HOME", "/home/u"),
                 ("XDG_CONFIG_HOME", "relative/config"),
@@ -200,7 +201,7 @@ mod tests {
 
     #[test]
     fn linux_lock_falls_back_to_state_without_runtime_dir() {
-        let paths = resolve(false, &[("HOME", "/home/u")]).unwrap();
+        let paths = resolve(Os::Linux, &[("HOME", "/home/u")]).unwrap();
         assert_eq!(
             paths.lock_file(),
             path("/home/u", &[".local/state", "kuda", "run", "kuda.lock"])
@@ -210,7 +211,11 @@ mod tests {
 
     #[test]
     fn windows_puts_config_in_appdata_and_the_rest_in_localappdata() {
-        let paths = resolve(true, &[("APPDATA", "/roaming"), ("LOCALAPPDATA", "/local")]).unwrap();
+        let paths = resolve(
+            Os::Windows,
+            &[("APPDATA", "/roaming"), ("LOCALAPPDATA", "/local")],
+        )
+        .unwrap();
         let root = Path::new("/local").join("kuda");
         assert_eq!(
             paths.config_file(),
@@ -225,8 +230,8 @@ mod tests {
     fn kuda_home_overrides_every_os() {
         let home = std::env::temp_dir().join("kuda-home");
         let home_str = home.to_str().unwrap();
-        for windows in [true, false] {
-            let paths = resolve(windows, &[("KUDA_HOME", home_str), ("HOME", "/home/u")]).unwrap();
+        for os in [Os::Windows, Os::Linux] {
+            let paths = resolve(os, &[("KUDA_HOME", home_str), ("HOME", "/home/u")]).unwrap();
             assert_eq!(paths.config_file(), home.join("config.toml"));
             assert_eq!(paths.db_file(), home.join("data").join("kuda.db"));
             assert_eq!(paths.logs_dir, home.join("logs"));
@@ -235,10 +240,10 @@ mod tests {
 
     #[test]
     fn missing_home_is_an_error() {
-        assert!(resolve(false, &[]).is_err());
-        assert!(resolve(true, &[]).is_err());
-        assert!(resolve(true, &[("APPDATA", "/roaming")]).is_err());
-        assert!(resolve(true, &[("LOCALAPPDATA", "/local")]).is_err());
+        assert!(resolve(Os::Linux, &[]).is_err());
+        assert!(resolve(Os::Windows, &[]).is_err());
+        assert!(resolve(Os::Windows, &[("APPDATA", "/roaming")]).is_err());
+        assert!(resolve(Os::Windows, &[("LOCALAPPDATA", "/local")]).is_err());
     }
 
     #[cfg(unix)]
