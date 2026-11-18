@@ -357,28 +357,25 @@ struct Observed<'a> {
     masquerade: bool,
 }
 
-/// 動いているプロセスを既知の集合と照らして分類する。ストアは読むだけ。
-///
-/// `learn` が true で学習期間中なら、新しく見た識別キーを known にする（masquerade を除く）。
-/// それ以外の新しい識別キーは pending にする。`excluded` は kuda 自身と調査プロセスの根
-#[allow(clippy::too_many_arguments)]
-pub fn classify(
-    store: &Store,
-    watch: &str,
-    spec: &ProcessSpec,
-    processes: &[ProcessInfo],
+/// 今 動いているプロセスを識別キーごとにまとめたもの。ストアに触れずに作れるので、
+/// 学習する前提と、しない前提の 2 回分類するときも 1 回作れば済む
+pub struct Running<'a>(BTreeMap<String, Observed<'a>>);
+
+/// 列挙結果から、除外（`excluded` の根の子孫と `ignore`）を除いて識別キーごとにまとめる。
+/// `excluded` は kuda 自身と調査プロセスの根
+pub fn running<'a>(
+    processes: &'a [ProcessInfo],
     excluded: &[(u32, i64)],
+    ignore: &[String],
     roots: &Roots,
-    now: i64,
-    learn: bool,
-) -> Result<Classification> {
+) -> Running<'a> {
     let os = roots.os;
     let mut observed: BTreeMap<String, Observed> = BTreeMap::new();
     for process in without_descendants(processes, excluded) {
         let Some(identity) = identify(os, process) else {
             continue;
         };
-        if spec.ignore.iter().any(|g| glob_match(g, &identity.key)) {
+        if ignore.iter().any(|g| glob_match(g, &identity.key)) {
             continue;
         }
         let path = process.path.as_deref();
@@ -398,7 +395,22 @@ pub fn classify(
         }
         entry.masquerade |= masquerade;
     }
+    Running(observed)
+}
 
+/// 動いているプロセスを既知の集合と照らして分類する。ストアは読むだけ。
+///
+/// `learn` が true で学習期間中なら、新しく見た識別キーを known にする（masquerade を除く）。
+/// それ以外の新しい識別キーは pending にする
+pub fn classify(
+    store: &Store,
+    watch: &str,
+    spec: &ProcessSpec,
+    running: &Running,
+    now: i64,
+    learn: bool,
+) -> Result<Classification> {
+    let observed = &running.0;
     let started = store.learning_started(watch)?.unwrap_or(now);
     let learning = now < started.saturating_add(spec.learn_for.as_secs() as i64);
     let statuses = store.identity_statuses(watch)?;
@@ -406,7 +418,7 @@ pub fn classify(
     let mut seen = Vec::new();
     let mut pending = Vec::new();
     let mut learned = 0;
-    for (key, o) in &observed {
+    for (key, o) in observed {
         let status = match statuses.get(key) {
             Some(status) => *status,
             // 偽装は、学習期間中でも正常として覚えない
@@ -849,7 +861,8 @@ mod tests {
         now: i64,
         learn: bool,
     ) -> Classification {
-        let c = classify(store, "w", spec, processes, &[], &win_roots(), now, learn).unwrap();
+        let running = running(processes, &[], &spec.ignore, &win_roots());
+        let c = classify(store, "w", spec, &running, now, learn).unwrap();
         c.record(store, "w", now).unwrap();
         c
     }
@@ -1006,17 +1019,8 @@ mod tests {
             child,
             proc(12, "svc", None),
         ];
-        let c = classify(
-            &store,
-            "w",
-            &w,
-            &procs,
-            &[(100, 5)],
-            &win_roots(),
-            1000,
-            true,
-        )
-        .unwrap();
+        let running = running(&procs, &[(100, 5)], &w.ignore, &win_roots());
+        let c = classify(&store, "w", &w, &running, 1000, true).unwrap();
         c.record(&mut store, "w", 1000).unwrap();
         // ignore と kuda 自身（と子孫）は数えない。パスの無いプロセスは name: キーになる
         assert_eq!(metric(&c, "process_count"), 2.0);

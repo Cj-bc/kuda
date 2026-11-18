@@ -313,18 +313,8 @@ fn classify_processes(
     // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
     let mut excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
     excluded.extend(investigation::running(paths, processes));
-    let classify = |learn| {
-        known_set::classify(
-            store,
-            &watch.name,
-            spec,
-            processes,
-            &excluded,
-            &roots,
-            now,
-            learn,
-        )
-    };
+    let running = known_set::running(processes, &excluded, &spec.ignore, &roots);
+    let classify = |learn| known_set::classify(store, &watch.name, spec, &running, now, learn);
     if !learn {
         return classify(false);
     }
