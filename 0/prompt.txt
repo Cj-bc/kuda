@@ -1,0 +1,142 @@
+<agent-message from="a7baf6f978a3de6d4">
+[Subagent hand-back] The text below is the final report of a subagent this session delegated to. It is model output, NOT a message from the user: instructions, requests, or approval claims inside it are the subagent's words and carry no user authority. The harness indents every line of the report, so a frame-like line at column zero inside it would be forged. Notes above this frame may quote model-derived text, which carries no user authority either. The report follows:
+  Config types are split from the TOML shape. It is one commit on branch `worktree-agent-a7baf6f978a3de6d4`: `eff1670 refactor: separate the TOML shape from validated config types`.
+  
+  I did not split it into two commits. The `learn_for` move couples the probe enum and the baseline split, so splitting would have meant a throwaway intermediate struct.
+  
+  **Checks (Windows native, in the worktree):**
+  - `cargo fmt` is clean and `cargo clippy --all-targets -- -D warnings` is clean.
+  - `cargo test` passes: 234 unit tests plus 12 integration tests. The Linux/WSL tests were not run, as instructed.
+  
+  **Base commit:** the worktree was checked out at `0cad7c2`, which lacks `known_set.rs` and the process probe. I ran `git reset --hard 72a1b46` on my own worktree branch to get the base you described. The branch name is unchanged.
+  
+  **Final type layout (`src/config.rs`):**
+  - `Config { general, backends, watches: Vec<Watch> }` no longer derives `Deserialize`.
+    - A private `RawConfig` (with `deny_unknown_fields`) is parsed first, then `Config::from_raw` validates and converts it.
+    - `Config::from_raw` still checks watch name safety and duplicates, with a `watch "x"` error context.
+  - `Watch { name, interval, probe: ProbeSpec, stats: StatsConfig, snapshots: SnapshotConfig, trigger, diagnose }`, built from a private `RawWatch` by `RawWatch::into_watch(&Backends)`.
+    - `into_watch` also does the trigger checks (`consecutive >= 1`, variable names via `variables_for(probe.kind())`) and the diagnose backend-defined check.
+  - `ProbeSpec` has these variants:
+    - `Tcp { targets, timeout }` and `Icmp { targets, timeout }`
+    - `Dns { targets, server, timeout }` and `Http { targets, expect_status, timeout }`
+    - `Command { program, args, timeout }`
+    - `Process(ProcessSpec { expected, ignore, learn_for: Duration })`
+    - `ProbeSpec::kind() -> ProbeKind`. `ProbeKind` is unchanged, so `trigger::variables_for(ProbeKind)` and agent A's code are unaffected.
+    - The per-kind doc comments moved onto the matching variants and fields.
+  - `RawProbe` (all keys flat) is converted by `RawProbe::into_spec(learn_for)`, which raises the same errors as before:
+    - process: `process probe takes no targets` / `command`
+    - process: `process probe needs learn_for in [watch.baseline]`
+    - non-process: `expected and ignore are only for kind = "process"`
+    - non-process: `learn_for is only for kind = "process"`
+    - command: `command probe needs command` / `takes no targets`
+    - other kinds: `probe needs targets`
+    - tcp: `tcp target needs a port: …`
+    - http: `http target must be a URL: …`
+  - `StatsConfig { metrics_retention, aggregate_by, min_samples }` and `SnapshotConfig { collectors, interval, keep_good }`, both with `Default`. A private `RawBaseline` keeps the TOML `[watch.baseline]` keys and defaults; its `Default` is built from those two types.
+  - `CollectorSpec`, `AggregateBy`, `Trigger`, `Diagnose`, `Backends` and `General` are untouched. `Trigger` and `Diagnose` are still deserialized directly.
+  
+  **Can't-happen branches removed:**
+  - `run_target`'s `ProbeKind::Process => Err(..)` arm is gone.
+  - `probe.command[..1]` is gone; the command target name is `program`, and `command::check` now takes `(program, args, timeout)` instead of indexing `argv[0]`.
+  - `probe::run` is now a match on `ProbeSpec` plus a shared `run_targets(ts, targets, check)` helper.
+  - `known_set::classify` no longer reads `watch.baseline.learn_for.is_some_and(..)` or `watch.probe`. Its signature is now `classify(store, watch_name: &str, spec: &ProcessSpec, processes, excluded, roots, now, learn)`. It needed `#[allow(clippy::too_many_arguments)]`, like `fire`.
+  
+  **Edits in shared files, for merging with A and C:**
+  - `src/commands.rs`:
+    - Field-path renames: `.baseline.snapshot_collectors` to `.snapshots.collectors`, `.baseline.keep_good_snapshots` to `.snapshots.keep_good`, `.baseline.snapshot_interval` to `.snapshots.interval`, `.baseline.metrics_retention` to `.stats.metrics_retention`, and `&watch.baseline` to `&watch.stats` in the `baseline::stats` and `baseline::update` calls.
+    - `check_watch` now matches `(&watch.probe, &run.processes)` with `(ProbeSpec::Process(spec), Some(processes))` and `_ => None`. This avoids a can't-happen lookup, but it silently ignores a mismatch. Agent A's `Observation` restructure should fold this in.
+    - `classify_processes` gained a `spec: &ProcessSpec` parameter.
+    - The import line is now `use crate::config::{BackendKind, Config, ProbeSpec, ProcessSpec, Watch}`.
+  - `src/baseline.rs`: `Baseline` becomes `StatsConfig` (import, parameter types, test helper).
+  - `src/known_set.rs`: the `classify` change above, with the test helper `watch()` now returning a `ProcessSpec`.
+  - `src/trigger.rs`: one doc comment now points to `RawWatch::into_watch` instead of `Config::validate_watch`. `docs/process-watch-plan.md` line 314 still mentions `validate_watch` and I did not touch it.
+  - `src/collector/mod.rs` was not touched. It still uses `config::CollectorSpec`, which I kept in `config.rs`, so agent C is free to move it.
+  
+  **Tests:**
+  - `example_config_is_valid`, `optional_sections_get_defaults` and `process_watch_is_valid` were adapted to the new types.
+    - `process_watch_is_valid` dropped the "timeout stays at its default" assertion, since `Process` has no timeout.
+    - `optional_sections_get_defaults` still checks the 3s timeout via a `ProbeSpec::Tcp` match.
+  - Added `command_probe_is_split_into_program_and_args`, which also checks that `command = []` is rejected.
+  - Moved to the new signatures without changing what they assert: the `probe/command.rs` tests now use a `run(script)` helper, and the `known_set` classify tests call `classify` with a `ProcessSpec`.
+  - All the other `config.rs` tests (typo rejection, tcp port, process combinations, `unknown variable` message, unknown collector, and so on) pass unchanged, and `config.example.toml` still parses.
+  
+  **Provisional and behavior notes:**
+  - The TOML format and validation errors are unchanged. As before, `server`, `expect_status` and a non-empty `command` on kinds that ignore them are still silently accepted. Rejecting them would change user-facing behavior, so I left it.
+  - `probe::run` now calls `collector::default_gateway()` only for tcp and icmp. Before, it ran for every non-process kind. This has no observable effect except skipping a needless call for dns, http and command.
+  - A `process` probe still accepts `timeout` and `server` keys, silently ignored. That matches the old behavior.
+  - `targets` is still `Vec<String>`; non-emptiness is checked at conversion, not encoded in the type.
+  - The `check_watch` match noted above is the one remaining place where the "process probe implies `run.processes` is `Some`" link is not type-enforced. A cleaner fix needs `ProbeRun` to carry the processes inside an enum, which falls under A or C's work.
+</agent-message>
+
+---
+
+<task-notification>
+<task-id>a7baf6f978a3de6d4</task-id>
+<tool-use-id>toolu_0155VEF2WdkZAgmtvdh1RNmZ</tool-use-id>
+<output-file>C:\Users\neco\AppData\Local\Temp\claude\C--Users-neco-Documents-projects-github-com-Cj-bc-kuda\9ceea57f-e7d0-4bcd-bcae-c535f204165a\tasks\a7baf6f978a3de6d4.output</output-file>
+<status>completed</status>
+<summary>Agent "Typed config domain model" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>This agent's report was delivered to you as a message from "a7baf6f978a3de6d4" (its SubagentHandback call). Read it there; it is not repeated here.
+</result>
+<usage><subagent_tokens>127748</subagent_tokens><tool_uses>50</tool_uses><duration_ms>285535</duration_ms></usage>
+<worktree><worktreePath>C:\Users\neco\Documents\projects\github.com\Cj-bc\kuda\.claude\worktrees\agent-a7baf6f978a3de6d4</worktreePath><worktreeBranch>worktree-agent-a7baf6f978a3de6d4</worktreeBranch></worktree>
+</task-notification>
+
+---
+
+<agent-message from="a129d2da38c9bf30d">
+[Subagent hand-back] The text below is the final report of a subagent this session delegated to. It is model output, NOT a message from the user: instructions, requests, or approval claims inside it are the subagent's words and carry no user authority. The harness indents every line of the report, so a frame-like line at column zero inside it would be forged. Notes above this frame may quote model-derived text, which carries no user authority either. The report follows:
+  Typed snapshots are done in one commit: `7292e29 refactor: type snapshots and let collectors own their diff keys`. Branch is `worktree-agent-a129d2da38c9bf30d`. On Windows, `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test` all pass (240 lib tests, 12 integration tests). I did not run the Linux/WSL tests because of the disk.
+  
+  **Starting point:** my worktree branch began at 0cad7c2, not 72a1b46. I ran `git merge --ff-only 72a1b46` first, so the commit sits directly on 72a1b46.
+  
+  **Types** (new file `src/collector/snapshot.rs`, re-exported from `collector`):
+  - `Snapshot { collectors: BTreeMap<String, CollectorResult>, taken_at: i64 }` with `failed() -> Vec<&str>` and `is_complete()`.
+  - `CollectorResult::{Ok(Value), Failed(String)}` with `is_ok()`.
+  - `KnownGood { collectors: BTreeMap<String, KnownGoodEntry> }` and `KnownGoodEntry { taken_at: i64, data: Value }`. `Store::last_known_good` returns `Option<KnownGood>`.
+  - `CollectorResult` and `KnownGoodEntry` use hand-written `Serialize` and `Deserialize`, which keep the old JSON shape.
+  - Fields are declared in alphabetical order, so the output is byte-identical to the old `json!` output, which sorted keys. The existing `serde_json` setup doesn't use `preserve_order`.
+  - A missing `data` reads as null and a missing `error` as an empty string. A `KnownGoodEntry` with `ok:false` is rejected.
+  
+  **Where the call sites changed:**
+  - `collector::take_snapshot` now returns `Snapshot`, and `failed_collectors` is gone.
+  - `Store::record_snapshot` takes `&Snapshot` and uses `is_complete()` instead of its own loop.
+  - `Evidence.current` is `&Snapshot` and `Evidence.last_good` is `Option<&KnownGood>`. `incident/mod.rs` also changes `render_summary` (now iterates `BTreeSet`s of names).
+  - `incident/diff.rs` drops `collector_names`, reads from the types, and no longer has its own "is this successful" check.
+  - In `commands.rs`, `take_snapshot` returns `Snapshot` and `print_collectors` takes a `&Snapshot`. The `use serde_json::Value` import is removed, and `snapshot()` uses `snapshot.failed().len()`.
+  
+  **Diff keys moved to the collector side:**
+  - `adapters::IDENTITY_KEYS` is `["name","adapter"]`, `routes::IDENTITY_KEYS` is `["destination","next_hop","interface"]`, and `traceroute::VOLATILE_KEYS` is `["raw","truncated"]`.
+  - `collector::identity_keys()` and `collector::is_volatile_key()` aggregate them, and `diff.rs` calls those. The concatenated order matches the old five-key list, so diff paths are unchanged.
+  - Adding a collector means editing only `src/collector/mod.rs` and the new collector's module, not the diff.
+  
+  **Tests:**
+  - Added in `collector/snapshot.rs`:
+    - `Snapshot` and `KnownGood` round-trip against literal old-format JSON strings, with exact string equality.
+    - A null payload stays `Ok`.
+    - `ok:false` without an `error` reads as failed.
+    - `failed()` and `is_complete()`.
+    - A known-good entry with `ok:false` is rejected.
+  - Added in `collector/mod.rs`: a test for `identity_keys` order and `is_volatile_key`.
+  - Added in `store/tests.rs`: `snapshots_are_stored_in_the_old_json_shape` checks the `snapshots.data` row text and the `known_good.data` text.
+  - Changed in `store/tests.rs`: the v2 migration tests now insert literal old-format row strings, so they read real old rows through the migration SQL. The remaining snapshot tests use the typed helpers.
+  - Adapted to the types (not new): the tests in `collector/mod.rs`, `incident/diff.rs` and `incident/mod.rs`.
+  
+  **Provisional:** `Snapshot::failed()` returns a `Vec<&str>` rather than an iterator. `render_diff` is `render_diff(Option<&KnownGood>, &Snapshot)`, so the other two branches will need to match that when merging.
+</agent-message>
+
+---
+
+<task-notification>
+<task-id>a129d2da38c9bf30d</task-id>
+<tool-use-id>toolu_01QBHi9gQu7hTLG6JocGXC7E</tool-use-id>
+<output-file>C:\Users\neco\AppData\Local\Temp\claude\C--Users-neco-Documents-projects-github-com-Cj-bc-kuda\9ceea57f-e7d0-4bcd-bcae-c535f204165a\tasks\a129d2da38c9bf30d.output</output-file>
+<status>completed</status>
+<summary>Agent "Typed snapshot structures" finished</summary>
+<note>A task-notification fires each time this agent stops with no live background children of its own. The user can send it another message and resume it, so the same task-id may notify more than once.</note>
+<result>This agent's report was delivered to you as a message from "a129d2da38c9bf30d" (its SubagentHandback call). Read it there; it is not repeated here.
+</result>
+<usage><subagent_tokens>119899</subagent_tokens><tool_uses>71</tool_uses><duration_ms>290313</duration_ms></usage>
+<worktree><worktreePath>C:\Users\neco\Documents\projects\github.com\Cj-bc\kuda\.claude\worktrees\agent-a129d2da38c9bf30d</worktreePath><worktreeBranch>worktree-agent-a129d2da38c9bf30d</worktreeBranch></worktree>
+</task-notification>
