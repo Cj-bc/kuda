@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01QBHi9gQu7hTLG6JocGXC7E",
+  "agent_id": "a129d2da38c9bf30d",
+  "subagent_type": "general-purpose",
+  "task_description": "Typed snapshot structures",
+  "token_usage": {
+    "input_tokens": 76,
+    "cache_creation_tokens": 117938,
+    "cache_read_tokens": 3328698,
+    "output_tokens": 33471,
+    "api_call_count": 38
+  },
+  "started_at": "2026-11-18T14:13:24.8735441+09:00",
+  "completed_at": "2026-11-18T14:18:13.71599+09:00"
+}

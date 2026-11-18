@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_0155VEF2WdkZAgmtvdh1RNmZ",
+  "agent_id": "a7baf6f978a3de6d4",
+  "subagent_type": "general-purpose",
+  "task_description": "Typed config domain model",
+  "token_usage": {
+    "input_tokens": 68,
+    "cache_creation_tokens": 124753,
+    "cache_read_tokens": 3288043,
+    "output_tokens": 33339,
+    "api_call_count": 34
+  },
+  "started_at": "2026-11-18T14:13:24.9720191+09:00",
+  "completed_at": "2026-11-18T14:18:08.842702+09:00"
+}
