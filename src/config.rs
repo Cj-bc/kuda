@@ -590,6 +590,15 @@ impl RawProbe {
                 "`learn_for` is only for kind = \"process\""
             );
         }
+        // 種類違いのキーを黙って捨てると、効いていると思い込んだまま監視が続く
+        ensure!(
+            kind == ProbeKind::Dns || server.is_none(),
+            "`server` is only for kind = \"dns\""
+        );
+        ensure!(
+            kind == ProbeKind::Http || expect_status.is_none(),
+            "`expect_status` is only for kind = \"http\""
+        );
         let need_targets = || -> Result<()> {
             ensure!(!targets.is_empty(), "probe needs `targets`");
             Ok(())
@@ -736,6 +745,23 @@ mod tests {
         assert!(Config::parse(&with_target("gateway:80")).is_ok());
         assert!(Config::parse(&with_target("[::1]:443")).is_ok());
         assert!(Config::parse(&with_target("192.0.2.1")).is_err());
+    }
+
+    #[test]
+    fn rejects_keys_of_another_kind() {
+        let with_key = |kind: &str, key: &str| {
+            let probe = MINIMAL_WATCH.replace("kind = \"tcp\"", &format!("kind = \"{kind}\""));
+            let probe = probe.replace("192.0.2.1:443", "https://example.com");
+            format!("{probe}{key}\n")
+        };
+        let server = "server = \"192.0.2.53\"";
+        let status = "expect_status = 200";
+        assert!(Config::parse(&with_key("dns", server)).is_ok());
+        assert!(Config::parse(&with_key("http", status)).is_ok());
+        for (kind, key) in [("http", server), ("dns", status), ("icmp", server)] {
+            let error = format!("{:#}", Config::parse(&with_key(kind, key)).unwrap_err());
+            assert!(error.contains("is only for kind"), "{kind}: {error}");
+        }
     }
 
     #[test]
