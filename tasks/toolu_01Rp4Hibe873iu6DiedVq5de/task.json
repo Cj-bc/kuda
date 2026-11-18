@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01Rp4Hibe873iu6DiedVq5de",
+  "agent_id": "a44161ababdaacf82",
+  "subagent_type": "general-purpose",
+  "task_description": "Write README and architecture doc",
+  "token_usage": {
+    "input_tokens": 60,
+    "cache_creation_tokens": 118491,
+    "cache_read_tokens": 3472500,
+    "output_tokens": 21684,
+    "api_call_count": 30
+  },
+  "started_at": "2026-11-18T14:22:13.3167039+09:00",
+  "completed_at": "2026-11-18T14:25:16.6351322+09:00"
+}

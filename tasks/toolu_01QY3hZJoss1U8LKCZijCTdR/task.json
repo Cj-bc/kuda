@@ -1,0 +1,7 @@
+{
+  "tool_use_id": "toolu_01QY3hZJoss1U8LKCZijCTdR",
+  "agent_id": "a53e23bee7a82c411",
+  "subagent_type": "general-purpose",
+  "task_description": "Consolidate shared test helpers",
+  "started_at": "2026-11-18T14:25:55.2547529+09:00"
+}
