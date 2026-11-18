@@ -1,6 +1,7 @@
 //! probe の生データ（結果と指標）。
 
 use super::Store;
+use crate::metrics::Variables;
 use crate::probe::{ProbeRun, TargetResult};
 use anyhow::Result;
 use rusqlite::params;
@@ -13,7 +14,9 @@ pub struct MetricRow {
 }
 
 impl Store {
-    pub fn record_run(&mut self, watch: &str, run: &ProbeRun) -> Result<()> {
+    /// probe の結果と指標を記録する。`metrics` は `run.metrics()` に分類の指標
+    /// （kind = "process" の unknown など）を足したもの。`run` だけからは作り直せない
+    pub fn record_run(&mut self, watch: &str, run: &ProbeRun, metrics: &Variables) -> Result<()> {
         let tx = self.conn.transaction()?;
         for result in &run.results {
             tx.execute(
@@ -30,7 +33,7 @@ impl Store {
                 ],
             )?;
         }
-        for (name, value) in run.metrics() {
+        for (name, value) in metrics {
             tx.execute(
                 "INSERT INTO metrics (watch, ts, name, value) VALUES (?1, ?2, ?3, ?4)",
                 params![watch, run.ts, name, value],

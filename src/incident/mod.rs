@@ -4,7 +4,7 @@ mod diff;
 
 use crate::baseline::{SeriesStats, Source};
 use crate::collector::{KnownGood, Snapshot};
-use crate::metrics::series_of;
+use crate::metrics::{Variables, series_of};
 use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
@@ -34,6 +34,8 @@ pub struct Evidence<'a> {
     pub reason: &'a str,
     pub since: i64,
     pub run: &'a ProbeRun,
+    /// `run.metrics()` に分類の指標を足したもの。`run` だけでは process の指標が欠ける
+    pub metrics: &'a Variables,
     pub stats: &'a [SeriesStats],
     pub history: &'a [MetricRow],
     pub current: &'a Snapshot,
@@ -154,7 +156,7 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
     let _ = writeln!(text, "- OS: {}", std::env::consts::OS);
 
     text.push_str("\n## 現在の指標\n\n| 指標 | 値 |\n| --- | --- |\n");
-    for (name, value) in evidence.run.metrics() {
+    for (name, value) in evidence.metrics {
         let _ = writeln!(text, "| {name} | {value:.3} |");
     }
 
@@ -278,9 +280,10 @@ mod tests {
         );
 
         let run = run();
+        let metrics = run.metrics();
         let evidence = Evidence {
             last_good: Some(&last_good),
-            ..evidence(&run, &current, &[])
+            ..evidence(&run, &metrics, &current, &[])
         };
         let summary = render_summary(&evidence, 7200);
         assert!(
@@ -319,6 +322,7 @@ mod tests {
 
     fn evidence<'a>(
         run: &'a ProbeRun,
+        metrics: &'a Variables,
         current: &'a Snapshot,
         history: &'a [MetricRow],
     ) -> Evidence<'a> {
@@ -327,6 +331,7 @@ mod tests {
             reason: "loss >= 0.5",
             since: 900,
             run,
+            metrics,
             stats: &[],
             history,
             current,
@@ -338,13 +343,14 @@ mod tests {
     fn creates_all_files_and_can_be_reloaded() {
         let root = temp_dir("incident");
         let run = run();
+        let metrics = run.metrics();
         let current = snapshot(json!([]));
         let history = [MetricRow {
             ts: 1000,
             name: "loss".to_string(),
             value: 1.0,
         }];
-        let incident = create(&root, &evidence(&run, &current, &history), 1000).unwrap();
+        let incident = create(&root, &evidence(&run, &metrics, &current, &history), 1000).unwrap();
 
         for file in ["summary.md", "diff.md", "current.json", "metrics.csv"] {
             assert!(incident.dir.join(file).is_file(), "{file}");
@@ -362,13 +368,26 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// 分類の指標は ProbeRun からは作り直せない。summary.md には渡された指標を載せる
+    #[test]
+    fn summary_lists_the_given_metrics_including_classification() {
+        let run = run();
+        let mut metrics = run.metrics();
+        metrics.insert(crate::metrics::UNKNOWN.to_string(), 3.0);
+        let current = snapshot(json!([]));
+        let summary = render_summary(&evidence(&run, &metrics, &current, &[]), 1000);
+        assert!(summary.contains("| unknown | 3.000 |"), "{summary}");
+        assert!(summary.contains("| loss | 1.000 |"), "{summary}");
+    }
+
     #[test]
     fn same_second_incidents_get_distinct_dirs() {
         let root = temp_dir("incident-dup");
         let run = run();
+        let metrics = run.metrics();
         let current = snapshot(json!([]));
-        let first = create(&root, &evidence(&run, &current, &[]), 1000).unwrap();
-        let second = create(&root, &evidence(&run, &current, &[]), 1000).unwrap();
+        let first = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
+        let second = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
         assert_ne!(first.dir, second.dir);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -377,9 +396,10 @@ mod tests {
     fn prune_removes_only_expired_incidents() {
         let root = temp_dir("incident-prune");
         let run = run();
+        let metrics = run.metrics();
         let current = snapshot(json!([]));
-        let old = create(&root, &evidence(&run, &current, &[]), 1000).unwrap();
-        let recent = create(&root, &evidence(&run, &current, &[]), 90 * 86400).unwrap();
+        let old = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
+        let recent = create(&root, &evidence(&run, &metrics, &current, &[]), 90 * 86400).unwrap();
         prune(&root, 30, 91 * 86400).unwrap();
         assert!(!old.dir.exists());
         assert!(recent.dir.exists());

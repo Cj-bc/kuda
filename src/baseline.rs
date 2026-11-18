@@ -286,7 +286,7 @@ mod tests {
                     error: None,
                 }],
             };
-            store.record_run("w", &run).unwrap();
+            store.record_run("w", &run, &run.metrics()).unwrap();
         }
         store
     }

@@ -175,7 +175,7 @@ fn apply(
     variables.extend(baseline::variables(&observation.stats));
     let matched = trigger_matches(watch, &variables);
 
-    store.record_run(&watch.name, &observation.run)?;
+    store.record_run(&watch.name, &observation.run, metrics)?;
     if let Some(classification) = &observation.classification {
         classification.record(store, &watch.name, now)?;
     }
@@ -266,6 +266,7 @@ fn build_incident(
         reason,
         since,
         run: &observation.run,
+        metrics: &observation.metrics,
         stats: &observation.stats,
         history: &history,
         current: &current,
@@ -862,6 +863,24 @@ mod tests {
         assert_eq!(store.identity_statuses("p").unwrap().len(), 2);
         assert!(reported(&store, "name:alpha-agent") && reported(&store, "name:beta-daemon"));
         assert_eq!(incidents(), 1);
+
+        // 分類の指標（unknown など）も metrics テーブルと事件の表に届く
+        let unknown = |rows: &[crate::store::MetricRow]| {
+            rows.iter()
+                .find(|row| row.name == metrics::UNKNOWN)
+                .map(|row| row.value)
+        };
+        assert_eq!(unknown(&store.recent_metrics("p", 1).unwrap()), Some(2.0));
+        let incident_dir = std::fs::read_dir(paths.incidents_dir.join("p"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let summary = std::fs::read_to_string(incident_dir.join("summary.md")).unwrap();
+        assert!(summary.contains("| unknown | 2.000 |"), "{summary}");
+        let csv = std::fs::read_to_string(incident_dir.join("metrics.csv")).unwrap();
+        assert!(csv.contains(",unknown,2.000,"), "{csv}");
 
         check_with(&mut store, &paths, watch, procs.clone(), 2000);
         assert_eq!(incidents(), 1, "報告済みでは再発火しない");

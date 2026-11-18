@@ -18,12 +18,17 @@ fn run(ts: i64, ok: bool) -> ProbeRun {
     }
 }
 
+/// probe の集計だけを指標として記録する（分類の指標を足さない probe と同じ）
+fn record(store: &mut Store, watch: &str, run: &ProbeRun) {
+    store.record_run(watch, run, &run.metrics()).unwrap();
+}
+
 #[test]
 fn records_and_reads_back_runs() {
     let mut store = Store::in_memory().unwrap();
-    store.record_run("w", &run(100, true)).unwrap();
-    store.record_run("w", &run(200, false)).unwrap();
-    store.record_run("other", &run(300, true)).unwrap();
+    record(&mut store, "w", &run(100, true));
+    record(&mut store, "w", &run(200, false));
+    record(&mut store, "other", &run(300, true));
 
     assert_eq!(store.sample_count("w").unwrap(), 2);
     let last = store.last_results("w").unwrap();
@@ -36,7 +41,7 @@ fn records_and_reads_back_runs() {
 fn recent_metrics_limits_by_run_and_sorts_ascending() {
     let mut store = Store::in_memory().unwrap();
     for ts in [100, 200, 300] {
-        store.record_run("w", &run(ts, true)).unwrap();
+        record(&mut store, "w", &run(ts, true));
     }
     let rows = store.recent_metrics("w", 2).unwrap();
     assert_eq!(rows.first().unwrap().ts, 200);
@@ -46,8 +51,8 @@ fn recent_metrics_limits_by_run_and_sorts_ascending() {
 #[test]
 fn prune_keeps_recent_rows_and_baseline() {
     let mut store = Store::in_memory().unwrap();
-    store.record_run("w", &run(100, true)).unwrap();
-    store.record_run("w", &run(200, true)).unwrap();
+    record(&mut store, "w", &run(100, true));
+    record(&mut store, "w", &run(200, true));
     store.hist_add("w", "hour", "rtt", 1, 5).unwrap();
     store.prune_metrics("w", 150).unwrap();
     assert_eq!(store.sample_count("w").unwrap(), 1);
@@ -150,7 +155,7 @@ fn probes_per_hour_follows_the_recorded_runs() {
     assert_eq!(store.probes_per_hour("w").unwrap(), 0.0);
     // 5 分間隔で 2 時間
     for i in 0..24 {
-        store.record_run("w", &run(i * 300, true)).unwrap();
+        record(&mut store, "w", &run(i * 300, true));
     }
     let rate = store.probes_per_hour("w").unwrap();
     assert!((rate - 12.0).abs() < 0.6, "{rate}");
@@ -718,6 +723,6 @@ fn rejects_a_database_from_a_newer_kuda() {
 #[test]
 fn reopening_keeps_data() {
     let db = TempDb::new("reopen");
-    db.open().record_run("w", &run(100, true)).unwrap();
+    record(&mut db.open(), "w", &run(100, true));
     assert_eq!(db.open().sample_count("w").unwrap(), 1);
 }
