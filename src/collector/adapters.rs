@@ -5,6 +5,9 @@ use anyhow::Result;
 #[cfg(any(unix, test))]
 use serde_json::Value;
 
+/// 差分でアダプタ一覧の要素を同定するキー（`collect` の出力の項目名）
+pub(super) const IDENTITY_KEYS: &[&str] = &["name", "adapter"];
+
 #[cfg(windows)]
 pub use self::windows_impl::collect;
 

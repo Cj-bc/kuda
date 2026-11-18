@@ -1,7 +1,7 @@
 //! サブコマンドの本体。
 
 use crate::baseline::{self, SeriesStats, Source};
-use crate::collector;
+use crate::collector::{self, CollectorResult, Snapshot};
 use crate::config::{BackendKind, Config, Watch};
 use crate::detach;
 use crate::diagnosis;
@@ -19,7 +19,6 @@ use crate::time::format_time;
 use crate::trigger::{self, Outcome, Variables};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Local;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -56,7 +55,7 @@ fn is_snapshot_due(state: &WatchState, now: i64, interval: Duration) -> bool {
 }
 
 /// スナップショットを取り、取得履歴と比較基準に記録する
-fn take_snapshot(store: &Store, watch: &Watch, now: i64) -> Result<Value> {
+fn take_snapshot(store: &Store, watch: &Watch, now: i64) -> Result<Snapshot> {
     let snapshot = collector::take_snapshot(&watch.baseline.snapshot_collectors, now);
     let keep = watch.baseline.keep_good_snapshots;
     store.record_snapshot(&watch.name, now, &snapshot, keep)?;
@@ -344,7 +343,7 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
         }
         let snapshot = take_snapshot(&store, watch, now)?;
         print_collectors(&watch.name, &snapshot);
-        failed += collector::failed_collectors(&snapshot).len();
+        failed += snapshot.failed().len();
     }
     if failed > 0 {
         bail!("{failed} collector(s) failed");
@@ -352,12 +351,11 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
     Ok(())
 }
 
-fn print_collectors(watch: &str, snapshot: &Value) {
-    let collectors = snapshot["collectors"].as_object().into_iter().flatten();
-    for (name, result) in collectors {
-        match result["error"].as_str() {
-            None => println!("{watch}: {name}: ok"),
-            Some(error) => println!("{watch}: {name}: FAILED: {error}"),
+fn print_collectors(watch: &str, snapshot: &Snapshot) {
+    for (name, result) in &snapshot.collectors {
+        match result {
+            CollectorResult::Ok(_) => println!("{watch}: {name}: ok"),
+            CollectorResult::Failed(error) => println!("{watch}: {name}: FAILED: {error}"),
         }
     }
 }

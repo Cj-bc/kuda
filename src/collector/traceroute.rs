@@ -10,6 +10,9 @@ const MAX_HOPS: &str = "15";
 /// check 全体がスケジューラの制限（2 分）に収まるよう、経路が途中で切れていても打ち切る
 const TIMEOUT: Duration = Duration::from_secs(40);
 
+/// 毎回変わるので差分で比べない出力の項目（生の出力と、打ち切りの有無）
+pub(super) const VOLATILE_KEYS: &[&str] = &["raw", "truncated"];
+
 pub fn collect(target: &str) -> Result<Value> {
     let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
         ("tracert", vec!["-d", "-h", MAX_HOPS, "-w", "500", target])

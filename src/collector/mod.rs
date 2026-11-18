@@ -3,13 +3,30 @@
 mod adapters;
 mod dns_config;
 mod routes;
+mod snapshot;
 mod traceroute;
 
 use crate::config::CollectorSpec;
 use anyhow::Result;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub use routes::default_gateway;
+pub use snapshot::{CollectorResult, KnownGood, KnownGoodEntry, Snapshot};
+
+/// 配列の要素を同定するキー。添字で比べると 1 件の増減で後続がすべて差分になる。
+/// 並び順は差分のパスに出る。collector を足したら、その出力の識別キーをここへ連ねる
+pub fn identity_keys() -> impl Iterator<Item = &'static str> {
+    adapters::IDENTITY_KEYS
+        .iter()
+        .chain(routes::IDENTITY_KEYS)
+        .copied()
+}
+
+/// 毎回変わるので差分で比べないキー
+pub fn is_volatile_key(key: &str) -> bool {
+    traceroute::VOLATILE_KEYS.contains(&key)
+}
 
 fn collect(spec: &CollectorSpec) -> Result<Value> {
     match spec {
@@ -21,7 +38,7 @@ fn collect(spec: &CollectorSpec) -> Result<Value> {
 }
 
 /// 全 collector を並列に実行する。個別の失敗はスナップショット内に記録して続行する
-pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64) -> Value {
+pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64) -> Snapshot {
     take_snapshot_with(specs, taken_at, collect)
 }
 
@@ -31,8 +48,8 @@ fn take_snapshot_with(
     specs: &[CollectorSpec],
     taken_at: i64,
     collect: fn(&CollectorSpec) -> Result<Value>,
-) -> Value {
-    let results: Vec<(String, Value)> = std::thread::scope(|scope| {
+) -> Snapshot {
+    let collectors: BTreeMap<String, CollectorResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
             .map(|spec| (spec.name(), scope.spawn(move || collect(spec))))
@@ -44,33 +61,25 @@ fn take_snapshot_with(
                     .join()
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("collector panicked")));
                 match result {
-                    Ok(data) => (name, json!({ "ok": true, "data": data })),
+                    Ok(data) => (name, CollectorResult::Ok(data)),
                     Err(error) => {
                         log::warn!("collector {name} failed: {error:#}");
-                        (name, json!({ "ok": false, "error": format!("{error:#}") }))
+                        (name, CollectorResult::Failed(format!("{error:#}")))
                     }
                 }
             })
             .collect()
     });
-    let collectors: Map<String, Value> = results.into_iter().collect();
-    json!({ "taken_at": taken_at, "collectors": collectors })
-}
-
-/// 失敗した collector の名前を返す
-pub fn failed_collectors(snapshot: &Value) -> Vec<String> {
-    snapshot["collectors"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(_, result)| result["ok"] != Value::Bool(true))
-        .map(|(name, _)| name.clone())
-        .collect()
+    Snapshot {
+        taken_at,
+        collectors,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_failing_collector_does_not_lose_the_others() {
@@ -80,13 +89,9 @@ mod tests {
             CollectorSpec::Traceroute("kuda.invalid".to_string()),
         ];
         let snapshot = take_snapshot(&specs, 42);
-        assert_eq!(snapshot["taken_at"], 42);
-        assert!(snapshot["collectors"].get("dns_config").is_some());
-        assert!(
-            snapshot["collectors"]
-                .get("traceroute:kuda.invalid")
-                .is_some()
-        );
+        assert_eq!(snapshot.taken_at, 42);
+        assert!(snapshot.collectors.contains_key("dns_config"));
+        assert!(snapshot.collectors.contains_key("traceroute:kuda.invalid"));
     }
 
     #[test]
@@ -99,21 +104,21 @@ mod tests {
         }
         let specs = [CollectorSpec::Routes, CollectorSpec::DnsConfig];
         let snapshot = take_snapshot_with(&specs, 42, collect);
-        assert_eq!(snapshot["collectors"]["routes"]["ok"], false);
         assert_eq!(
-            snapshot["collectors"]["routes"]["error"],
-            "collector panicked"
+            snapshot.collectors["routes"],
+            CollectorResult::Failed("collector panicked".to_string())
         );
-        assert_eq!(snapshot["collectors"]["dns_config"]["ok"], true);
-        assert_eq!(failed_collectors(&snapshot), ["routes"]);
+        assert!(snapshot.collectors["dns_config"].is_ok());
+        assert_eq!(snapshot.failed(), ["routes"]);
     }
 
     #[test]
-    fn reports_failed_collectors() {
-        let snapshot = json!({ "collectors": {
-            "a": { "ok": true, "data": 1 },
-            "b": { "ok": false, "error": "x" },
-        }});
-        assert_eq!(failed_collectors(&snapshot), ["b"]);
+    fn keys_are_taken_from_the_collectors() {
+        assert_eq!(
+            identity_keys().collect::<Vec<_>>(),
+            ["name", "adapter", "destination", "next_hop", "interface"]
+        );
+        assert!(is_volatile_key("raw"));
+        assert!(!is_volatile_key("hops"));
     }
 }

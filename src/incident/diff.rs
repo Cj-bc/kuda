@@ -1,23 +1,17 @@
 //! スナップショットの比較。collector ごとの JSON を平坦化して、変更・追加・削除を並べる。
 
+use crate::collector::{self, CollectorResult, KnownGood, Snapshot};
 use crate::time::format_time;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-/// 配列の要素を同定するキー。添字で比べると 1 件の増減で後続がすべて差分になる
-const IDENTITY_KEYS: [&str; 5] = ["name", "adapter", "destination", "next_hop", "interface"];
-
-/// 毎回変わるので比較しないキー
-const VOLATILE_KEYS: [&str; 2] = ["raw", "truncated"];
-
 /// 比較基準の取得時刻。collector ごとに異なりうるので、異なれば範囲で示す
-fn baseline_time(last_good: &Value) -> String {
-    let times: Vec<i64> = last_good["collectors"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(_, entry)| entry["taken_at"].as_i64())
+fn baseline_time(last_good: &KnownGood) -> String {
+    let times: Vec<i64> = last_good
+        .collectors
+        .values()
+        .map(|entry| entry.taken_at)
         .collect();
     match (times.iter().min(), times.iter().max()) {
         (Some(first), Some(last)) if first == last => format_time(*first),
@@ -39,8 +33,7 @@ fn scalar(value: &Value) -> String {
 }
 
 fn identity(item: &Value) -> Option<String> {
-    let parts: Vec<String> = IDENTITY_KEYS
-        .iter()
+    let parts: Vec<String> = collector::identity_keys()
         .filter_map(|key| item.get(key).filter(|v| !v.is_null()).map(scalar))
         .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -51,7 +44,7 @@ fn flatten(path: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
-                if !VOLATILE_KEYS.contains(&key.as_str()) {
+                if !collector::is_volatile_key(key) {
                     flatten(&format!("{path}.{key}"), value, out);
                 }
             }
@@ -73,24 +66,13 @@ fn flatten(path: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     }
 }
 
-fn collector_data(snapshot: &Value, name: &str) -> Option<BTreeMap<String, String>> {
-    let entry = snapshot["collectors"].get(name)?;
-    if entry["ok"] != Value::Bool(true) {
-        return None;
-    }
+fn flat_data(name: &str, data: &Value) -> BTreeMap<String, String> {
     let mut flat = BTreeMap::new();
-    flatten(name, &entry["data"], &mut flat);
-    Some(flat)
+    flatten(name, data, &mut flat);
+    flat
 }
 
-pub(super) fn collector_names(snapshot: &Value) -> Vec<String> {
-    snapshot["collectors"]
-        .as_object()
-        .map(|map| map.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
-pub(super) fn render_diff(last_good: Option<&Value>, current: &Value) -> String {
+pub(super) fn render_diff(last_good: Option<&KnownGood>, current: &Snapshot) -> String {
     let mut text = "# 正常時との差分\n\n".to_string();
     let Some(last_good) = last_good else {
         text.push_str("比較できる正常時のスナップショットがありません。\n");
@@ -100,34 +82,34 @@ pub(super) fn render_diff(last_good: Option<&Value>, current: &Value) -> String 
         text,
         "基準: {} / 現在: {}\n",
         baseline_time(last_good),
-        current["taken_at"]
-            .as_i64()
-            .map_or_else(|| "?".to_string(), format_time),
+        format_time(current.taken_at),
     );
 
-    let mut names = collector_names(last_good);
-    names.extend(collector_names(current));
-    names.sort();
-    names.dedup();
+    let names: BTreeSet<&String> = last_good
+        .collectors
+        .keys()
+        .chain(current.collectors.keys())
+        .collect();
 
     let (mut changed, mut added, mut removed, mut failed) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for name in names {
-        let (Some(old), Some(new)) = (
-            collector_data(last_good, &name),
-            collector_data(current, &name),
-        ) else {
+        let baseline = last_good.collectors.get(name).map(|entry| &entry.data);
+        let now = match current.collectors.get(name) {
+            Some(CollectorResult::Ok(data)) => Some(data),
+            _ => None,
+        };
+        let (Some(old), Some(new)) = (baseline, now) else {
             // 片方で取得できていないと全項目が差分に見えるので、1 行にまとめる
-            let error = match current["collectors"][&name]["error"].as_str() {
-                Some(error) => error,
-                None if current["collectors"].get(&name).is_none() => {
-                    "現在のスナップショットに含まれていません"
-                }
-                None => "正常時に取得に成功したことがありません",
+            let error = match current.collectors.get(name) {
+                Some(CollectorResult::Failed(error)) => error.as_str(),
+                None => "現在のスナップショットに含まれていません",
+                Some(CollectorResult::Ok(_)) => "正常時に取得に成功したことがありません",
             };
             failed.push(format!("- `{name}`: {error}"));
             continue;
         };
+        let (old, new) = (flat_data(name, old), flat_data(name, new));
         for (path, value) in &new {
             match old.get(path) {
                 None => added.push(format!("- `{path}`: {value}")),
@@ -165,10 +147,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn snapshot(routes: Value) -> Value {
-        json!({ "taken_at": 100, "collectors": {
+    fn snapshot(routes: Value) -> Snapshot {
+        serde_json::from_value(json!({ "taken_at": 100, "collectors": {
             "routes": { "ok": true, "data": routes },
-        }})
+        }}))
+        .unwrap()
+    }
+
+    /// 成功した collector だけを、全部この時刻に取れた比較基準として使う
+    fn known_good(snapshot: &Snapshot) -> KnownGood {
+        let collectors = snapshot
+            .collectors
+            .iter()
+            .filter_map(|(name, result)| match result {
+                CollectorResult::Ok(data) => Some((
+                    name.clone(),
+                    collector::KnownGoodEntry {
+                        taken_at: snapshot.taken_at,
+                        data: data.clone(),
+                    },
+                )),
+                CollectorResult::Failed(_) => None,
+            })
+            .collect();
+        KnownGood { collectors }
     }
 
     fn route(destination: &str, next_hop: &str, metric: u32) -> Value {
@@ -178,7 +180,7 @@ mod tests {
     #[test]
     fn identical_snapshots_have_no_diff() {
         let data = snapshot(json!([route("0.0.0.0/0", "192.168.1.1", 10)]));
-        assert!(render_diff(Some(&data), &data).contains("差分はありません"));
+        assert!(render_diff(Some(&known_good(&data)), &data).contains("差分はありません"));
     }
 
     #[test]
@@ -188,7 +190,7 @@ mod tests {
             route("0.0.0.0/0", "192.168.1.1", 10),
             route("10.0.0.0/8", "10.0.0.1", 1)
         ]));
-        let diff = render_diff(Some(&old), &new);
+        let diff = render_diff(Some(&known_good(&old)), &new);
         assert!(diff.contains("## 追加"));
         assert!(!diff.contains("## 変更"));
         assert!(!diff.contains("## 削除"));
@@ -198,40 +200,48 @@ mod tests {
     fn changed_value_shows_both_sides() {
         let old = snapshot(json!([route("0.0.0.0/0", "192.168.1.1", 10)]));
         let new = snapshot(json!([route("0.0.0.0/0", "192.168.1.1", 50)]));
-        let diff = render_diff(Some(&old), &new);
+        let diff = render_diff(Some(&known_good(&old)), &new);
         assert!(diff.contains("10 ⇒ 50"), "{diff}");
     }
 
     #[test]
     fn removed_gateway_is_reported() {
         let old = snapshot(json!([route("0.0.0.0/0", "192.168.1.1", 10)]));
-        let diff = render_diff(Some(&old), &snapshot(json!([])));
+        let diff = render_diff(Some(&known_good(&old)), &snapshot(json!([])));
         assert!(diff.contains("## 削除"), "{diff}");
     }
 
     #[test]
     fn hop_changes_compare_as_a_path_and_ignore_raw_text() {
-        let trace = |hops: Value, raw: &str| {
-            json!({ "taken_at": 1, "collectors": {
+        let trace = |hops: Value, raw: &str| -> Snapshot {
+            serde_json::from_value(json!({ "taken_at": 1, "collectors": {
                 "traceroute:x": { "ok": true, "data": { "hops": hops, "raw": raw } },
-            }})
+            }}))
+            .unwrap()
         };
         let old = trace(json!(["10.0.0.1", null]), "1 ms");
         assert!(
-            render_diff(Some(&old), &trace(json!(["10.0.0.1", null]), "9 ms"))
-                .contains("差分はありません")
+            render_diff(
+                Some(&known_good(&old)),
+                &trace(json!(["10.0.0.1", null]), "9 ms")
+            )
+            .contains("差分はありません")
         );
-        let diff = render_diff(Some(&old), &trace(json!(["10.0.0.2", null]), "1 ms"));
+        let diff = render_diff(
+            Some(&known_good(&old)),
+            &trace(json!(["10.0.0.2", null]), "1 ms"),
+        );
         assert!(diff.contains("10.0.0.1 → * ⇒ 10.0.0.2 → *"), "{diff}");
     }
 
     #[test]
     fn failed_collector_is_one_line_not_a_mass_removal() {
         let old = snapshot(json!([route("0.0.0.0/0", "192.168.1.1", 10)]));
-        let new = json!({ "taken_at": 2, "collectors": {
+        let new: Snapshot = serde_json::from_value(json!({ "taken_at": 2, "collectors": {
             "routes": { "ok": false, "error": "ip not found" },
-        }});
-        let diff = render_diff(Some(&old), &new);
+        }}))
+        .unwrap();
+        let diff = render_diff(Some(&known_good(&old)), &new);
         assert!(diff.contains("ip not found"));
         assert!(!diff.contains("## 削除"));
     }

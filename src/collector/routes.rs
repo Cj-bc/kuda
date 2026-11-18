@@ -4,6 +4,9 @@ use anyhow::Result;
 use serde_json::Value;
 use std::net::IpAddr;
 
+/// 差分でルート一覧の要素を同定するキー（`collect` の出力の項目名）
+pub(super) const IDENTITY_KEYS: &[&str] = &["destination", "next_hop", "interface"];
+
 #[cfg(windows)]
 pub use self::windows_impl::{collect, default_gateway};
 

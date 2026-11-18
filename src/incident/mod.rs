@@ -3,15 +3,16 @@
 mod diff;
 
 use crate::baseline::{SeriesStats, Source};
+use crate::collector::{KnownGood, Snapshot};
 use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
 use crate::time::format_time;
 use anyhow::{Context, Result, ensure};
 use chrono::{Local, TimeZone};
-use diff::{collector_names, render_diff};
+use diff::render_diff;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -34,9 +35,9 @@ pub struct Evidence<'a> {
     pub run: &'a ProbeRun,
     pub stats: &'a [SeriesStats],
     pub history: &'a [MetricRow],
-    pub current: &'a Value,
+    pub current: &'a Snapshot,
     /// collector ごとの最後の成功データ（`Store::last_known_good`）
-    pub last_good: Option<&'a Value>,
+    pub last_good: Option<&'a KnownGood>,
 }
 
 /// 秒単位の時刻から一意なディレクトリを作る。同じ秒に重なったら連番を付ける
@@ -192,19 +193,18 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
 
     text.push_str("\n## 最後の正常時スナップショット\n\n");
     text.push_str("collector ごとに、最後に取得に成功した時点のデータと比べます。\n\n");
-    let mut names = collector_names(evidence.current);
+    let mut names: BTreeSet<&String> = evidence.current.collectors.keys().collect();
     if let Some(last_good) = evidence.last_good {
-        names.extend(collector_names(last_good));
+        names.extend(last_good.collectors.keys());
     }
-    names.sort();
-    names.dedup();
     if names.is_empty() {
         text.push_str("ありません。\n");
     }
     for name in names {
         let taken_at = evidence
             .last_good
-            .and_then(|last_good| last_good["collectors"][&name]["taken_at"].as_i64());
+            .and_then(|last_good| last_good.collectors.get(name))
+            .map(|entry| entry.taken_at);
         let time = taken_at.map_or_else(|| "成功した取得がありません".to_string(), format_time);
         let _ = writeln!(text, "- `{name}`: {time}");
     }
@@ -241,12 +241,13 @@ fn render_metrics(evidence: &Evidence) -> String {
 mod tests {
     use super::*;
     use crate::probe::TargetResult;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    fn snapshot(routes: Value) -> Value {
-        json!({ "taken_at": 100, "collectors": {
+    fn snapshot(routes: Value) -> Snapshot {
+        serde_json::from_value(json!({ "taken_at": 100, "collectors": {
             "routes": { "ok": true, "data": routes },
-        }})
+        }}))
+        .unwrap()
     }
 
     fn route(destination: &str, next_hop: &str, metric: u32) -> Value {
@@ -256,15 +257,17 @@ mod tests {
     #[test]
     fn per_collector_baseline_is_compared_with_its_own_time() {
         // routes は 1 時間前、dns_config は 7 時間前が最後の成功
-        let last_good = json!({ "collectors": {
+        let last_good: KnownGood = serde_json::from_value(json!({ "collectors": {
             "routes": { "ok": true, "taken_at": 3600, "data": [route("0.0.0.0/0", "192.168.1.1", 10)] },
             "dns_config": { "ok": true, "taken_at": 0, "data": { "servers": ["192.168.1.1"] } },
-        }});
-        let current = json!({ "taken_at": 7200, "collectors": {
+        }}))
+        .unwrap();
+        let current: Snapshot = serde_json::from_value(json!({ "taken_at": 7200, "collectors": {
             "routes": { "ok": true, "data": [route("0.0.0.0/0", "192.168.1.1", 50)] },
             "dns_config": { "ok": true, "data": { "servers": ["192.168.1.1"] } },
             "adapters": { "ok": true, "data": [] },
-        }});
+        }}))
+        .unwrap();
         let diff = render_diff(Some(&last_good), &current);
         assert!(
             diff.contains(&format!("{} 〜 {}", format_time(0), format_time(3600))),
@@ -318,7 +321,7 @@ mod tests {
 
     fn evidence<'a>(
         run: &'a ProbeRun,
-        current: &'a Value,
+        current: &'a Snapshot,
         history: &'a [MetricRow],
     ) -> Evidence<'a> {
         Evidence {
