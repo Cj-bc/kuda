@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01Lij44qbhMypLG41wMD23zE",
+  "agent_id": "a3b1dc44c41dc3d03",
+  "subagent_type": "general-purpose",
+  "task_description": "Metrics vocab and check flow",
+  "token_usage": {
+    "input_tokens": 130,
+    "cache_creation_tokens": 192292,
+    "cache_read_tokens": 8459254,
+    "output_tokens": 51712,
+    "api_call_count": 64
+  },
+  "started_at": "2026-11-18T14:13:25.0843369+09:00",
+  "completed_at": "2026-11-18T14:21:34.8022178+09:00"
+}
