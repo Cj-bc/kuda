@@ -15,7 +15,7 @@ use crate::metrics::{self, Variables};
 use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun};
-use crate::store::{Store, WatchState};
+use crate::store::{ProbeState, SnapshotState, Store};
 use crate::time::format_time;
 use crate::trigger::{self, Outcome};
 use anyhow::{Context, Result, bail, ensure};
@@ -46,7 +46,7 @@ const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// スナップショットを取る時期か。最後の取得で全 collector が成功していれば snapshot_interval、
 /// 失敗した collector があれば再試行の間隔（snapshot_interval が短ければそちら）を、
 /// 最後の取得から空ける
-fn is_snapshot_due(state: &WatchState, now: i64, interval: Duration) -> bool {
+fn is_snapshot_due(state: &SnapshotState, now: i64, interval: Duration) -> bool {
     let wait = if state.last_snapshot_complete == Some(true) {
         interval
     } else {
@@ -101,7 +101,7 @@ fn check_watch(
     force: bool,
     now: i64,
 ) -> Result<()> {
-    let state = store.load_state(&watch.name)?;
+    let state = store.load_probe_state(&watch.name)?;
     if !force && !is_due(state.last_probe, now, watch.interval) {
         log::debug!("{}: interval has not elapsed", watch.name);
         return Ok(());
@@ -166,7 +166,7 @@ fn apply(
     store: &mut Store,
     paths: &Paths,
     watch: &Watch,
-    mut state: WatchState,
+    mut state: ProbeState,
     observation: &Observation,
     now: i64,
 ) -> Result<()> {
@@ -187,7 +187,9 @@ fn apply(
     let healthy = !matched && metrics[metrics::LOSS] < 1.0;
     if healthy {
         baseline::update(store, &watch.name, &watch.stats, metrics, now)?;
-        if is_snapshot_due(&state, now, watch.snapshots.interval)
+        // snapshot コマンドが並行して取った分も踏まえるよう、使う直前に読む
+        let snapshot_state = store.load_snapshot_state(&watch.name)?;
+        if is_snapshot_due(&snapshot_state, now, watch.snapshots.interval)
             && !watch.snapshots.collectors.is_empty()
         {
             take_snapshot(store, watch, now)?;
@@ -195,13 +197,13 @@ fn apply(
     }
 
     let Some(trigger) = &watch.trigger else {
-        store.save_state(&watch.name, &state)?;
+        store.save_probe_state(&watch.name, &state)?;
         return Ok(());
     };
     let since = state.trigger.since;
     let outcome = trigger::advance(&mut state.trigger, matched, trigger, now);
     // 発火の処理で失敗しても二重に発火しないよう、先に状態を保存する
-    store.save_state(&watch.name, &state)?;
+    store.save_probe_state(&watch.name, &state)?;
     log::debug!("{}: trigger outcome {outcome:?}", watch.name);
 
     match outcome {
@@ -397,8 +399,9 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             continue;
         }
         // check のロックは取らない。check と並行してよいよう、スナップショットの記録以外は
-        // 書かない。ここで読んだ状態を save_state で書き戻すと、収集中に check が保存した状態を巻き戻す
-        let state = store.load_state(&watch.name)?;
+        // 書かない。読むのは SnapshotState だけで、これは保存する関数が無い
+        // （check の状態を書き戻すと、収集中に check が保存した状態を巻き戻す）
+        let state = store.load_snapshot_state(&watch.name)?;
         let now = now();
         if !force && !is_snapshot_due(&state, now, watch.snapshots.interval) {
             println!(
@@ -503,19 +506,24 @@ fn manual_incident(paths: &Paths, watch: &Watch) -> Result<Incident> {
     let store = Store::open(&paths.db_file())?;
     let now = now();
     let observation = observe(&store, paths, watch, now, false)?;
-    let since = store.load_state(&watch.name)?.trigger.since.unwrap_or(now);
+    let since = store
+        .load_probe_state(&watch.name)?
+        .trigger
+        .since
+        .unwrap_or(now);
     build_incident(&store, paths, watch, &observation, since, "手動実行")
 }
 
 pub fn status(config: &Config, paths: &Paths) -> Result<()> {
     let store = Store::open(&paths.db_file())?;
     for watch in &config.watches {
-        let state = store.load_state(&watch.name)?;
+        let state = store.load_probe_state(&watch.name)?;
+        let snapshot = store.load_snapshot_state(&watch.name)?;
         println!("{}", watch.name);
         print_probe_status(&store, watch, &state)?;
         let stats = baseline::stats(&store, &watch.name, &watch.stats, now())?;
         print_baseline(&stats);
-        println!("  last snapshot: {}", snapshot_status(&state));
+        println!("  last snapshot: {}", snapshot_status(&snapshot));
         print_trigger_status(watch, &state, now());
     }
     Ok(())
@@ -523,7 +531,7 @@ pub fn status(config: &Config, paths: &Paths) -> Result<()> {
 
 /// 最後の取得時刻と、そのとき失敗した collector があったか。
 /// 成否の記録が無いとき（版 3 へ上げた直後）は、失敗とは言い切らない
-fn snapshot_status(state: &WatchState) -> String {
+fn snapshot_status(state: &SnapshotState) -> String {
     let Some(last) = state.last_snapshot else {
         return "none".to_string();
     };
@@ -540,7 +548,7 @@ fn snapshot_status(state: &WatchState) -> String {
     }
 }
 
-fn print_probe_status(store: &Store, watch: &Watch, state: &WatchState) -> Result<()> {
+fn print_probe_status(store: &Store, watch: &Watch, state: &ProbeState) -> Result<()> {
     let last_probe = state.last_probe.map_or("never".to_string(), format_time);
     println!("  last probe: {last_probe}");
     println!("  samples: {}", store.sample_count(&watch.name)?);
@@ -571,7 +579,7 @@ fn print_baseline(stats: &[SeriesStats]) {
     }
 }
 
-fn print_trigger_status(watch: &Watch, state: &WatchState, now: i64) {
+fn print_trigger_status(watch: &Watch, state: &ProbeState, now: i64) {
     let Some(trigger) = &watch.trigger else {
         println!("  trigger: none");
         return;
@@ -688,12 +696,11 @@ mod tests {
 
     /// 最後の取得の成否は、全 collector が成功した時刻と一致するかで決める。
     /// 成功した時刻が無ければ、版 3 へ上げた直後の成否不明とする
-    fn snapshot_state(last: Option<i64>, complete: Option<i64>) -> WatchState {
-        WatchState {
+    fn snapshot_state(last: Option<i64>, complete: Option<i64>) -> SnapshotState {
+        SnapshotState {
             last_snapshot: last,
             last_complete_snapshot: complete,
             last_snapshot_complete: complete.map(|complete| Some(complete) == last),
-            ..WatchState::default()
         }
     }
 
@@ -701,7 +708,7 @@ mod tests {
     fn failure_at_the_same_second_as_a_success_is_retried() {
         let interval = Duration::from_secs(6 * 3600);
         // 同じ秒に始めた成功と失敗の取得が重なり、時刻は全 collector の成功と一致している
-        let state = WatchState {
+        let state = SnapshotState {
             last_snapshot_complete: Some(false),
             ..snapshot_state(Some(100), Some(100))
         };
@@ -814,7 +821,7 @@ mod tests {
             }],
             processes: Some(processes),
         };
-        let state = store.load_state(&watch.name).unwrap();
+        let state = store.load_probe_state(&watch.name).unwrap();
         let observation = observe_run(store, paths, watch, run, now, true).unwrap();
         apply(store, paths, watch, state, &observation, now).unwrap();
     }

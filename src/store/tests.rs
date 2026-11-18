@@ -263,7 +263,7 @@ fn failed_collectors_keep_the_last_good_data() {
     let store = Store::in_memory().unwrap();
     let good = snapshot(100, ok(json!({ "n": 1 })), ok(json!({ "s": "a" })));
     store.record_snapshot("w", 100, &good, 5).unwrap();
-    let state = store.load_state("w").unwrap();
+    let state = store.load_snapshot_state("w").unwrap();
     assert_eq!(state.last_snapshot, Some(100));
     assert_eq!(state.last_complete_snapshot, Some(100));
 
@@ -275,7 +275,7 @@ fn failed_collectors_keep_the_last_good_data() {
     assert_eq!(baseline.collectors["routes"].taken_at, 200);
     assert_eq!(baseline.collectors["dns_config"].data["s"], "a");
     assert_eq!(baseline.collectors["dns_config"].taken_at, 100);
-    let state = store.load_state("w").unwrap();
+    let state = store.load_snapshot_state("w").unwrap();
     assert_eq!(state.last_snapshot, Some(200));
     assert_eq!(state.last_complete_snapshot, Some(100));
 
@@ -287,7 +287,7 @@ fn failed_collectors_keep_the_last_good_data() {
         store.last_known_good("w", &names()).unwrap().unwrap(),
         baseline
     );
-    let state = store.load_state("w").unwrap();
+    let state = store.load_snapshot_state("w").unwrap();
     assert_eq!(state.last_snapshot, Some(300));
     assert_eq!(state.last_complete_snapshot, Some(100));
     // 取得履歴には失敗も残る
@@ -348,7 +348,7 @@ fn a_failure_at_the_same_second_as_a_success_is_not_hidden() {
         for data in order {
             store.record_snapshot("w", 100, data, 5).unwrap();
         }
-        let state = store.load_state("w").unwrap();
+        let state = store.load_snapshot_state("w").unwrap();
         assert_eq!(state.last_snapshot, Some(100));
         assert_eq!(state.last_complete_snapshot, Some(100));
         assert_eq!(state.last_snapshot_complete, Some(false));
@@ -362,23 +362,35 @@ fn latest_attempt_decides_whether_the_snapshot_was_complete() {
     let partial = snapshot(200, ok(json!(1)), failed());
     store.record_snapshot("w", 100, &complete, 5).unwrap();
     assert_eq!(
-        store.load_state("w").unwrap().last_snapshot_complete,
+        store
+            .load_snapshot_state("w")
+            .unwrap()
+            .last_snapshot_complete,
         Some(true)
     );
     store.record_snapshot("w", 200, &partial, 5).unwrap();
     assert_eq!(
-        store.load_state("w").unwrap().last_snapshot_complete,
+        store
+            .load_snapshot_state("w")
+            .unwrap()
+            .last_snapshot_complete,
         Some(false)
     );
     // 収集開始の早い取得が後から完了しても、最後の取得の成否は変えない
     store.record_snapshot("w", 150, &complete, 5).unwrap();
     assert_eq!(
-        store.load_state("w").unwrap().last_snapshot_complete,
+        store
+            .load_snapshot_state("w")
+            .unwrap()
+            .last_snapshot_complete,
         Some(false)
     );
     store.record_snapshot("w", 300, &complete, 5).unwrap();
     assert_eq!(
-        store.load_state("w").unwrap().last_snapshot_complete,
+        store
+            .load_snapshot_state("w")
+            .unwrap()
+            .last_snapshot_complete,
         Some(true)
     );
 }
@@ -392,7 +404,7 @@ fn an_earlier_snapshot_finishing_later_does_not_roll_back_the_baseline() {
     store.record_snapshot("w", 100, &older, 5).unwrap();
     let baseline = store.last_known_good("w", &names()).unwrap().unwrap();
     assert_eq!(baseline.collectors["routes"].data["n"], 2);
-    let state = store.load_state("w").unwrap();
+    let state = store.load_snapshot_state("w").unwrap();
     assert_eq!(state.last_snapshot, Some(200));
     assert_eq!(state.last_complete_snapshot, Some(200));
 }
@@ -441,8 +453,8 @@ fn v2_file_database_is_migrated_to_a_per_collector_baseline() {
     assert_eq!(baseline.collectors["routes"].taken_at, 200);
     assert_eq!(baseline.collectors["dns_config"].data["s"], "a");
     assert_eq!(baseline.collectors["dns_config"].taken_at, 100);
-    let state = store.load_state("w").unwrap();
-    assert_eq!(state.last_probe, Some(310));
+    assert_eq!(store.load_probe_state("w").unwrap().last_probe, Some(310));
+    let state = store.load_snapshot_state("w").unwrap();
     assert_eq!(state.last_snapshot, Some(300));
     assert_eq!(state.last_complete_snapshot, None);
     assert_eq!(state.last_snapshot_complete, None);
@@ -501,7 +513,7 @@ fn v3_database_is_migrated_to_process_identities() {
     let mut store = db.open();
     assert_eq!(Store::version(&store.conn).unwrap(), MIGRATIONS.len());
     // 既存の状態はそのまま残り、学習期間の起点は未設定になる
-    let state = store.load_state("w").unwrap();
+    let state = store.load_probe_state("w").unwrap();
     assert_eq!(state.last_probe, Some(310));
     assert_eq!(state.trigger.streak, 2);
     assert_eq!(store.learning_started("w").unwrap(), None);
@@ -568,28 +580,29 @@ fn learning_start_is_set_once_and_independent_of_check_state() {
     store.start_learning("w", 200).unwrap();
     assert_eq!(store.learning_started("w").unwrap(), Some(100));
     store
-        .save_state(
+        .save_probe_state(
             "w",
-            &WatchState {
+            &ProbeState {
                 last_probe: Some(300),
-                ..WatchState::default()
+                ..ProbeState::default()
             },
         )
         .unwrap();
     assert_eq!(store.learning_started("w").unwrap(), Some(100));
     store.start_learning("w", 400).unwrap();
-    assert_eq!(store.load_state("w").unwrap().last_probe, Some(300));
+    assert_eq!(store.load_probe_state("w").unwrap().last_probe, Some(300));
 }
 
 #[test]
 fn state_round_trips_and_defaults_when_missing() {
     let store = Store::in_memory().unwrap();
-    assert_eq!(store.load_state("w").unwrap(), WatchState::default());
-    let state = WatchState {
+    assert_eq!(store.load_probe_state("w").unwrap(), ProbeState::default());
+    assert_eq!(
+        store.load_snapshot_state("w").unwrap(),
+        SnapshotState::default()
+    );
+    let state = ProbeState {
         last_probe: Some(1),
-        last_snapshot: Some(2),
-        last_complete_snapshot: Some(2),
-        last_snapshot_complete: Some(true),
         trigger: TriggerState {
             streak: 3,
             since: Some(4),
@@ -597,22 +610,28 @@ fn state_round_trips_and_defaults_when_missing() {
             active: true,
         },
     };
-    store.save_state("w", &state).unwrap();
+    store.save_probe_state("w", &state).unwrap();
     store.set_last_snapshot("w", 2).unwrap();
-    assert_eq!(store.load_state("w").unwrap(), state);
+    assert_eq!(store.load_probe_state("w").unwrap(), state);
+    let snapshot = SnapshotState {
+        last_snapshot: Some(2),
+        last_complete_snapshot: Some(2),
+        last_snapshot_complete: Some(true),
+    };
+    assert_eq!(store.load_snapshot_state("w").unwrap(), snapshot);
 }
 
 #[test]
 fn last_snapshot_alone_creates_default_state() {
     let store = Store::in_memory().unwrap();
     store.set_last_snapshot("w", 2).unwrap();
-    let expected = WatchState {
+    let expected = SnapshotState {
         last_snapshot: Some(2),
         last_complete_snapshot: Some(2),
         last_snapshot_complete: Some(true),
-        ..WatchState::default()
     };
-    assert_eq!(store.load_state("w").unwrap(), expected);
+    assert_eq!(store.load_snapshot_state("w").unwrap(), expected);
+    assert_eq!(store.load_probe_state("w").unwrap(), ProbeState::default());
 }
 
 #[test]
@@ -621,9 +640,15 @@ fn last_snapshot_never_moves_backwards() {
     // snapshot が 100 に収集を始め、その間に check が 110 で保存し、最後に snapshot が完了する
     store.set_last_snapshot("w", 110).unwrap();
     store.set_last_snapshot("w", 100).unwrap();
-    assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(110));
+    assert_eq!(
+        store.load_snapshot_state("w").unwrap().last_snapshot,
+        Some(110)
+    );
     store.set_last_snapshot("w", 120).unwrap();
-    assert_eq!(store.load_state("w").unwrap().last_snapshot, Some(120));
+    assert_eq!(
+        store.load_snapshot_state("w").unwrap().last_snapshot,
+        Some(120)
+    );
 }
 
 /// 別プロセスの代わりに同じファイルを複数の接続で開くための DB。drop で片付ける
@@ -664,7 +689,7 @@ fn snapshot_does_not_roll_back_check_state() {
     // snapshot が収集している間に check が状態を進めて保存し、その後 snapshot が
     // 完了する。commands::snapshot は収集前に読んだ状態を書き戻さず、
     // set_last_snapshot だけを呼ぶ
-    let mut checked = check.load_state("w").unwrap();
+    let mut checked = check.load_probe_state("w").unwrap();
     checked.last_probe = Some(10);
     checked.trigger = TriggerState {
         streak: 3,
@@ -672,13 +697,14 @@ fn snapshot_does_not_roll_back_check_state() {
         last_fired: Some(5),
         active: true,
     };
-    check.save_state("w", &checked).unwrap();
+    check.save_probe_state("w", &checked).unwrap();
     snapshot.set_last_snapshot("w", 20).unwrap();
 
-    let state = check.load_state("w").unwrap();
-    assert_eq!(state.last_probe, Some(10));
-    assert_eq!(state.last_snapshot, Some(20));
-    assert_eq!(state.trigger, checked.trigger);
+    assert_eq!(check.load_probe_state("w").unwrap(), checked);
+    assert_eq!(
+        check.load_snapshot_state("w").unwrap().last_snapshot,
+        Some(20)
+    );
 }
 
 #[test]
@@ -688,14 +714,16 @@ fn check_does_not_roll_back_last_snapshot() {
     let check = db.open();
 
     // check が状態を読んだ後に snapshot が完了し、その後で check が保存する
-    let mut state = check.load_state("w").unwrap();
+    let mut state = check.load_probe_state("w").unwrap();
     snapshot.set_last_snapshot("w", 20).unwrap();
     state.last_probe = Some(30);
-    check.save_state("w", &state).unwrap();
+    check.save_probe_state("w", &state).unwrap();
 
-    let state = snapshot.load_state("w").unwrap();
-    assert_eq!(state.last_probe, Some(30));
-    assert_eq!(state.last_snapshot, Some(20));
+    assert_eq!(snapshot.load_probe_state("w").unwrap().last_probe, Some(30));
+    assert_eq!(
+        snapshot.load_snapshot_state("w").unwrap().last_snapshot,
+        Some(20)
+    );
 }
 
 #[test]

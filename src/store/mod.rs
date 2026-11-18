@@ -22,7 +22,7 @@ use std::time::Duration;
 pub use hist::V1Hist;
 pub use identities::IdentityStatus;
 pub use metrics::MetricRow;
-pub use state::WatchState;
+pub use state::{ProbeState, SnapshotState};
 
 pub struct Store {
     conn: Connection,

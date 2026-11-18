@@ -50,7 +50,7 @@ impl Store {
     }
 
     /// 学習期間の起点を記録する。既にあれば変えない。
-    /// `save_state` と同じ行を触るが、列が別なので互いを巻き戻さない
+    /// `save_probe_state` と同じ行を触るが、列が別なので互いを巻き戻さない
     pub fn start_learning(&self, watch: &str, ts: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO watch_state (watch, streak, active, learning_started)
