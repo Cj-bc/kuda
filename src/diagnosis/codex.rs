@@ -1,7 +1,7 @@
 use super::{Backend, Request};
 use crate::config::CodexBackend;
-use crate::paths::create_private_dir;
 use crate::exec;
+use crate::paths::create_private_dir;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
