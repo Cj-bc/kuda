@@ -8,8 +8,9 @@ mod codex;
 mod local;
 
 use crate::config::{BackendKind, Config, Diagnose};
-use crate::incident::{Incident, format_time};
+use crate::incident::Incident;
 use crate::paths::{Paths, create_private_dir, is_safe_name};
+use crate::time::format_time;
 use anyhow::{Context, Result, bail, ensure};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

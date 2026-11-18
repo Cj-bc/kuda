@@ -23,6 +23,7 @@ mod os;
 mod paths;
 mod probe;
 mod store;
+mod time;
 mod trigger;
 
 #[derive(Parser)]
