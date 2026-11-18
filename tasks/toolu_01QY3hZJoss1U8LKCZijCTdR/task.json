@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_01QY3hZJoss1U8LKCZijCTdR",
+  "agent_id": "a53e23bee7a82c411",
+  "subagent_type": "general-purpose",
+  "task_description": "Consolidate shared test helpers",
+  "token_usage": {
+    "input_tokens": 46,
+    "cache_creation_tokens": 70949,
+    "cache_read_tokens": 1621754,
+    "output_tokens": 19322,
+    "api_call_count": 23
+  },
+  "started_at": "2026-11-18T14:25:55.2547529+09:00",
+  "completed_at": "2026-11-18T14:29:10.4718158+09:00"
+}
