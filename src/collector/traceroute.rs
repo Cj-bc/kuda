@@ -1,6 +1,6 @@
 //! traceroute / tracert による経路の取得。
 
-use crate::process;
+use crate::exec;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::net::IpAddr;
@@ -19,12 +19,12 @@ pub fn collect(target: &str) -> Result<Value> {
             vec!["-n", "-m", MAX_HOPS, "-w", "1", "-q", "1", target],
         )
     };
-    let Some(path) = process::find_program(program) else {
+    let Some(path) = exec::find_program(program) else {
         bail!("{program} is not installed");
     };
-    let mut command = process::command(path);
+    let mut command = exec::command(path);
     command.args(args);
-    let output = process::run(command, None, TIMEOUT)?;
+    let output = exec::run(command, None, TIMEOUT)?;
     let hops = parse_hops(&output.stdout);
     if hops.is_empty() {
         bail!(

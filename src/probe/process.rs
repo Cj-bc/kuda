@@ -250,7 +250,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process;
+    use crate::exec;
 
     #[test]
     fn lists_itself_with_path_and_start_time() {
@@ -279,11 +279,11 @@ mod tests {
     #[test]
     fn child_reports_this_process_as_its_parent() {
         #[cfg(windows)]
-        let mut command = process::command("ping");
+        let mut command = exec::command("ping");
         #[cfg(windows)]
         command.args(["-n", "10", "127.0.0.1"]);
         #[cfg(unix)]
-        let mut command = process::command("sleep");
+        let mut command = exec::command("sleep");
         #[cfg(unix)]
         command.arg("10");
 

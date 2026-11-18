@@ -5,6 +5,7 @@ use crate::collector;
 use crate::config::{BackendKind, Config, Watch};
 use crate::detach;
 use crate::diagnosis;
+use crate::exec;
 use crate::incident::{self, Evidence, Incident, format_time};
 use crate::investigation;
 use crate::known_set::{self, Classification, Roots};
@@ -13,7 +14,6 @@ use crate::logging;
 use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun, ProcessInfo};
-use crate::process;
 use crate::store::{Store, WatchState};
 use crate::trigger::{self, Outcome, Variables};
 use anyhow::{Context, Result, bail, ensure};
@@ -545,7 +545,7 @@ pub fn check_config(config: &Config, paths: &Paths) -> Result<()> {
         }
         for kind in std::iter::once(diagnose.backend).chain(diagnose.fallback) {
             if let Some(command) = backend_command(config, kind)
-                && process::find_program(command).is_none()
+                && exec::find_program(command).is_none()
             {
                 problems.push(format!(
                     "{}: {} command not found: {command}",

@@ -9,15 +9,15 @@ pub use self::windows_impl::{collect, default_gateway};
 
 #[cfg(unix)]
 pub fn collect() -> Result<Value> {
-    use crate::process;
+    use crate::exec;
     use anyhow::bail;
     use std::time::Duration;
 
     let mut routes = Vec::new();
     for family in ["-4", "-6"] {
-        let mut command = process::command("ip");
+        let mut command = exec::command("ip");
         command.args(["-j", family, "route", "show"]);
-        let output = process::run(command, None, Duration::from_secs(5))?;
+        let output = exec::run(command, None, Duration::from_secs(5))?;
         if !output.success() {
             bail!("ip -j route failed: {}", output.stderr.trim());
         }

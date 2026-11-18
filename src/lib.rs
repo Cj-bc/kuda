@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod detach;
 mod diagnosis;
+mod exec;
 mod incident;
 mod investigation;
 mod known_set;
@@ -20,7 +21,6 @@ mod logging;
 mod notify;
 mod paths;
 mod probe;
-mod process;
 mod store;
 mod trigger;
 

@@ -1,7 +1,7 @@
 use super::{Backend, Request};
 use crate::config::CodexBackend;
 use crate::paths::create_private_dir;
-use crate::process;
+use crate::exec;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -135,21 +135,21 @@ fn prompt_with_rules(prompt: &str, allowed_commands: &[String]) -> String {
 
 impl Backend for Codex {
     fn available(&self) -> Result<String, String> {
-        process::find_program(&self.0.command)
+        exec::find_program(&self.0.command)
             .map(|path| path.display().to_string())
             .ok_or_else(|| format!("command not found: {}", self.0.command))
     }
 
     fn run(&self, request: &Request) -> Result<String> {
-        let program = process::find_program(&self.0.command)
+        let program = exec::find_program(&self.0.command)
             .with_context(|| format!("command not found: {}", self.0.command))?;
         let scratch = Scratch::create(request.work_dir)?;
-        let mut command = process::command(program);
+        let mut command = exec::command(program);
         command
             .args(args(request.incident_dir, &scratch.last_message()))
             .current_dir(request.incident_dir);
         let prompt = prompt_with_rules(request.prompt, request.allowed_commands);
-        let output = process::run(command, Some(&prompt), request.timeout)?;
+        let output = exec::run(command, Some(&prompt), request.timeout)?;
         if output.timed_out {
             bail!("timed out after {:?}", request.timeout);
         }

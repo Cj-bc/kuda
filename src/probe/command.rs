@@ -1,13 +1,13 @@
 use super::Sample;
-use crate::process;
+use crate::exec;
 use std::time::{Duration, Instant};
 
 /// 終了コード 0 を成功とする。標準出力の最終行が数値なら `value` 指標になる
 pub fn check(argv: &[String], timeout: Duration) -> Result<Sample, String> {
-    let mut command = process::command(&argv[0]);
+    let mut command = exec::command(&argv[0]);
     command.args(&argv[1..]);
     let started = Instant::now();
-    let output = process::run(command, None, timeout).map_err(|e| format!("{e:#}"))?;
+    let output = exec::run(command, None, timeout).map_err(|e| format!("{e:#}"))?;
     let rtt_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     if output.timed_out {

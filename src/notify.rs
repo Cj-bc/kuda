@@ -3,7 +3,7 @@
 //! 通知は補助的なものなので、出せなくても調査は止めずにログに残すだけにする。
 //! Windows は PowerShell 5.1 から WinRT のトーストを、Linux は `notify-send` を使う。
 
-use crate::process;
+use crate::exec;
 use anyhow::{Result, bail};
 use std::path::Path;
 use std::time::Duration;
@@ -64,7 +64,7 @@ pub fn send(event: &Event) {
     }
 }
 
-fn check(output: process::Output) -> Result<()> {
+fn check(output: exec::Output) -> Result<()> {
     if output.timed_out {
         bail!("timed out");
     }
@@ -92,29 +92,29 @@ const POWERSHELL_APP_ID: &str =
 
 #[cfg(windows)]
 fn show(event: &Event) -> Result<()> {
-    let mut command = process::command("powershell.exe");
+    let mut command = exec::command("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", TOAST_SCRIPT])
         .env("KUDA_TOAST_XML", toast_xml(event))
         .env("KUDA_TOAST_APP_ID", POWERSHELL_APP_ID);
-    check(process::run(command, None, TIMEOUT)?)
+    check(exec::run(command, None, TIMEOUT)?)
 }
 
 #[cfg(unix)]
 fn show(event: &Event) -> Result<()> {
-    let Some(program) = process::find_program("notify-send") else {
+    let Some(program) = exec::find_program("notify-send") else {
         bail!("notify-send is not installed");
     };
     let urgency = match event {
         Event::Failed { .. } => "critical",
         _ => "normal",
     };
-    let mut command = process::command(program);
+    let mut command = exec::command(program);
     command
         .args(["--app-name=kuda", &format!("--urgency={urgency}")])
         .arg(event.title())
         .arg(event.body());
-    check(process::run(command, None, TIMEOUT)?)
+    check(exec::run(command, None, TIMEOUT)?)
 }
 
 #[cfg(any(windows, test))]

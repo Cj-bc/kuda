@@ -65,19 +65,19 @@ fn spawn(_watch: &str, argv: &[String]) -> Result<()> {
 
 #[cfg(unix)]
 fn spawn(watch: &str, argv: &[String]) -> Result<()> {
-    use crate::process;
+    use crate::exec;
     use std::os::unix::process::CommandExt;
     use std::time::Duration;
 
     // ユーザーの systemd が動いていれば別ユニットにする。cgroup ごと止められずに済み、
     // 同名ユニットが動いていれば起動に失敗するので多重起動防止にもなる
     if std::env::var_os("XDG_RUNTIME_DIR").is_some()
-        && let Some(systemd_run) = process::find_program("systemd-run")
+        && let Some(systemd_run) = exec::find_program("systemd-run")
     {
-        let mut command = process::command(systemd_run);
+        let mut command = exec::command(systemd_run);
         command.args(systemd_run_args(watch, |key| std::env::var(key).ok()));
         command.args(argv);
-        match process::run(command, None, Duration::from_secs(10)) {
+        match exec::run(command, None, Duration::from_secs(10)) {
             Ok(output) if output.success() => return Ok(()),
             Ok(output) if output.stderr.contains("already") => {
                 log::info!("diagnose for {watch} is already running");

@@ -534,7 +534,7 @@ mod tests {
         let mut helper = helper
             .args([
                 "--exact",
-                "process::tests::stops_commands_when_signalled",
+                "exec::tests::stops_commands_when_signalled",
                 "--nocapture",
             ])
             .env(SIGNAL_HELPER_DIR, &dir)

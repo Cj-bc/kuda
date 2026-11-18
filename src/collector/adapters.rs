@@ -13,13 +13,13 @@ pub(super) use self::windows_impl::dns_servers;
 
 #[cfg(unix)]
 pub fn collect() -> Result<Value> {
-    use crate::process;
+    use crate::exec;
     use anyhow::{Context, bail};
     use std::time::Duration;
 
-    let mut command = process::command("ip");
+    let mut command = exec::command("ip");
     command.args(["-j", "addr", "show"]);
-    let output = process::run(command, None, Duration::from_secs(5)).context("ip -j addr")?;
+    let output = exec::run(command, None, Duration::from_secs(5)).context("ip -j addr")?;
     if !output.success() {
         bail!("ip -j addr failed: {}", output.stderr.trim());
     }

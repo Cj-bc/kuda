@@ -1,6 +1,6 @@
 use super::{Backend, Request};
 use crate::config::ClaudeCodeBackend;
-use crate::process;
+use crate::exec;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
@@ -101,15 +101,15 @@ fn failure_detail(stdout: &str, stderr: &str) -> String {
 
 impl Backend for ClaudeCode {
     fn available(&self) -> Result<String, String> {
-        process::find_program(&self.0.command)
+        exec::find_program(&self.0.command)
             .map(|path| path.display().to_string())
             .ok_or_else(|| format!("command not found: {}", self.0.command))
     }
 
     fn run(&self, request: &Request) -> Result<String> {
-        let program = process::find_program(&self.0.command)
+        let program = exec::find_program(&self.0.command)
             .with_context(|| format!("command not found: {}", self.0.command))?;
-        let mut command = process::command(program);
+        let mut command = exec::command(program);
         command
             .args(args(
                 self.0.max_turns,
@@ -118,7 +118,7 @@ impl Backend for ClaudeCode {
             ))
             .current_dir(request.incident_dir);
         // プロンプトは複数行なので、.cmd ラッパーでも壊れないよう標準入力で渡す
-        let output = process::run(command, Some(request.prompt), request.timeout)?;
+        let output = exec::run(command, Some(request.prompt), request.timeout)?;
         if output.timed_out {
             bail!("timed out after {:?}", request.timeout);
         }
