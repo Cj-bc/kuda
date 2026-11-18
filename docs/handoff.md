@@ -17,7 +17,7 @@
 
 正常時はスナップショットの更新だけで終わり、異常がトリガー条件を満たしたときだけ調査プロセスが残ります。
 
-本書は、設計どおりに実装した `kuda` を開発機1台でビルドし、配置・設定・スケジューラ登録・動作確認するまでの手順です。コマンド名やサブコマンドは設計時点の想定で、実装に合わせて読み替えてください。
+本書は、設計どおりに実装した `kuda` を開発機1台でビルドし、配置・設定・スケジューラ登録・動作確認するまでの手順です。コードを変える人向けの設計（処理の流れ、モジュール構成、データモデル、用語）は [architecture.md](architecture.md) にあります。
 
 ## 前提条件
 
@@ -39,7 +39,7 @@ LLM CLIは、スケジューラがタスクを実行するのと**同じユー�
 
 Nix flakeでリリースビルドのバイナリを作ります。Windows向けもWSL上のNixからクロスビルドします。Windowsでは、タスク起動のたびにコンソール窓が出ないよう、スケジューラ用のGUIサブシステム版 `kudaw.exe` も作ります。
 
-### プロジェクト構成（想定）
+### プロジェクト構成
 
 ```
 kuda/
@@ -47,29 +47,37 @@ kuda/
   flake.lock
   Cargo.toml
   Cargo.lock
-  src/
-    lib.rs             # CLI（check / snapshot / diagnose / status / check-config / check-backends）
-    main.rs            # kuda の入口
-    bin/kudaw.rs       # kudaw の入口（Windows では GUI サブシステム）
-    commands.rs        # 各サブコマンドの本体
-    config.rs          # config.toml の読み込みと検証
-    paths.rs           # OS別のディレクトリ解決（Linux は XDG）
-    probe/             # tcp, icmp, dns, http, command
-    store.rs           # SQLite: メトリクス・集計・スナップショット・状態
-    baseline.rs        # 時間帯別 p50/p95、last_known_good 管理
-    collector/         # adapters, routes, dns_config, traceroute
-    trigger.rs         # 条件式・連続回数・クールダウン
-    incident.rs        # 事件ディレクトリ生成、diff 生成
-    diagnosis/         # claude_code, codex, local
-    lock.rs            # 多重起動防止
-    detach.rs          # 調査プロセスの切り離し起動
-    process.rs         # 外部コマンドの起動（タイムアウト、窓を出さない）
-    logging.rs         # 日付ローテーションするファイルログ
+  README.md
+  config.example.toml
+  docs/                  # handoff.md（本書）、architecture.md ほか
   prompts/
     network.md
-  config.example.toml
+  src/
+    lib.rs               # CLI（check / snapshot / diagnose / status / check-config / check-backends）
+    main.rs              # kuda の入口
+    bin/kudaw.rs         # kudaw の入口（Windows では GUI サブシステム）
+    commands.rs          # 各サブコマンドの本体
+    config.rs            # config.toml の読み込みと検証
+    paths.rs             # OS別のディレクトリ解決（Linux は XDG）
+    os.rs                # OS の区別（規則の関数が Os を受け取る）
+    time.rs              # 人が読む時刻の表記
+    metrics.rs           # 指標・変数の名前、ベースラインの系列表
+    probe/               # tcp, icmp, dns, http, command, process
+    collector/           # adapters, routes, dns_config, traceroute, snapshot（結果の型）
+    store/               # SQLite。metrics, hist, snapshot, state, identities, schema（移行）
+    baseline.rs          # 時間帯別 p50/p95
+    trigger.rs           # 条件式・連続回数・クールダウン
+    known_set.rs         # プロセスの識別・分類・既知の集合
+    incident/            # mod（事件ディレクトリ生成）, diff（スナップショットの差分）
+    diagnosis/           # claude_code, codex, local
+    investigation.rs     # 実行中の調査の記録（プロセス監視が自身を除外するため）
+    lock.rs              # 多重起動防止
+    detach.rs            # 調査プロセスの切り離し起動
+    exec.rs              # 外部コマンドの起動（タイムアウト、窓を出さない、子孫の回収）
+    notify.rs            # デスクトップ通知
+    logging.rs           # 日付ローテーションするファイルログ
   tests/
-    e2e.rs             # 実バイナリでの通しテスト
+    e2e.rs               # 実バイナリでの通しテスト
 ```
 
 主な依存クレートは `rusqlite`（bundled）、`serde` と `serde_json`、`toml`、`clap`、`anyhow`、`chrono`、`log`、`fd-lock`、`ureq`（ローカルLLMへのHTTP）です。Windowsでは `windows`（`GetAdaptersAddresses`、`GetIpForwardTable2`、`IcmpSendEcho2`）を、Linuxでは `ip -j` の呼び出しと `socket2`（非特権の ping ソケット）を使います。メモリと起動時間を抑えるため、tokio などの非同期ランタイムは入れず同期実装にします。
@@ -101,89 +109,7 @@ flake の出力は次の3つです。Windows向けは `pkgsCross.mingwW64` に�
 | `packages.<system>.kuda-windows` | Windows 11 向けの `kuda.exe` と `kudaw.exe`。同じく設定例とプロンプトを同梱 |
 | `devShells.<system>.default` | cargo、rustc、clippy、rust-analyzer、sqlite、traceroute 入りの開発シェル |
 
-```nix
-{
-  description = "Kuda - PC monitoring harness with LLM-driven investigation";
-
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-  };
-
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        lib = pkgs.lib;
-        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-
-        # ビルドに必要なファイルだけをストアに入れる（target/ などを除外）
-        src = lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            ./Cargo.toml
-            ./Cargo.lock
-            ./src
-            ./prompts
-            ./config.example.toml
-          ];
-        };
-
-        # p = ビルド先プラットフォームの package set（ネイティブ or pkgsCross.*）
-        mkKuda = p:
-          let isWindows = p.stdenv.hostPlatform.isWindows;
-          in p.rustPlatform.buildRustPackage {
-            pname = "kuda";
-            version = cargoToml.package.version;
-            inherit src;
-            cargoLock.lockFile = ./Cargo.lock;
-
-            # mingw の std が要求するスレッドライブラリ
-            buildInputs = lib.optionals isWindows [ p.windows.pthreads ];
-
-            # クロスビルドしたテストはビルド機で実行できないためスキップ
-            doCheck = !isWindows;
-
-            # 設定例とプロンプトを $out/share/kuda に同梱する
-            postInstall = ''
-              install -Dm644 config.example.toml $out/share/kuda/config.example.toml
-              mkdir -p $out/share/kuda/prompts
-              cp -r prompts/. $out/share/kuda/prompts/
-            '';
-
-            meta = {
-              description = "PC monitoring harness with LLM-driven investigation";
-              mainProgram = "kuda";
-              platforms = lib.platforms.linux ++ lib.platforms.windows;
-            };
-          };
-      in
-      {
-        packages = {
-          default = mkKuda pkgs;
-          kuda = mkKuda pkgs;
-          # Windows 11 向け (x86_64-pc-windows-gnu)。WSL 上でクロスビルドする
-          kuda-windows = mkKuda pkgs.pkgsCross.mingwW64;
-        };
-
-        apps.default = flake-utils.lib.mkApp { drv = self.packages.${system}.default; };
-
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            cargo
-            rustc
-            rustfmt
-            clippy
-            rust-analyzer
-            sqlite        # DB の中身確認用（ビルドには不要: rusqlite bundled）
-            traceroute
-          ];
-        };
-
-        formatter = pkgs.nixfmt-rfc-style;
-      });
-}
-```
+定義の全体は `flake.nix` を見てください（本書に写しを置くと古くなるため載せません）。`nixpkgs` と `flake-utils` を入力にし、対象システムは `x86_64-linux` と `aarch64-linux` です。ビルドに入れるのは `Cargo.toml`、`Cargo.lock`、`src`、`prompts`、`config.example.toml` だけです。クロスビルドしたテストはビルド機で動かせないので、Windows 向けでは `cargo test` を走らせません。そのほか `apps.default` と、整形用の `formatter`（`nixfmt-rfc-style`）も出力します。
 
 flake は **git で追跡されているファイルしか見えません**。`flake.nix`、`Cargo.lock`、`prompts/` などは、ビルド前に少なくとも `git add` しておいてください。`flake.lock` もコミットして、nixpkgs のバージョンを固定します。
 
