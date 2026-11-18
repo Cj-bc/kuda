@@ -4,6 +4,7 @@ mod diff;
 
 use crate::baseline::{SeriesStats, Source};
 use crate::collector::{KnownGood, Snapshot};
+use crate::metrics::series_of;
 use crate::paths::{create_private_dir, is_safe_name};
 use crate::probe::ProbeRun;
 use crate::store::MetricRow;
@@ -213,10 +214,7 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
 
 fn render_metrics(evidence: &Evidence) -> String {
     let baseline = |metric: &str| {
-        let series = match metric {
-            "rtt_p50" => "rtt",
-            other => other,
-        };
+        let series = series_of(metric);
         let stat = evidence.stats.iter().find(|stat| stat.series == series);
         stat.map_or_else(
             || ",".to_string(),

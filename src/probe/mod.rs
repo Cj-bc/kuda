@@ -9,7 +9,7 @@ mod tcp;
 
 use crate::collector;
 use crate::config::ProbeSpec;
-use crate::trigger::Variables;
+use crate::metrics::{self, Variables};
 pub use process::{ProcessInfo, enumerate};
 use serde::Serialize;
 use std::net::IpAddr;
@@ -70,19 +70,19 @@ impl ProbeRun {
         let mut metrics = Variables::new();
         let failed = self.results.iter().filter(|r| !r.ok).count();
         metrics.insert(
-            "loss".to_string(),
+            metrics::LOSS.to_string(),
             failed as f64 / self.results.len().max(1) as f64,
         );
 
         let mut rtts: Vec<f64> = self.results.iter().filter_map(|r| r.rtt_ms).collect();
         rtts.sort_by(f64::total_cmp);
         if let Some(max) = rtts.last() {
-            metrics.insert("rtt_max".to_string(), *max);
-            metrics.insert("rtt_p50".to_string(), percentile(&rtts, 0.50));
-            metrics.insert("rtt_p95".to_string(), percentile(&rtts, 0.95));
+            metrics.insert(metrics::RTT_MAX.to_string(), *max);
+            metrics.insert(metrics::RTT_P50.to_string(), percentile(&rtts, 0.50));
+            metrics.insert(metrics::RTT_P95.to_string(), percentile(&rtts, 0.95));
         }
         if let Some(value) = self.results.iter().find_map(|r| r.value) {
-            metrics.insert("value".to_string(), value);
+            metrics.insert(metrics::VALUE.to_string(), value);
         }
         metrics
     }

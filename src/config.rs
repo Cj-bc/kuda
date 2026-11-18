@@ -1,8 +1,9 @@
 //! config.toml の読み込みと検証。
 
+use crate::metrics;
 use crate::os::Os;
 use crate::paths::is_safe_name;
-use crate::trigger::{self, Expr};
+use crate::trigger::Expr;
 use anyhow::{Context, Result, bail, ensure};
 use log::LevelFilter;
 use serde::{Deserialize, Deserializer};
@@ -528,7 +529,7 @@ impl RawWatch {
         if let Some(trigger) = &self.trigger {
             ensure!(trigger.consecutive >= 1, "consecutive must be at least 1");
             // 式の変数は probe の種類で決まるので、パースではなくここで照合する
-            let available = trigger::variables_for(probe.kind());
+            let available = metrics::variables_for(probe.kind());
             for name in trigger.when.variables() {
                 ensure!(
                     available.contains(&name),

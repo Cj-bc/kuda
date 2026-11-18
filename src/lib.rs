@@ -18,6 +18,7 @@ mod investigation;
 mod known_set;
 mod lock;
 mod logging;
+mod metrics;
 mod notify;
 mod os;
 mod paths;

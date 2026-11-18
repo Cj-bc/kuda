@@ -6,14 +6,10 @@
 //! 百分位数の誤差はビン幅の半分（約 ±2.5%）に収まる。
 
 use crate::config::{AggregateBy, StatsConfig};
+use crate::metrics::{BASELINE_PREFIX, SERIES, Variables};
 use crate::store::{Store, V1Hist};
-use crate::trigger::Variables;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
-
-/// (ヒストグラムの系列名, 元になる指標)。
-/// 系列 rtt は probe ごとの中央値の分布で、`baseline.rtt_p95` はその 95 パーセンタイル
-const SERIES: [(&str, &str); 3] = [("rtt", "rtt_p50"), ("loss", "loss"), ("value", "value")];
 
 /// 隣り合うビンの比
 const BIN_RATIO: f64 = 1.05;
@@ -183,8 +179,8 @@ pub fn stats(
 pub fn variables(stats: &[SeriesStats]) -> Variables {
     let mut variables = Variables::new();
     for stat in stats {
-        variables.insert(format!("baseline.{}_p50", stat.series), stat.p50);
-        variables.insert(format!("baseline.{}_p95", stat.series), stat.p95);
+        variables.insert(format!("{BASELINE_PREFIX}{}_p50", stat.series), stat.p50);
+        variables.insert(format!("{BASELINE_PREFIX}{}_p95", stat.series), stat.p95);
     }
     variables
 }
@@ -440,7 +436,7 @@ mod tests {
         update(&store, "w", &config, &metrics(10.0), ts).unwrap();
         let variables = variables(&stats(&store, "w", &config, ts).unwrap());
         for name in variables.keys() {
-            let available = crate::trigger::variables_for(crate::config::ProbeKind::Tcp);
+            let available = crate::metrics::variables_for(crate::config::ProbeKind::Tcp);
             assert!(available.contains(&name.as_str()), "{name}");
         }
         assert!(variables.contains_key("baseline.rtt_p95"));

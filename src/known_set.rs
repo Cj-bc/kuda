@@ -5,10 +5,10 @@
 //! Linux 上でも走らせられる。ストアを使う分類は [`classify`]。
 
 use crate::config::ProcessSpec;
+use crate::metrics::{self, Variables};
 use crate::os::Os;
 use crate::probe::ProcessInfo;
 use crate::store::{IdentityStatus, Store};
-use crate::trigger::Variables;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -434,14 +434,14 @@ pub fn classify(
         .filter(|g| !observed.keys().any(|key| glob_match(g, key)))
         .count();
     let mut metrics = Variables::new();
-    metrics.insert("unknown".to_string(), pending.len() as f64);
+    metrics.insert(metrics::UNKNOWN.to_string(), pending.len() as f64);
     metrics.insert(
-        "unknown_user_writable".to_string(),
+        metrics::UNKNOWN_USER_WRITABLE.to_string(),
         count(|p| p.user_writable),
     );
-    metrics.insert("masquerade".to_string(), count(|p| p.masquerade));
-    metrics.insert("missing".to_string(), missing as f64);
-    metrics.insert("process_count".to_string(), observed.len() as f64);
+    metrics.insert(metrics::MASQUERADE.to_string(), count(|p| p.masquerade));
+    metrics.insert(metrics::MISSING.to_string(), missing as f64);
+    metrics.insert(metrics::PROCESS_COUNT.to_string(), observed.len() as f64);
     Ok(Classification {
         metrics,
         pending,
@@ -869,6 +869,20 @@ mod tests {
 
     fn status(store: &Store, key: &str) -> Option<IdentityStatus> {
         store.identity_statuses("w").unwrap().get(key).copied()
+    }
+
+    /// classify が出す指標は、process の条件式で使える変数として許可リストに載っている
+    #[test]
+    fn classification_metrics_are_listed_for_process_watches() {
+        let mut store = Store::in_memory().unwrap();
+        let w = watch(&[], &[]);
+        let procs = [proc(10, "notepad.exe", Some(NOTEPAD))];
+        let c = observe(&mut store, &w, &procs, 1000, true);
+        let available = crate::metrics::variables_for(crate::config::ProbeKind::Process);
+        assert_eq!(c.metrics.len(), 5, "{:?}", c.metrics);
+        for name in c.metrics.keys() {
+            assert!(available.contains(&name.as_str()), "{name}");
+        }
     }
 
     #[test]

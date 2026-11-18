@@ -4,47 +4,9 @@
 //! 値が無い変数（データ不足のベースラインや、全滅時の RTT）を含む比較は
 //! 「不明」になる。最終結果が不明なら発火しない。
 
-use crate::config::{ProbeKind, Trigger};
+use crate::config::Trigger;
+use crate::metrics::Variables;
 use serde::Deserialize;
-use std::collections::BTreeMap;
-
-/// probe の種類ごとに、条件式で使える変数。
-///
-/// 式のパースでは検査しない。変数は probe の種類で決まり、パースの時点では
-/// どの probe の式か分からないので、`RawWatch::into_watch`（config.rs）が照合する。
-/// 網羅的に match しているのは、probe の種類を足したときに許可リストの決め忘れを防ぐため。
-pub fn variables_for(kind: ProbeKind) -> &'static [&'static str] {
-    match kind {
-        ProbeKind::Tcp
-        | ProbeKind::Icmp
-        | ProbeKind::Dns
-        | ProbeKind::Http
-        | ProbeKind::Command => &[
-            "loss",
-            "rtt_p50",
-            "rtt_p95",
-            "rtt_max",
-            "value",
-            "baseline.rtt_p50",
-            "baseline.rtt_p95",
-            "baseline.loss_p50",
-            "baseline.loss_p95",
-            "baseline.value_p50",
-            "baseline.value_p95",
-        ],
-        // baseline.* は無い。時間帯の統計ではなく、既知の集合と比べる
-        ProbeKind::Process => &[
-            "loss",
-            "unknown",
-            "unknown_user_writable",
-            "masquerade",
-            "missing",
-            "process_count",
-        ],
-    }
-}
-
-pub type Variables = BTreeMap<String, f64>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "String")]
@@ -415,6 +377,8 @@ pub fn advance(state: &mut TriggerState, matched: bool, trigger: &Trigger, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProbeKind;
+    use crate::metrics::variables_for;
     use std::time::Duration;
 
     fn expr(source: &str) -> Expr {

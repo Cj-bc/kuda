@@ -11,12 +11,13 @@ use crate::investigation;
 use crate::known_set::{self, Classification, Roots};
 use crate::lock;
 use crate::logging;
+use crate::metrics::{self, Variables};
 use crate::notify::{self, Event};
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun, ProcessInfo};
 use crate::store::{Store, WatchState};
 use crate::time::format_time;
-use crate::trigger::{self, Outcome, Variables};
+use crate::trigger::{self, Outcome};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Local;
 use std::path::{Path, PathBuf};
@@ -133,7 +134,7 @@ fn check_watch(
     state.last_probe = Some(now);
 
     // 異常時の値でベースラインと last_known_good を汚さない
-    let healthy = !matched && metrics["loss"] < 1.0;
+    let healthy = !matched && metrics[metrics::LOSS] < 1.0;
     if healthy {
         baseline::update(store, &watch.name, &watch.stats, &metrics, now)?;
         if is_snapshot_due(&state, now, watch.snapshots.interval)
