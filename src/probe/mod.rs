@@ -10,7 +10,7 @@ mod tcp;
 use crate::collector;
 use crate::config::ProbeSpec;
 use crate::metrics::{self, Variables};
-pub use process::{ProcessInfo, enumerate};
+pub use process::{ProcessInfo, enumerate, same_start};
 use serde::Serialize;
 use std::net::IpAddr;
 

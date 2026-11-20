@@ -6,7 +6,7 @@
 
 use crate::known_set;
 use crate::paths::Paths;
-use crate::probe::ProcessInfo;
+use crate::probe::{self, ProcessInfo};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -59,7 +59,7 @@ pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
         };
         if processes
             .iter()
-            .any(|p| p.pid == root.0 && p.started == Some(root.1))
+            .any(|p| p.pid == root.0 && probe::same_start(root.1, p.started))
         {
             roots.push(root);
         }
@@ -120,10 +120,12 @@ mod tests {
         let (_dir, paths) = paths("stale");
         let registration = register(&paths, "w", &[me(42)]).unwrap().unwrap();
         // 同じ PID でも起動時刻が違えば、別のプロセスが PID を再利用している
-        assert!(running(&paths, &[me(43)]).is_empty());
+        assert!(running(&paths, &[me(500)]).is_empty());
         // 消さない。列挙の直後に始まった調査の記録かもしれない
         assert!(registration.0.exists());
         assert_eq!(running(&paths, &[me(42)]).len(), 1);
+        // 列挙ごとに 1 秒ずれうる（Linux の btime）ので、1 秒差は同じプロセスとみなす
+        assert_eq!(running(&paths, &[me(43)]).len(), 1);
         std::mem::forget(registration);
     }
 

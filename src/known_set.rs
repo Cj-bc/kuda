@@ -7,7 +7,7 @@
 use crate::config::ProcessSpec;
 use crate::metrics::{self, Variables};
 use crate::os::Os;
-use crate::probe::ProcessInfo;
+use crate::probe::{self, ProcessInfo};
 use crate::store::{IdentityStatus, Store};
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -254,7 +254,7 @@ pub fn without_descendants<'a>(
             by_pid
                 .get(&pid)
                 .copied()
-                .filter(|p| p.started == Some(started))
+                .filter(|p| probe::same_start(started, p.started))
         })
         .collect();
     while let Some(parent) = queue.pop() {

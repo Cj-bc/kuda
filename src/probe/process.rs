@@ -19,6 +19,13 @@ pub fn enumerate() -> Result<Vec<ProcessInfo>> {
     imp::enumerate()
 }
 
+/// 別々の列挙で見た起動時刻が、同じプロセスのものか。
+/// Linux の起動時刻は、起動からの経過と、読むたびに計算される起動時刻（btime）から作るので、
+/// 列挙をまたぐと 1 秒ずれうる。同じ 1 秒のうちに同じ PID が再利用されることは考えない
+pub fn same_start(recorded: i64, seen: Option<i64>) -> bool {
+    seen.is_some_and(|seen| (seen - recorded).abs() <= 1)
+}
+
 #[cfg(windows)]
 mod imp {
     use super::ProcessInfo;
