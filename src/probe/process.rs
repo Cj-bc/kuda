@@ -151,7 +151,7 @@ mod imp {
         ticks_per_sec: u64,
         users: &[(u32, String)],
     ) -> Option<ProcessInfo> {
-        let stat = parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+        let stat = parse_stat_bytes(&fs::read(format!("/proc/{pid}/stat")).ok()?)?;
         // 他ユーザーのプロセスやカーネルスレッドでは読めない
         let path = fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
@@ -177,6 +177,13 @@ mod imp {
         name: String,
         ppid: u32,
         start_ticks: u64,
+    }
+
+    /// comm は UTF-8 とは限らない（プロセスが自由に付けられる）。UTF-8 として読むと
+    /// プロセスごと列挙から落ちるので、名前だけを置き換え文字で崩して読む。
+    /// 区切りの `(` `)` と数字は ASCII なので、崩しても位置は変わらない
+    fn parse_stat_bytes(stat: &[u8]) -> Option<Stat> {
+        parse_stat(&String::from_utf8_lossy(stat))
     }
 
     /// `pid (comm) state ppid ...`。comm は空白や括弧を含みうるので、最後の `)` で区切る
@@ -233,6 +240,15 @@ mod imp {
                 "42 (a) b (c) S 7 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 12345 1000 10 0";
             let stat = parse_stat(line).unwrap();
             assert_eq!(stat.name, "a) b (c");
+            assert_eq!(stat.ppid, 7);
+            assert_eq!(stat.start_ticks, 12345);
+        }
+
+        #[test]
+        fn a_name_that_is_not_utf8_keeps_the_process() {
+            let line = b"42 (x\xff\xfey) S 7 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 12345 1000 10 0";
+            let stat = parse_stat_bytes(line).unwrap();
+            assert_eq!(stat.name, "x\u{fffd}\u{fffd}y");
             assert_eq!(stat.ppid, 7);
             assert_eq!(stat.start_ticks, 12345);
         }
