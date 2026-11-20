@@ -77,11 +77,19 @@ fn excluded_pids(processes: &[ProcessInfo], roots: &[(u32, i64)]) -> HashSet<u32
         .collect()
 }
 
-/// 持ち主がすべて除外対象の待ち受けを除く。持ち主の分からないものは残す
+/// 除外対象の持ち主を外す。持ち主がすべて除外対象の待ち受けは丸ごと除く。
+/// 除外対象と共有しているソケットに除外対象を残すと、調査が動いているかどうかで差分が変わる。
+/// 持ち主の分からないものは残す
 fn without_excluded(listeners: Vec<Listener>, excluded: &HashSet<u32>) -> Vec<Listener> {
     listeners
         .into_iter()
-        .filter(|l| l.pids.is_empty() || !l.pids.iter().all(|pid| excluded.contains(pid)))
+        .filter_map(|mut l| {
+            if l.pids.is_empty() {
+                return Some(l);
+            }
+            l.pids.retain(|pid| !excluded.contains(pid));
+            (!l.pids.is_empty()).then_some(l)
+        })
         .collect()
 }
 
@@ -93,28 +101,35 @@ fn identities(os: Os, processes: &[ProcessInfo]) -> HashMap<u32, String> {
 }
 
 /// `{ "<proto:addr:port>": { "processes": ["<identity>", ...] } }`。
-/// PID は毎回変わるので入れず、持ち主は識別キーで示す
+/// PID は毎回変わるので入れず、持ち主は識別キーで示す。一時ポートの UDP には、
+/// どの持ち主がどの番号を使っていたかを `ephemeral_ports: { "<identity>": [port, ...] }` で添える
 fn render(
     listeners: &[Listener],
     identities: &HashMap<u32, String>,
     ephemeral: &RangeInclusive<u16>,
 ) -> Value {
-    let mut owners: BTreeMap<String, (BTreeSet<String>, BTreeSet<u16>)> = BTreeMap::new();
+    type Ports = BTreeMap<String, BTreeSet<u16>>;
+    let mut owners: BTreeMap<String, (BTreeSet<String>, Ports)> = BTreeMap::new();
     for listener in listeners {
         let (entry, ports) = owners.entry(listener.key(ephemeral)).or_default();
-        if listener.is_ephemeral(ephemeral) {
-            ports.insert(listener.port);
-        }
-        let known: Vec<_> = listener
+        let mut known: Vec<String> = listener
             .pids
             .iter()
-            .filter_map(|pid| identities.get(pid))
+            .filter_map(|pid| identities.get(pid).cloned())
             .collect();
         // 持ち主が分からない（権限が足りない、列挙の合間に終わった）ことも差分で見えるようにする
         if known.is_empty() {
-            entry.insert("unknown".to_string());
+            known.push("unknown".to_string());
         }
-        entry.extend(known.into_iter().cloned());
+        if listener.is_ephemeral(ephemeral) {
+            for owner in &known {
+                ports
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(listener.port);
+            }
+        }
+        entry.extend(known);
     }
     let map: Map<String, Value> = owners
         .into_iter()
@@ -487,10 +502,10 @@ mod tests {
         );
         assert_eq!(value["tcp:0.0.0.0:50001"]["processes"], json!(["/opt/app"]));
         assert_eq!(value.as_object().unwrap().len(), 2);
-        // 番号は証拠として残すが、差分では比べない
+        // どの持ち主がどの番号を使っていたかは証拠として残すが、差分では比べない
         assert_eq!(
             value["udp:0.0.0.0:ephemeral"]["ephemeral_ports"],
-            json!([50001, 61234])
+            json!({ "/opt/app": [61234], "/usr/bin/browser": [50001] })
         );
         assert!(crate::collector::is_volatile_key("ephemeral_ports"));
         assert!(value["tcp:0.0.0.0:50001"].get("ephemeral_ports").is_none());
@@ -548,6 +563,8 @@ mod tests {
         );
         let ports: Vec<u16> = kept.iter().map(|l| l.port).collect();
         assert_eq!(ports, [22, 8080, 7000]);
+        // 除外対象と共有していたソケットからは、除外対象の持ち主だけが外れる
+        assert_eq!(kept[1].pids, [22]);
     }
 
     #[test]
