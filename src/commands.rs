@@ -120,6 +120,9 @@ struct Observation {
     metrics: Variables,
     stats: Vec<SeriesStats>,
     classification: Option<Classification>,
+    /// 学習する前提の分類で、条件式がすでに成立していた。やり直した分類では式の値が
+    /// 逆転しうる（`missing >= 1 && unknown == 0` など）ので、成立した事実をここで持ち越す
+    matched_while_learning: bool,
 }
 
 /// probe を実行して観測する。`learn` が false なら、学習期間中でも新しい識別キーを known にしない
@@ -144,9 +147,12 @@ fn observe_run(
     learn: bool,
 ) -> Result<Observation> {
     let mut metrics = run.metrics();
+    let mut matched_while_learning = false;
     let classification = match (&watch.probe, &run.processes) {
         (ProbeSpec::Process(spec), Some(_)) => {
-            let classification = classify_processes(store, paths, watch, spec, &run, now, learn)?;
+            let (classification, matched) =
+                classify_processes(store, paths, watch, spec, &run, now, learn)?;
+            matched_while_learning = matched;
             metrics.extend(classification.metrics.clone());
             Some(classification)
         }
@@ -159,6 +165,7 @@ fn observe_run(
         metrics,
         stats,
         classification,
+        matched_while_learning,
     })
 }
 
@@ -174,7 +181,7 @@ fn apply(
     let metrics = &observation.metrics;
     let mut variables = metrics.clone();
     variables.extend(baseline::variables(&observation.stats));
-    let matched = trigger_matches(watch, &variables);
+    let matched = observation.matched_while_learning || trigger_matches(watch, &variables);
 
     store.record_run(&watch.name, &observation.run, metrics)?;
     if let Some(classification) = &observation.classification {
@@ -201,6 +208,18 @@ fn apply(
         store.save_probe_state(&watch.name, &state)?;
         return Ok(());
     };
+    // process の列挙に失敗した回は分類の変数が無く、それを使う比較は成立しない。
+    // それを回復とみなすと、異常が続いたまま発火の状態が解けるので、状態を進めない
+    let incomplete =
+        matches!(watch.probe, ProbeSpec::Process(_)) && observation.classification.is_none();
+    if incomplete && !matched {
+        log::warn!(
+            "{}: process enumeration failed, keeping the trigger state",
+            watch.name
+        );
+        store.save_probe_state(&watch.name, &state)?;
+        return Ok(());
+    }
     let since = state.trigger.since;
     let outcome = trigger::advance(&mut state.trigger, matched, trigger, now);
     // 発火の処理で失敗しても二重に発火しないよう、先に状態を保存する
@@ -310,7 +329,8 @@ fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
 ///
 /// 学習してよいのは正常な回だけ。正常かどうかは条件式の成否で決まるが、その式の変数は
 /// 分類の結果に依存する。そこで、まず学習する前提で分類し、式が成立したら（異常なら）
-/// 何も学習しない前提でやり直す。やり直すと pending が増えるだけなので、成立したままになる。
+/// 何も学習しない前提でやり直す。やり直すと pending が増えるので、式によっては成立しなく
+/// なる。そのため、最初の分類で成立したかどうかも返す。
 /// `learn` が false なら最初から学習しない（手動の調査用）
 fn classify_processes(
     store: &Store,
@@ -320,7 +340,7 @@ fn classify_processes(
     run: &ProbeRun,
     now: i64,
     learn: bool,
-) -> Result<Classification> {
+) -> Result<(Classification, bool)> {
     let processes = run.processes.as_deref().unwrap_or_default();
     let roots = Roots::from_env();
     // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
@@ -329,18 +349,18 @@ fn classify_processes(
     let running = known_set::running(processes, &excluded, &spec.ignore, &roots);
     let classify = |learn| known_set::classify(store, &watch.name, spec, &running, now, learn);
     if !learn {
-        return classify(false);
+        return Ok((classify(false)?, false));
     }
     let classification = classify(true)?;
     if classification.learned == 0 {
-        return Ok(classification);
+        return Ok((classification, false));
     }
     let mut variables = run.metrics();
     variables.extend(classification.metrics.clone());
     if trigger_matches(watch, &variables) {
-        return classify(false);
+        return Ok((classify(false)?, true));
     }
-    Ok(classification)
+    Ok((classification, false))
 }
 
 fn fire(
@@ -897,5 +917,69 @@ mod tests {
         check_with(&mut store, &paths, watch, procs, 3000);
         assert_eq!(incidents(), 2);
         assert!(reported(&store, "name:gamma-helper") && reported(&store, "name:alpha-agent"));
+    }
+
+    fn process_watch(dir: &TempDir, learn_for: &str, when: &str) -> Config {
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[watch]]\nname = \"p\"\n[watch.probe]\nkind = \"process\"\n\
+                 expected = [\"name:guard\"]\n\
+                 [watch.baseline]\nlearn_for = \"{learn_for}\"\n\
+                 [watch.trigger]\nwhen = \"{when}\"\nconsecutive = 1\ncooldown = \"0s\"\n"
+            ),
+        )
+        .unwrap();
+        Config::load(&config_path).unwrap()
+    }
+
+    /// 学習する前提で成立した式が、学習しない前提のやり直しで不成立になっても、発火を落とさない
+    #[test]
+    fn a_match_while_learning_survives_the_retry() {
+        let dir = TempDir::new("check-retry");
+        let config = process_watch(&dir, "7d", "missing >= 1 && unknown == 0");
+        let watch = config.watch("p").unwrap();
+        let paths = dir.paths();
+        let mut store = Store::in_memory().unwrap();
+
+        check_with(&mut store, &paths, watch, vec![process(10, "alpha")], 1000);
+        assert!(store.load_probe_state("p").unwrap().trigger.active);
+        // 異常な回なので、学習期間中でも覚えない
+        assert!(reported(&store, "name:alpha"));
+    }
+
+    /// 列挙に失敗した回は、missing の比較が成立しなくても回復にしない
+    #[test]
+    fn a_failed_enumeration_does_not_recover() {
+        let dir = TempDir::new("check-failed");
+        let config = process_watch(&dir, "0s", "missing >= 1");
+        let watch = config.watch("p").unwrap();
+        let paths = dir.paths();
+        let mut store = Store::in_memory().unwrap();
+
+        check_with(&mut store, &paths, watch, vec![], 1000);
+        assert!(store.load_probe_state("p").unwrap().trigger.active);
+
+        let failed = ProbeRun {
+            ts: 2000,
+            results: vec![TargetResult {
+                target: "processes".to_string(),
+                ok: false,
+                rtt_ms: None,
+                value: None,
+                error: Some("denied".to_string()),
+            }],
+            processes: None,
+        };
+        let state = store.load_probe_state("p").unwrap();
+        let observation = observe_run(&store, &paths, watch, failed, 2000, true).unwrap();
+        apply(&mut store, &paths, watch, state, &observation, 2000).unwrap();
+        let state = store.load_probe_state("p").unwrap();
+        assert!(state.trigger.active);
+        assert_eq!(state.last_probe, Some(2000));
+
+        check_with(&mut store, &paths, watch, vec![process(10, "guard")], 3000);
+        assert!(!store.load_probe_state("p").unwrap().trigger.active);
     }
 }
