@@ -45,6 +45,7 @@ pub struct UnknownProcess {
     pub flags: Vec<&'static str>,
     /// 実行ファイルの SHA-256。取れなければ null で、理由を `sha256_note` に書く
     pub sha256: Option<String>,
+    /// ハッシュについての補足。取れなかった理由か、どのファイルを読んだか（Windows）
     pub sha256_note: Option<String>,
     pub command_line: Option<String>,
 }
@@ -103,7 +104,11 @@ pub fn describe(
 /// 置き換わったりすると、PID で引くコマンドラインや `/proc/<pid>/exe` は別物の値になる。
 /// パスで読むハッシュも、終わった後に置き換えられたファイルのものかもしれない。
 /// そこで `alive` で読む前と読んだ後に列挙し、同じ PID・起動時刻・パスのプロセスが
-/// どちらにもいたときだけ値を使う。起動時刻が取れないプロセスは確かめられないので使わない
+/// どちらにもいたときだけ値を使う。起動時刻が取れないプロセスは確かめられないので使わない。
+///
+/// Windows ではパスで開き直すので、プロセスが動いたまま実行ファイルが置き換えられていると
+/// （名前を変えて新しいファイルを置く更新など）、置き換え後のファイルのハッシュになる。
+/// それは確かめられないので、`sha256_note` にパスで読んだことを明記する
 pub fn enrich(
     os: Os,
     unknown: &mut [UnknownProcess],
@@ -153,12 +158,21 @@ pub fn enrich(
             continue;
         }
         match hash {
-            Ok(hash) => item.sha256 = Some(hash),
+            Ok(hash) => {
+                item.sha256 = Some(hash);
+                if os == Os::Windows {
+                    item.sha256_note = Some(PATH_HASH.to_string());
+                }
+            }
             Err(note) => item.sha256_note = Some(note),
         }
         item.command_line = command_lines.get(&item.pid).cloned();
     }
 }
+
+/// Windows のハッシュに付ける補足。プロセスが読み込んだ実行ファイルそのものとは限らない
+const PATH_HASH: &str = "read from the path when the incident was created; \
+                         the file may have been replaced since the process started";
 
 /// 確かめられなかったので値を使わなかったときの理由
 const GONE: &str = "not collected: the process exited, was replaced, \
@@ -524,7 +538,10 @@ mod tests {
         };
 
         // 同じプロセスがいれば、ハッシュが付く
-        assert!(enriched(&original, vec![original.clone()]).sha256.is_some());
+        let item = enriched(&original, vec![original.clone()]);
+        assert!(item.sha256.is_some());
+        // Windows はパスで読んだことを添える（読み込まれた実行ファイルそのものとは限らない）
+        assert_eq!(item.sha256_note.as_deref(), Some(PATH_HASH));
 
         // Windows の作成時刻はずれないので、1 秒の差でも別のプロセスとみなす
         let mut drifted = original.clone();
