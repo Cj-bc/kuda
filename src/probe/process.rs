@@ -126,11 +126,28 @@ mod imp {
     }
 }
 
+/// Linux のパス（任意のバイト列）を文字列にする。パスは識別キーになるので、別のパスが
+/// 同じ文字列にならないようにする。置き換え文字で崩すと、UTF-8 でないファイル名どうしが
+/// 1 つの識別キーにまとまり、新しい実行ファイルが既知のものとして扱われうる。
+/// そこで、UTF-8 として読めないバイトは `\xNN` に、`\` は `\\` にする
+#[cfg(any(unix, test))]
+fn path_text(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(&chunk.valid().replace('\\', "\\\\"));
+        for byte in chunk.invalid() {
+            text.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    text
+}
+
 #[cfg(unix)]
 mod imp {
-    use super::ProcessInfo;
+    use super::{ProcessInfo, path_text};
     use anyhow::{Context, Result};
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
 
     pub fn enumerate() -> Result<Vec<ProcessInfo>> {
         let boot_time = boot_time().context("cannot read btime from /proc/stat")?;
@@ -165,7 +182,7 @@ mod imp {
         // 他ユーザーのプロセスやカーネルスレッドでは読めない
         let path = fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+            .map(|p| path_text(p.as_os_str().as_bytes()));
         let user = fs::read_to_string(format!("/proc/{pid}/status"))
             .ok()
             .and_then(|status| parse_uid(&status))
@@ -337,5 +354,15 @@ mod tests {
 
         let found = processes.iter().find(|p| p.pid == child.id()).unwrap();
         assert_eq!(found.ppid, Some(std::process::id()));
+    }
+
+    /// 別のパスは別の文字列になる。UTF-8 のパスで `\` を含まないものは、そのまま
+    #[test]
+    fn paths_stay_distinct_when_they_are_not_utf8() {
+        assert_eq!(path_text(b"/usr/bin/tool"), "/usr/bin/tool");
+        assert_eq!(path_text(b"/tmp/a\xff"), r"/tmp/a\xff");
+        assert_ne!(path_text(b"/tmp/a\xff"), path_text(b"/tmp/a\xfe"));
+        // 文字どおり `\xff` という名前のファイルとも区別する
+        assert_eq!(path_text(br"/tmp/a\xff"), r"/tmp/a\\xff");
     }
 }
