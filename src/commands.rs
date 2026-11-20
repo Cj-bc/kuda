@@ -208,11 +208,12 @@ fn apply(
         store.save_probe_state(&watch.name, &state)?;
         return Ok(());
     };
-    // process の列挙に失敗した回は分類の変数が無く、それを使う比較は成立しない。
-    // それを回復とみなすと、異常が続いたまま発火の状態が解けるので、状態を進めない
+    // process の列挙に失敗した回は分類の変数が無く、それを使う比較は不明になる。
+    // 不明を回復とみなすと、異常が続いたまま発火の状態が解けるので、状態を進めない。
+    // `loss == 0 && missing >= 1` のように不成立と決まるなら、通常どおり連続を途切れさせる
     let incomplete =
         matches!(watch.probe, ProbeSpec::Process(_)) && observation.classification.is_none();
-    if incomplete && !matched {
+    if incomplete && trigger.when.evaluate(&variables).is_none() {
         log::warn!(
             "{}: process enumeration failed, keeping the trigger state",
             watch.name
@@ -959,8 +960,35 @@ mod tests {
         check_with(&mut store, &paths, watch, vec![], 1000);
         assert!(store.load_probe_state("p").unwrap().trigger.active);
 
+        failed_check(&mut store, &paths, watch, 2000);
+        let state = store.load_probe_state("p").unwrap();
+        assert!(state.trigger.active);
+        assert_eq!(state.last_probe, Some(2000));
+
+        check_with(&mut store, &paths, watch, vec![process(10, "guard")], 3000);
+        assert!(!store.load_probe_state("p").unwrap().trigger.active);
+    }
+
+    /// 列挙に失敗しても、式が不成立と決まるなら、ふだんどおり連続を途切れさせる
+    #[test]
+    fn a_failed_enumeration_resets_a_definitely_false_expression() {
+        let dir = TempDir::new("check-failed-false");
+        let config = process_watch(&dir, "0s", "loss == 0 && missing >= 1");
+        let watch = config.watch("p").unwrap();
+        let paths = dir.paths();
+        let mut store = Store::in_memory().unwrap();
+
+        check_with(&mut store, &paths, watch, vec![], 1000);
+        assert!(store.load_probe_state("p").unwrap().trigger.active);
+        failed_check(&mut store, &paths, watch, 2000);
+        let state = store.load_probe_state("p").unwrap();
+        assert!(!state.trigger.active);
+        assert_eq!(state.trigger.streak, 0);
+    }
+
+    fn failed_check(store: &mut Store, paths: &Paths, watch: &Watch, now: i64) {
         let failed = ProbeRun {
-            ts: 2000,
+            ts: now,
             results: vec![TargetResult {
                 target: "processes".to_string(),
                 ok: false,
@@ -971,13 +999,7 @@ mod tests {
             processes: None,
         };
         let state = store.load_probe_state("p").unwrap();
-        let observation = observe_run(&store, &paths, watch, failed, 2000, true).unwrap();
-        apply(&mut store, &paths, watch, state, &observation, 2000).unwrap();
-        let state = store.load_probe_state("p").unwrap();
-        assert!(state.trigger.active);
-        assert_eq!(state.last_probe, Some(2000));
-
-        check_with(&mut store, &paths, watch, vec![process(10, "guard")], 3000);
-        assert!(!store.load_probe_state("p").unwrap().trigger.active);
+        let observation = observe_run(store, paths, watch, failed, now, true).unwrap();
+        apply(store, paths, watch, state, &observation, now).unwrap();
     }
 }

@@ -241,7 +241,12 @@ impl Expr {
 
     /// 不明（判定材料が足りない）場合は発火させない
     pub fn matches(&self, vars: &Variables) -> bool {
-        self.root.eval(vars) == Some(true)
+        self.evaluate(vars) == Some(true)
+    }
+
+    /// 式の値。判定材料が足りず決まらなければ None
+    pub fn evaluate(&self, vars: &Variables) -> Option<bool> {
+        self.root.eval(vars)
     }
 }
 
