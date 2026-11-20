@@ -1,0 +1,7 @@
+<task-notification>
+<task-id>bur22yoxr</task-id>
+<tool-use-id>toolu_01CkNiwm4Aa1h5XaJ4haDVH9</tool-use-id>
+<output-file>REDACTED\AppData\Local\Temp\claude\REDACTED\e9ce7c30-6e09-40ce-89c7-a4aa94a29735\tasks\bur22yoxr.output</output-file>
+<status>completed</status>
+<summary>Background command "Run the entire review a fourth time" completed (exit code 0)</summary>
+</task-notification>
