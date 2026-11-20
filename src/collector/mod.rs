@@ -9,6 +9,7 @@ mod snapshot;
 mod traceroute;
 
 use crate::config::CollectorSpec;
+use crate::paths::Paths;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -27,23 +28,23 @@ pub fn identity_keys() -> impl Iterator<Item = &'static str> {
 
 /// 毎回変わるので差分で比べないキー
 pub fn is_volatile_key(key: &str) -> bool {
-    traceroute::VOLATILE_KEYS.contains(&key)
+    traceroute::VOLATILE_KEYS.contains(&key) || processes::VOLATILE_KEYS.contains(&key)
 }
 
-fn collect(spec: &CollectorSpec) -> Result<Value> {
+fn collect(spec: &CollectorSpec, paths: &Paths) -> Result<Value> {
     match spec {
         CollectorSpec::Adapters => adapters::collect(),
         CollectorSpec::Routes => routes::collect(),
         CollectorSpec::DnsConfig => dns_config::collect(),
-        CollectorSpec::Processes => processes::collect(),
+        CollectorSpec::Processes => processes::collect(paths),
         CollectorSpec::ListeningPorts => listening_ports::collect(),
         CollectorSpec::Traceroute(target) => traceroute::collect(target),
     }
 }
 
 /// 全 collector を並列に実行する。個別の失敗はスナップショット内に記録して続行する
-pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64) -> Snapshot {
-    take_snapshot_with(specs, taken_at, collect)
+pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64, paths: &Paths) -> Snapshot {
+    take_snapshot_with(specs, taken_at, paths, collect)
 }
 
 /// `collect` で各 collector を実行する。panic も失敗として記録する。
@@ -51,12 +52,13 @@ pub fn take_snapshot(specs: &[CollectorSpec], taken_at: i64) -> Snapshot {
 fn take_snapshot_with(
     specs: &[CollectorSpec],
     taken_at: i64,
-    collect: fn(&CollectorSpec) -> Result<Value>,
+    paths: &Paths,
+    collect: fn(&CollectorSpec, &Paths) -> Result<Value>,
 ) -> Snapshot {
     let collectors: BTreeMap<String, CollectorResult> = std::thread::scope(|scope| {
         let handles: Vec<_> = specs
             .iter()
-            .map(|spec| (spec.name(), scope.spawn(move || collect(spec))))
+            .map(|spec| (spec.name(), scope.spawn(move || collect(spec, paths))))
             .collect();
         handles
             .into_iter()
@@ -83,6 +85,7 @@ fn take_snapshot_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
     use serde_json::json;
 
     #[test]
@@ -92,7 +95,8 @@ mod tests {
             // 不正な宛先でも snapshot 全体は成立する
             CollectorSpec::Traceroute("kuda.invalid".to_string()),
         ];
-        let snapshot = take_snapshot(&specs, 42);
+        let dir = TempDir::new("snapshot");
+        let snapshot = take_snapshot(&specs, 42, &dir.paths());
         assert_eq!(snapshot.taken_at, 42);
         assert!(snapshot.collectors.contains_key("dns_config"));
         assert!(snapshot.collectors.contains_key("traceroute:kuda.invalid"));
@@ -100,14 +104,15 @@ mod tests {
 
     #[test]
     fn a_panicking_collector_is_recorded_as_failed() {
-        fn collect(spec: &CollectorSpec) -> Result<Value> {
+        fn collect(spec: &CollectorSpec, _: &Paths) -> Result<Value> {
             match spec {
                 CollectorSpec::Routes => panic!("boom"),
                 _ => Ok(json!([])),
             }
         }
         let specs = [CollectorSpec::Routes, CollectorSpec::DnsConfig];
-        let snapshot = take_snapshot_with(&specs, 42, collect);
+        let dir = TempDir::new("snapshot-panic");
+        let snapshot = take_snapshot_with(&specs, 42, &dir.paths(), collect);
         assert_eq!(
             snapshot.collectors["routes"],
             CollectorResult::Failed("collector panicked".to_string())
@@ -123,6 +128,7 @@ mod tests {
             ["name", "adapter", "destination", "next_hop", "interface"]
         );
         assert!(is_volatile_key("raw"));
+        assert!(is_volatile_key("instances"));
         assert!(!is_volatile_key("hops"));
     }
 }

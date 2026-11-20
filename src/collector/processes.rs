@@ -3,15 +3,21 @@
 //! 識別とフラグは kind = "process" の分類と同じ関数（`known_set`）で求める。
 //! 判定を二重に書くと、事件の差分と分類で食い違うため。
 
+use crate::investigation;
 use crate::known_set::{self, Running};
+use crate::paths::Paths;
 use crate::probe;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-pub fn collect() -> Result<Value> {
+/// 同じ識別キーで動いている数は、ブラウザやサービスのホストでは絶えず増減する。
+/// 証拠としては残すが、差分で比べると毎回の事件に出てしまう
+pub(super) const VOLATILE_KEYS: &[&str] = &["instances"];
+
+pub fn collect(paths: &Paths) -> Result<Value> {
     let processes = probe::enumerate()?;
-    // 起動した kuda 自身と子孫は、毎回いて意味のない差分になるので入れない
-    let excluded: Vec<_> = known_set::own_root(&processes).into_iter().collect();
+    // kuda 自身と調査プロセス（と子孫）は、分類と同じく入れない
+    let excluded = investigation::excluded_roots(paths, &processes);
     let roots = known_set::Roots::from_env();
     Ok(render(&known_set::running(
         &processes,
@@ -58,7 +64,7 @@ mod tests {
     use crate::known_set::Roots;
     use crate::os::Os;
     use crate::probe::ProcessInfo;
-    use crate::testutil::process;
+    use crate::testutil::{TempDir, process};
 
     fn roots() -> Roots {
         Roots::new(Os::Windows, &[r"C:\Users\alice"], Some(r"C:\Windows"))
@@ -99,7 +105,7 @@ mod tests {
 
     #[test]
     fn collects_from_this_machine() {
-        let value = collect().unwrap();
+        let value = collect(&TempDir::new("processes").paths()).unwrap();
         assert!(!value.as_object().unwrap().is_empty());
     }
 }

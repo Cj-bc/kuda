@@ -67,6 +67,14 @@ pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
     roots
 }
 
+/// プロセスの監視から除く根: kuda 自身と、実行中の調査プロセス。
+/// 分類とスナップショットで同じ根を使わないと、事件の差分と分類が食い違う
+pub fn excluded_roots(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
+    let mut roots: Vec<_> = known_set::own_root(processes).into_iter().collect();
+    roots.extend(running(paths, processes));
+    roots
+}
+
 fn parse(text: &str) -> Option<(u32, i64)> {
     let (pid, started) = text.trim().split_once(' ')?;
     Some((pid.parse().ok()?, started.parse().ok()?))
@@ -117,6 +125,19 @@ mod tests {
         assert!(registration.0.exists());
         assert_eq!(running(&paths, &[me(42)]).len(), 1);
         std::mem::forget(registration);
+    }
+
+    #[test]
+    fn excluded_roots_cover_this_process_and_running_investigations() {
+        let (_dir, paths) = paths("excluded");
+        let investigator = ProcessInfo {
+            pid: 7,
+            started: Some(99),
+            ..me(0)
+        };
+        std::fs::write(paths.data_dir.join(format!("{PREFIX}w")), "7 99").unwrap();
+        let roots = excluded_roots(&paths, &[me(42), investigator]);
+        assert_eq!(roots, [(std::process::id(), 42), (7, 99)]);
     }
 
     #[test]

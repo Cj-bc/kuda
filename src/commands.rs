@@ -57,8 +57,8 @@ fn is_snapshot_due(state: &SnapshotState, now: i64, interval: Duration) -> bool 
 }
 
 /// スナップショットを取り、取得履歴と比較基準に記録する
-fn take_snapshot(store: &Store, watch: &Watch, now: i64) -> Result<Snapshot> {
-    let snapshot = collector::take_snapshot(&watch.snapshots.collectors, now);
+fn take_snapshot(store: &Store, paths: &Paths, watch: &Watch, now: i64) -> Result<Snapshot> {
+    let snapshot = collector::take_snapshot(&watch.snapshots.collectors, now, paths);
     let keep = watch.snapshots.keep_good;
     store.record_snapshot(&watch.name, now, &snapshot, keep)?;
     Ok(snapshot)
@@ -200,7 +200,7 @@ fn apply(
         if is_snapshot_due(&snapshot_state, now, watch.snapshots.interval)
             && !watch.snapshots.collectors.is_empty()
         {
-            take_snapshot(store, watch, now)?;
+            take_snapshot(store, paths, watch, now)?;
         }
     }
 
@@ -274,7 +274,7 @@ fn build_incident(
     reason: &str,
 ) -> Result<Incident> {
     let created = now();
-    let current = collector::take_snapshot(&watch.snapshots.collectors, created);
+    let current = collector::take_snapshot(&watch.snapshots.collectors, created, paths);
     let collectors: Vec<String> = watch
         .snapshots
         .collectors
@@ -343,9 +343,7 @@ fn classify_processes(
 ) -> Result<(Classification, bool)> {
     let processes = run.processes.as_deref().unwrap_or_default();
     let roots = Roots::from_env();
-    // kuda 自身と、実行中の調査プロセス（detach されていて親子ではたどれない）
-    let mut excluded: Vec<_> = known_set::own_root(processes).into_iter().collect();
-    excluded.extend(investigation::running(paths, processes));
+    let excluded = investigation::excluded_roots(paths, processes);
     let running = known_set::running(processes, &excluded, &spec.ignore, &roots);
     let classify = |learn| known_set::classify(store, &watch.name, spec, &running, now, learn);
     if !learn {
@@ -433,7 +431,7 @@ pub fn snapshot(config: &Config, paths: &Paths, force: bool, only: Option<&str>)
             );
             continue;
         }
-        let snapshot = take_snapshot(&store, watch, now)?;
+        let snapshot = take_snapshot(&store, paths, watch, now)?;
         print_collectors(&watch.name, &snapshot);
         failed += snapshot.failed().len();
     }
