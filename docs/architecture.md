@@ -43,9 +43,9 @@ process の分類には順序の制約があります。学習してよいのは
 | 判定 | `baseline.rs` | 時間帯別 p50/p95 の統計。対数ビンのヒストグラムとして蓄積する |
 | 判定 | `known_set.rs` | プロセスの識別キーの正規化、フラグ判定（user_writable、masquerade）、既知の集合との分類 |
 | 観測 | `probe/` | 疎通確認とプロセスの列挙（`probe/process.rs`）。判定や学習はしない |
-| 観測 | `collector/` | スナップショットの収集（adapters、routes、dns_config、traceroute）と、その結果の型（`collector/snapshot.rs`） |
+| 観測 | `collector/` | スナップショットの収集（adapters、routes、dns_config、traceroute、processes、listening_ports）と、その結果の型（`collector/snapshot.rs`） |
 | 永続化 | `store/` | SQLite。テーブルごとにサブモジュール（metrics、hist、snapshot、state、identities）に分け、`schema.rs` に移行を持つ |
-| 調査 | `incident/` | 事件ディレクトリの生成（`mod.rs`）と、スナップショットの差分（`diff.rs`） |
+| 調査 | `incident/` | 事件ディレクトリの生成（`mod.rs`）、スナップショットの差分（`diff.rs`）、未知のプロセスの証拠（`unknown.rs`） |
 | 調査 | `diagnosis/` | LLM バックエンド（`claude_code`、`codex`、`local`）の選択、fallback、レポートの保存 |
 | 調査 | `detach.rs`、`investigation.rs`、`lock.rs` | 調査プロセスの切り離し起動、実行中の調査の記録、多重起動防止 |
 | 部品 | `exec.rs` | 外部コマンドの起動。タイムアウト、子孫プロセスの回収、Windows で窓を出さないこと |
@@ -141,9 +141,9 @@ SQLite（`kuda.db`、WAL モード）です。版は `PRAGMA user_version` で�
 | --- | --- |
 | watch | 設定の `[[watch]]`。名前を持ち、probe、トリガー、調査の設定をまとめた監視の単位 |
 | probe | 1 回の観測。`kind` で種類が決まる。結果は `ProbeRun`（ターゲットごとの結果と、そこから作る指標） |
-| collector | スナップショットを構成する、システム状態の収集器（adapters、routes、dns_config、traceroute）。probe とは別物 |
+| collector | スナップショットを構成する、システム状態の収集器（adapters、routes、dns_config、traceroute、processes、listening_ports）。probe とは別物 |
 | snapshot | 全 collector を 1 回実行した結果。collector ごとに成功か失敗かを持つ |
-| incident（事件） | 発火の根拠をまとめたディレクトリ（`summary.md`、`diff.md`、`current.json`、`last_known_good.json`、`metrics.csv`、`incident.json`）。調査の入力で、レポートの根拠でもある |
+| incident（事件） | 発火の根拠をまとめたディレクトリ（`summary.md`、`diff.md`、`current.json`、`last_known_good.json`、`metrics.csv`、`incident.json`、process watch では `unknown_processes.json`）。調査の入力で、レポートの根拠でもある |
 | report（レポート） | 調査の出力。`reports/<watch>/<事件ID>.md`。使ったバックエンドと所要時間も書く。回復のお知らせ（`-recovered.md`）も同じ場所に置く |
 | 発火 | トリガー条件が連続回数を満たし、クールダウン中でもないこと。事件を作って調査を起動する |
 

@@ -13,6 +13,7 @@ use crate::lock;
 use crate::logging;
 use crate::metrics::{self, Variables};
 use crate::notify::{self, Event};
+use crate::os::Os;
 use crate::paths::{Paths, create_private_dir};
 use crate::probe::{self, ProbeRun};
 use crate::store::{ProbeState, SnapshotState, Store};
@@ -263,6 +264,17 @@ fn build_incident(
         .collect();
     let last_good = store.last_known_good(&watch.name, &collectors)?;
     let history = store.recent_metrics(&watch.name, INCIDENT_HISTORY_RUNS)?;
+    // ハッシュとコマンドラインは、事件を作るこの時点で取る。報告済みにした後では
+    // プロセスが終わっているかもしれないので、取れなかった項目は null のまま残す
+    let unknown_processes = match (&observation.classification, &observation.run.processes) {
+        (Some(classification), Some(processes)) => {
+            let os = Os::current();
+            let mut unknown = incident::describe_unknown(os, &classification.pending, processes);
+            incident::enrich_unknown(os, &mut unknown);
+            unknown
+        }
+        _ => Vec::new(),
+    };
     let evidence = Evidence {
         watch: &watch.name,
         reason,
@@ -273,6 +285,7 @@ fn build_incident(
         history: &history,
         current: &current,
         last_good: last_good.as_ref(),
+        unknown_processes: &unknown_processes,
     };
     incident::create(&paths.incidents_dir, &evidence, created)
 }
@@ -862,6 +875,20 @@ mod tests {
         assert!(summary.contains("| unknown | 2.000 |"), "{summary}");
         let csv = std::fs::read_to_string(incident_dir.join("metrics.csv")).unwrap();
         assert!(csv.contains(",unknown,2.000,"), "{csv}");
+        // 事件の証拠: pending だった識別キーが JSON と表に載る
+        let evidence: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(incident_dir.join("unknown_processes.json")).unwrap(),
+        )
+        .unwrap();
+        let identities: Vec<_> = evidence
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["identity"].as_str().unwrap())
+            .collect();
+        assert_eq!(identities, ["name:alpha-agent", "name:beta-daemon"]);
+        assert!(summary.contains("## 未知のプロセス"), "{summary}");
+        assert!(summary.contains("name:alpha-agent"), "{summary}");
 
         check_with(&mut store, &paths, watch, procs.clone(), 2000);
         assert_eq!(incidents(), 1, "報告済みでは再発火しない");

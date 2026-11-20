@@ -1,6 +1,7 @@
 //! 事件ディレクトリ（現在のスナップショット、正常時との差分、メトリクス）の生成。
 
 mod diff;
+mod unknown;
 
 use crate::baseline::{SeriesStats, Source};
 use crate::collector::{KnownGood, Snapshot};
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+pub use unknown::{UnknownProcess, describe as describe_unknown, enrich as enrich_unknown};
 
 const META_FILE: &str = "incident.json";
 
@@ -41,6 +43,8 @@ pub struct Evidence<'a> {
     pub current: &'a Snapshot,
     /// collector ごとの最後の成功データ（`Store::last_known_good`）
     pub last_good: Option<&'a KnownGood>,
+    /// 未知のプロセスの証拠（kind = "process" で pending があるときだけ空でない）
+    pub unknown_processes: &'a [UnknownProcess],
 }
 
 /// 秒単位の時刻から一意なディレクトリを作る。同じ秒に重なったら連番を付ける
@@ -87,6 +91,12 @@ pub fn create(incidents_dir: &Path, evidence: &Evidence, created: i64) -> Result
         write("last_known_good.json", serde_json::to_string_pretty(data)?)?;
     }
     write("metrics.csv", render_metrics(evidence))?;
+    if !evidence.unknown_processes.is_empty() {
+        write(
+            "unknown_processes.json",
+            serde_json::to_string_pretty(evidence.unknown_processes)?,
+        )?;
+    }
     write(META_FILE, serde_json::to_string_pretty(&incident)?)?;
     Ok(incident)
 }
@@ -173,6 +183,8 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
             cell(result.error.as_deref().unwrap_or("-")),
         );
     }
+
+    text.push_str(&unknown::render_table(evidence.unknown_processes));
 
     text.push_str("\n## ベースライン\n\n");
     if evidence.stats.is_empty() {
@@ -328,6 +340,7 @@ mod tests {
             history,
             current,
             last_good: None,
+            unknown_processes: &[],
         }
     }
 
@@ -371,6 +384,57 @@ mod tests {
         assert!(summary.contains("| loss | 1.000 |"), "{summary}");
     }
 
+    fn unknown_process(name: &str) -> UnknownProcess {
+        UnknownProcess {
+            identity: format!(r"c:\tmp\{name}"),
+            name: name.to_string(),
+            path: Some(format!(r"C:\tmp\{name}")),
+            pid: 7,
+            ppid: Some(1),
+            parent_identity: None,
+            user: None,
+            started: Some(100),
+            flags: vec!["user_writable"],
+            sha256: None,
+            sha256_note: Some("cannot open".to_string()),
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn unknown_processes_are_written_as_json_and_a_summary_table() {
+        let root = TempDir::new("incident-unknown");
+        let run = run();
+        let metrics = run.metrics();
+        let current = snapshot(json!([]));
+        let unknown = [unknown_process("evil|x.exe")];
+        let evidence = Evidence {
+            unknown_processes: &unknown,
+            ..evidence(&run, &metrics, &current, &[])
+        };
+        let incident = create(&root, &evidence, 1000).unwrap();
+
+        let text = std::fs::read_to_string(incident.dir.join("unknown_processes.json")).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        // JSON は生の値を保つ
+        assert_eq!(parsed[0]["name"], "evil|x.exe");
+        assert_eq!(parsed[0]["sha256"], Value::Null);
+        let summary = std::fs::read_to_string(incident.dir.join("summary.md")).unwrap();
+        assert!(summary.contains("## 未知のプロセス"), "{summary}");
+        assert!(summary.contains(r"evil\|x.exe"), "{summary}");
+    }
+
+    #[test]
+    fn no_unknown_processes_means_no_file_and_no_section() {
+        let root = TempDir::new("incident-no-unknown");
+        let run = run();
+        let metrics = run.metrics();
+        let current = snapshot(json!([]));
+        let incident = create(&root, &evidence(&run, &metrics, &current, &[]), 1000).unwrap();
+        assert!(!incident.dir.join("unknown_processes.json").exists());
+        let summary = std::fs::read_to_string(incident.dir.join("summary.md")).unwrap();
+        assert!(!summary.contains("未知のプロセス"));
+    }
     #[test]
     fn same_second_incidents_get_distinct_dirs() {
         let root = TempDir::new("incident-dup");
