@@ -10,6 +10,7 @@ use crate::paths::Paths;
 use crate::probe::{self, ProcessInfo};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 
 const PREFIX: &str = "investigating-";
 
@@ -18,7 +19,7 @@ pub struct Registration(PathBuf);
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        // 消せなくても出来ることがない。残っても害はない（`running` が無視し、次の調査が上書きする）
+        // 消せなくても出来ることがない。残っても `running` が無視し、古くなれば消す
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -42,8 +43,9 @@ pub fn register(
 }
 
 /// 生きている調査プロセスの (PID, 起動時刻)。
-/// 一致するプロセスがいない記録は無視するだけで消さない。check の列挙の直後に始まった調査の
-/// 記録も、列挙結果には一致しないので、消すと生きている調査を巻き込む
+/// 一致するプロセスがいない記録は、すぐには消さない。check の列挙の直後に始まった調査の
+/// 記録も列挙結果には一致しないので、消すと生きている調査を巻き込む。
+/// 異常終了した調査の記録は、`STALE_AFTER` を過ぎたら消す（毎回読み直すことになるため）
 pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
     let Ok(entries) = std::fs::read_dir(&paths.data_dir) else {
         return Vec::new();
@@ -65,9 +67,25 @@ pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
             .any(|p| p.pid == root.0 && probe::same_start(Os::current(), root.1, p.started))
         {
             roots.push(root);
+        } else if is_stale(&entry) {
+            // 消せなくても、次の回にまた試す
+            let _ = std::fs::remove_file(entry.path());
         }
     }
     roots
+}
+
+/// 調査は長くても数十分で終わる（バックエンドの制限時間）。それより十分古い記録は、
+/// 異常終了した調査の残りとみなす
+const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
+
+fn is_stale(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > STALE_AFTER)
 }
 
 /// プロセスの監視から除く根: kuda 自身と、実行中の調査プロセス。
@@ -146,6 +164,27 @@ mod tests {
         std::fs::write(paths.data_dir.join(format!("{PREFIX}w")), "7 99").unwrap();
         let roots = excluded_roots(&paths, &[me(42), investigator]);
         assert_eq!(roots, [(std::process::id(), 42), (7, 99)]);
+    }
+
+    /// 異常終了した調査の古い記録は消す。新しいものは、始まったばかりの調査かもしれないので残す
+    #[test]
+    fn stale_records_of_dead_investigations_are_removed() {
+        let (_dir, paths) = paths("crashed");
+        let old = paths.data_dir.join(format!("{PREFIX}w-7"));
+        let fresh = paths.data_dir.join(format!("{PREFIX}w-8"));
+        std::fs::write(&old, "7 99").unwrap();
+        std::fs::write(&fresh, "8 99").unwrap();
+        let two_days_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        assert!(running(&paths, &[me(42)]).is_empty());
+        assert!(!old.exists());
+        assert!(fresh.exists());
     }
 
     /// 同じ watch の別の調査（別の PID）の記録は、自分の Drop で消えない
