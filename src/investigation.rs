@@ -33,7 +33,9 @@ pub fn register(
     let Some((pid, started)) = known_set::own_root(processes) else {
         return Ok(None);
     };
-    let path = paths.data_dir.join(format!("{PREFIX}{watch}"));
+    // 同じ watch の調査が重なっても（ロックを取る前の短い間など）、互いの記録を
+    // 上書きしたり、Drop で消したりしないよう、PID ごとに分ける
+    let path = paths.data_dir.join(format!("{PREFIX}{watch}-{pid}"));
     std::fs::write(&path, format!("{pid} {started}"))
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(Some(Registration(path)))
@@ -143,6 +145,23 @@ mod tests {
         std::fs::write(paths.data_dir.join(format!("{PREFIX}w")), "7 99").unwrap();
         let roots = excluded_roots(&paths, &[me(42), investigator]);
         assert_eq!(roots, [(std::process::id(), 42), (7, 99)]);
+    }
+
+    /// 同じ watch の別の調査（別の PID）の記録は、自分の Drop で消えない
+    #[test]
+    fn records_are_kept_per_process() {
+        let (_dir, paths) = paths("per-pid");
+        let other = paths.data_dir.join(format!("{PREFIX}w-7"));
+        std::fs::write(&other, "7 99").unwrap();
+        let investigator = ProcessInfo {
+            pid: 7,
+            started: Some(99),
+            ..me(0)
+        };
+        let registration = register(&paths, "w", &[me(42)]).unwrap().unwrap();
+        drop(registration);
+        assert!(other.exists());
+        assert_eq!(running(&paths, &[investigator]), [(7, 99)]);
     }
 
     #[test]

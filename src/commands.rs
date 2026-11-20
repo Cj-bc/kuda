@@ -467,6 +467,10 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         .map(BackendKind::parse)
         .transpose()?;
 
+    // 調査の間だけ記録し、check のプロセス監視が調査プロセスを未知として数えないようにする。
+    // 事件を作る（collector を走らせる）間や --dry-run でも、並行する check からは見えるので、
+    // 最初に記録する
+    let _registration = register_investigation(paths, &watch.name);
     let incident = match &options.incident {
         Some(dir) => incident::load(dir)?,
         None => manual_incident(paths, watch)?,
@@ -496,8 +500,6 @@ pub fn diagnose(config: &Config, paths: &Paths, options: DiagnoseOptions) -> Res
         println!("an investigation for {} is already running", watch.name);
         return Ok(());
     }
-    // 調査の間だけ記録し、check のプロセス監視が調査プロセスを未知として数えないようにする
-    let _registration = register_investigation(paths, &watch.name);
     let notify = options.notify && config.general.notify;
     if notify {
         notify::send(&Event::Started { watch: &watch.name });
