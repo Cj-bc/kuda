@@ -98,10 +98,11 @@ fn is_version_element(element: &str) -> bool {
     }
 }
 
-/// Linux のカーネルスレッドか。`/proc/<pid>/exe` が読めず、自身が kthreadd（PID 2）か
-/// その子であるものを対象外にする。Windows では常に false
+/// Linux のカーネルスレッドか。判定は列挙時に stat の flags で済ませてある。
+/// PID 2 を kthreadd とみなすと、PID の名前空間の中で PID 2 になった普通のサービスが、
+/// 実行ファイルのパスを読めないだけで監視から消える。Windows では常に false
 pub fn is_kernel_thread(os: Os, info: &ProcessInfo) -> bool {
-    os == Os::Linux && info.path.is_none() && (info.pid == 2 || info.ppid == Some(2))
+    os == Os::Linux && info.kernel_thread
 }
 
 /// プロセスの識別キーを求める。対象外（カーネルスレッド）は None
@@ -493,6 +494,7 @@ mod tests {
             path: Some(format!("/bin/p{pid}")),
             user: None,
             started,
+            kernel_thread: false,
         }
     }
 
@@ -593,6 +595,7 @@ mod tests {
             path: None,
             user: None,
             started: None,
+            kernel_thread: false,
         };
         assert_eq!(identify(Os::Windows, &p).unwrap().key, "name:system");
         let q = ProcessInfo {
@@ -604,20 +607,18 @@ mod tests {
 
     #[test]
     fn kernel_threads_are_skipped_on_linux_only() {
-        let mut kthreadd = info(2, Some(0), None);
-        kthreadd.path = None;
         let mut worker = info(30, Some(2), None);
         worker.path = None;
-        let mut unreadable = info(500, Some(1), None);
-        unreadable.path = None;
-        let mut child_with_exe = info(31, Some(2), None);
-        child_with_exe.path = Some("/usr/bin/x".into());
+        worker.kernel_thread = true;
+        // PID の名前空間の中で PID 2 になった普通のサービス。パスが読めなくても残す
+        let mut service = info(2, Some(1), None);
+        service.path = None;
+        let mut child = info(31, Some(2), None);
+        child.path = None;
 
-        assert!(identify(Os::Linux, &kthreadd).is_none());
         assert!(identify(Os::Linux, &worker).is_none());
-        // 親が kthreadd でなければ、読めないだけのプロセスは name: キーで残す
-        assert_eq!(identify(Os::Linux, &unreadable).unwrap().key, "name:p500");
-        assert!(identify(Os::Linux, &child_with_exe).is_some());
+        assert_eq!(identify(Os::Linux, &service).unwrap().key, "name:p2");
+        assert_eq!(identify(Os::Linux, &child).unwrap().key, "name:p31");
         assert!(identify(Os::Windows, &worker).is_some());
     }
 

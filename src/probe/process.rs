@@ -12,6 +12,8 @@ pub struct ProcessInfo {
     pub user: Option<String>,
     /// Unix 秒
     pub started: Option<i64>,
+    /// Linux のカーネルスレッド（stat の flags に PF_KTHREAD）。Windows では常に false
+    pub kernel_thread: bool,
 }
 
 /// 全プロセスを列挙する。個々のプロセスの詳細が取れなくても列挙は続ける
@@ -94,6 +96,7 @@ mod imp {
             path: handle.as_ref().and_then(|h| image_path(h.0)),
             user: None,
             started: handle.as_ref().and_then(|h| start_time(h.0)),
+            kernel_thread: false,
         }
     }
 
@@ -177,6 +180,7 @@ mod imp {
             path,
             user,
             started: Some(boot_time + (stat.start_ticks / ticks_per_sec) as i64),
+            kernel_thread: stat.kernel_thread,
         })
     }
 
@@ -184,7 +188,12 @@ mod imp {
         name: String,
         ppid: u32,
         start_ticks: u64,
+        kernel_thread: bool,
     }
+
+    /// include/linux/sched.h の PF_KTHREAD。PID の名前空間の中でも正しく判定できる
+    /// （名前空間の中では kthreadd が PID 2 とは限らず、PID 2 が普通のサービスでありうる）
+    const PF_KTHREAD: u64 = 0x0020_0000;
 
     /// comm は UTF-8 とは限らない（プロセスが自由に付けられる）。UTF-8 として読むと
     /// プロセスごと列挙から落ちるので、名前だけを置き換え文字で崩して読む。
@@ -198,11 +207,14 @@ mod imp {
         let open = stat.find('(')?;
         let close = stat.rfind(')')?;
         let rest: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
-        // rest[0] = state, rest[1] = ppid, rest[19] = starttime（stat の 22 番目）
+        // rest[0] = state, rest[1] = ppid, rest[6] = flags（stat の 9 番目）、
+        // rest[19] = starttime（stat の 22 番目）
+        let flags: u64 = rest.get(6)?.parse().ok()?;
         Some(Stat {
             name: stat.get(open + 1..close)?.to_string(),
             ppid: rest.get(1)?.parse().ok()?,
             start_ticks: rest.get(19)?.parse().ok()?,
+            kernel_thread: flags & PF_KTHREAD != 0,
         })
     }
 
@@ -249,6 +261,14 @@ mod imp {
             assert_eq!(stat.name, "a) b (c");
             assert_eq!(stat.ppid, 7);
             assert_eq!(stat.start_ticks, 12345);
+            assert!(!stat.kernel_thread);
+        }
+
+        #[test]
+        fn kernel_threads_are_told_by_their_flags() {
+            // kworker の実例。flags 0x4208060 に PF_KTHREAD（0x200000）が立っている
+            let line = "88 (kworker/0:1H) I 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 0 -20 1 0 77 0 0";
+            assert!(parse_stat(line).unwrap().kernel_thread);
         }
 
         #[test]

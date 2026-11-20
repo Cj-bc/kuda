@@ -102,6 +102,7 @@ mod tests {
             path: None,
             user: None,
             started: Some(started),
+            kernel_thread: false,
         }
     }
 

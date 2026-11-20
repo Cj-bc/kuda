@@ -67,6 +67,7 @@ pub(crate) fn process(pid: u32, name: &str, path: Option<&str>) -> ProcessInfo {
         path: path.map(str::to_string),
         user: None,
         started: Some(1),
+        kernel_thread: false,
     }
 }
 
