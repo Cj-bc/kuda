@@ -615,6 +615,12 @@ impl RawProbe {
                 ensure!(command.is_empty(), "process probe takes no `command`");
                 let learn_for =
                     learn_for.context("process probe needs `learn_for` in [watch.baseline]")?;
+                // 学習期間は秒単位で比べる。端数を切り捨てると `500ms` が学習なしになり、
+                // 動いているものがすべて未知として報告される
+                ensure!(
+                    learn_for.subsec_nanos() == 0,
+                    "`learn_for` must be a whole number of seconds"
+                );
                 Ok(ProbeSpec::Process(ProcessSpec {
                     expected,
                     ignore,
@@ -881,6 +887,12 @@ mod tests {
         assert!(Config::parse(&with("targets = [\"a:1\"]")).is_err());
         assert!(Config::parse(&with("command = [\"x\"]")).is_err());
         assert!(Config::parse(&PROCESS_WATCH.replace("learn_for = \"7d\"", "")).is_err());
+        let error = Config::parse(&PROCESS_WATCH.replace("\"7d\"", "\"500ms\"")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("whole number of seconds"),
+            "{error:#}"
+        );
+        assert!(Config::parse(&PROCESS_WATCH.replace("\"7d\"", "\"0s\"")).is_ok());
         let bad = PROCESS_WATCH.replace("masquerade >= 1", "baseline.rtt_p95 > 1");
         let error = format!("{:#}", Config::parse(&bad).unwrap_err());
         assert!(error.contains("unknown variable"), "{error}");
