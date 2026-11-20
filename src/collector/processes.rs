@@ -9,6 +9,7 @@ use crate::paths::Paths;
 use crate::probe;
 use anyhow::Result;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 /// 同じ識別キーで動いている数は、ブラウザやサービスのホストでは絶えず増減する。
 /// 証拠としては残すが、差分で比べると毎回の事件に出てしまう
@@ -27,8 +28,10 @@ pub fn collect(paths: &Paths) -> Result<Value> {
     )))
 }
 
-/// `{ "<identity>": { name, path, user, instances, flags } }`。
+/// `{ "<identity>": { names, paths, users, instances, flags } }`。
 /// PID や起動時刻のように毎回変わる値は入れない。入れると、差分が毎回出てしまう。
+/// 名前・パス・ユーザーは同じ識別キーのプロセス全員の値の集合にする。代表の 1 つだけにすると、
+/// 代表が終わって別のプロセスに替わったときに、何も起きていないのに差分が出る。
 /// `ignore` は collector からは渡らないので、監視から外したパスもここには載る
 fn render(running: &Running) -> Value {
     let mut map = Map::new();
@@ -43,14 +46,17 @@ fn render(running: &Running) -> Value {
         if observed.user_writable {
             flags.push("user_writable");
         }
-        let process = observed.process;
+        let members = &observed.members;
+        let names: BTreeSet<&str> = members.iter().map(|p| p.name.as_str()).collect();
+        let paths: BTreeSet<&str> = members.iter().filter_map(|p| p.path.as_deref()).collect();
+        let users: BTreeSet<&str> = members.iter().filter_map(|p| p.user.as_deref()).collect();
         map.insert(
             observed.identity.key.clone(),
             json!({
-                "name": process.name,
-                "path": process.path,
-                "user": process.user,
-                "instances": observed.instances,
+                "names": names,
+                "paths": paths,
+                "users": users,
+                "instances": members.len(),
                 "flags": flags,
             }),
         );
@@ -91,7 +97,25 @@ mod tests {
         assert_eq!(system["flags"], json!([]));
         let fake = &value[r"c:\users\alice\appdata\local\temp\svchost.exe"];
         assert_eq!(fake["flags"], json!(["masquerade", "user_writable"]));
-        assert_eq!(value["name:system"]["path"], Value::Null);
+        assert_eq!(value["name:system"]["paths"], json!([]));
+    }
+
+    /// 代表（PID 最小）が終わって別のプロセスに替わっても、集合が同じなら出力は同じ
+    #[test]
+    fn a_new_representative_does_not_change_the_output() {
+        let mut root = process(1, "agent", Some(r"C:\Apps\agent.exe"));
+        root.user = Some("SYSTEM".to_string());
+        let mut alice = process(2, "agent", Some(r"C:\Apps\agent.exe"));
+        alice.user = Some("alice".to_string());
+        let mut alice_again = alice.clone();
+        alice_again.pid = 3;
+        let before = snapshot(&[root.clone(), alice.clone()]);
+        let after = snapshot(&[alice_again, root]);
+        assert_eq!(before, after);
+        assert_eq!(
+            before[r"c:\apps\agent.exe"]["users"],
+            json!(["SYSTEM", "alice"])
+        );
     }
 
     /// PID と起動時刻だけが違う 2 回の列挙は、差分が出ない形でなければならない

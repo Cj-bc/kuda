@@ -354,8 +354,8 @@ pub struct Observed<'a> {
     pub identity: Identity,
     /// 代表のプロセス（PID が最小のもの）
     pub process: &'a ProcessInfo,
-    /// 同じ識別キーで動いている数
-    pub instances: usize,
+    /// 同じ識別キーで動いているプロセス全員
+    pub members: Vec<&'a ProcessInfo>,
     pub user_writable: bool,
     pub masquerade: bool,
 }
@@ -396,11 +396,11 @@ pub fn running<'a>(
             .or_insert_with(|| Observed {
                 identity: identity.clone(),
                 process,
-                instances: 0,
+                members: Vec::new(),
                 user_writable,
                 masquerade,
             });
-        entry.instances += 1;
+        entry.members.push(process);
         // 代表は PID が最小のもの。列挙の順序に結果を依存させない。
         // deleted は代表のパスから決まる性質なので、代表と一緒に入れ替える
         if process.pid < entry.process.pid {
