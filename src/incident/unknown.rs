@@ -65,7 +65,8 @@ pub fn describe(
                 // PID が再利用されていたら親ではない
                 .filter(|q| match (q.started, process.started) {
                     (Some(parent), Some(child)) => parent <= child,
-                    _ => true,
+                    // 起動時刻が無ければ再利用を確かめられないので、親とはみなさない
+                    _ => false,
                 })
                 .and_then(|q| known_set::identify(os, q));
             let mut flags = Vec::new();
@@ -163,20 +164,15 @@ pub fn enrich(
 const GONE: &str = "not collected: the process exited, was replaced, \
                     or has no start time to verify it by";
 
-/// ハッシュを取る場所の候補。Linux では `/proc/<pid>/exe` が、削除済みの実行ファイルの
-/// 中身も読める。削除済みのパスそのものは、更新で置き換わった別のファイルを指しうるので
-/// 候補にしない
+/// ハッシュを取る場所の候補。Linux では `/proc/<pid>/exe` だけを使う。これは実行中の
+/// 実行ファイルそのものを開くので、削除済みでも置き換えられていても正しい中身が読める。
+/// パスで開き直すと、置き換えられた別のファイルや、表示のために `\xNN` に直した
+/// （実在しない）パスを開きうる。Windows はパスで開く
 fn hash_candidates(os: Os, pid: u32, path: Option<&str>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if os == Os::Linux {
-        candidates.push(PathBuf::from(format!("/proc/{pid}/exe")));
+    match os {
+        Os::Linux => vec![PathBuf::from(format!("/proc/{pid}/exe"))],
+        Os::Windows => path.map(PathBuf::from).into_iter().collect(),
     }
-    if let Some(path) = path
-        && !(os == Os::Linux && path.ends_with(" (deleted)"))
-    {
-        candidates.push(PathBuf::from(path));
-    }
-    candidates
 }
 
 /// 最初に読めた候補の SHA-256 を 16 進で、読んだバイト数と一緒に返す。
@@ -455,6 +451,17 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_without_a_start_time_is_not_trusted() {
+        let mut unknown_start = process(10, "other.exe", Some(r"C:\o.exe"));
+        unknown_start.started = None;
+        let mut child = process(20, "x.exe", Some(r"C:\x.exe"));
+        child.ppid = Some(10);
+        let all = [unknown_start, child.clone()];
+        let described = describe(Os::Windows, &pending(&[child]), &all);
+        assert_eq!(described[0].parent_identity, None);
+    }
+
+    #[test]
     fn hashes_a_file_and_explains_why_it_cannot() {
         let dir = TempDir::new("unknown-hash");
         let path = dir.join("a.bin");
@@ -483,15 +490,18 @@ mod tests {
 
     #[test]
     fn candidates_depend_on_the_os() {
-        assert_eq!(
-            hash_candidates(Os::Linux, 7, Some("/usr/bin/x")),
-            [PathBuf::from("/proc/7/exe"), PathBuf::from("/usr/bin/x")]
-        );
-        // 削除済みのパスは、更新で置き換わった別のファイルかもしれない
-        assert_eq!(
-            hash_candidates(Os::Linux, 7, Some("/usr/bin/x (deleted)")),
-            [PathBuf::from("/proc/7/exe")]
-        );
+        // Linux はパスによらず、動いている実行ファイルそのものを読む
+        for path in [
+            Some("/usr/bin/x"),
+            Some("/usr/bin/x (deleted)"),
+            Some(r"/tmp/a\xff"),
+            None,
+        ] {
+            assert_eq!(
+                hash_candidates(Os::Linux, 7, path),
+                [PathBuf::from("/proc/7/exe")]
+            );
+        }
         assert_eq!(
             hash_candidates(Os::Windows, 7, Some(r"C:\x.exe")),
             [PathBuf::from(r"C:\x.exe")]
@@ -583,5 +593,38 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("evil|name"));
         assert!(!render_table(&[]).contains('|'));
+    }
+
+    /// 区切りとして働く `|`（前の `\` が偶数個）の数
+    fn separators(row: &str) -> usize {
+        let mut count = 0;
+        let mut backslashes = 0;
+        for c in row.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '|' if backslashes % 2 == 0 => count += 1,
+                _ => {}
+            }
+            if c != '\\' {
+                backslashes = 0;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn a_backslash_before_a_pipe_does_not_break_the_table() {
+        let mut item = describe(
+            Os::Windows,
+            &pending(&[process(1, "a.exe", Some(r"C:\x.exe"))]),
+            &[],
+        )
+        .remove(0);
+        item.name = r"a\|b ![x](https://evil.invalid/p.png)".to_string();
+        let table = render_table(&[item]);
+        let row = table.lines().find(|l| l.contains("evil")).unwrap();
+        assert_eq!(separators(row), 9, "{row}");
+        // 画像の記法は文字どおりに見える
+        assert!(row.contains(r"\!\[x\]"), "{row}");
     }
 }

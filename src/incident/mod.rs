@@ -148,9 +148,22 @@ pub fn prune(incidents_dir: &Path, retention_days: u32, now: i64) -> Result<()> 
     Ok(())
 }
 
-/// Markdown の表を壊す文字を取り除く
+/// Markdown の中で文字どおりに見せる。改行は空白にし、表を崩す `|` と、リンクや画像
+/// （開いただけで外部を読みに行く）になる記号を `\` で逃がす。`\` 自身も逃がさないと、
+/// `a\|b` の `\` が `|` の逃がしを打ち消して表が崩れる
 fn cell(text: &str) -> String {
-    text.replace('|', "\\|").replace(['\r', '\n'], " ")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\r' | '\n' => out.push(' '),
+            '\\' | '|' | '[' | ']' | '<' | '>' | '!' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn format_ms(value: Option<f64>) -> String {

@@ -81,6 +81,11 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
+/// コードの外に置く値。制御文字を見える形にし、リンクや画像になる記号を逃がす
+fn literal(text: &str) -> String {
+    super::cell(&printable(text))
+}
+
 /// インラインコードにする。中のバッククォートより長い区切りで囲み、途中で閉じさせない
 fn code(text: &str) -> String {
     let text = printable(text);
@@ -139,19 +144,19 @@ pub(super) fn render_diff(last_good: Option<&KnownGood>, current: &Snapshot) -> 
                 None => "現在のスナップショットに含まれていません",
                 Some(CollectorResult::Ok(_)) => "正常時に取得に成功したことがありません",
             };
-            failed.push(format!("- {}: {}", code(name), printable(error)));
+            failed.push(format!("- {}: {}", code(name), literal(error)));
             continue;
         };
         let (old, new) = (flat_data(name, old), flat_data(name, new));
         for (path, value) in &new {
             match old.get(path) {
-                None => added.push(format!("- {}: {}", code(path), printable(value))),
+                None => added.push(format!("- {}: {}", code(path), literal(value))),
                 Some(previous) if previous != value => {
                     changed.push(format!(
                         "- {}: {} ⇒ {}",
                         code(path),
-                        printable(previous),
-                        printable(value)
+                        literal(previous),
+                        literal(value)
                     ));
                 }
                 Some(_) => {}
@@ -159,7 +164,7 @@ pub(super) fn render_diff(last_good: Option<&KnownGood>, current: &Snapshot) -> 
         }
         for (path, value) in &old {
             if !new.contains_key(path) {
-                removed.push(format!("- {}: {}", code(path), printable(value)));
+                removed.push(format!("- {}: {}", code(path), literal(value)));
             }
         }
     }
@@ -309,6 +314,25 @@ mod tests {
         // 項目は 1 行で、パスはバッククォートを含んでも閉じない区切りで囲まれている
         let line = diff.lines().find(|l| l.contains("/tmp/x")).unwrap();
         assert!(line.starts_with("- `` processes./tmp/x"), "{line}");
+    }
+
+    /// 値に画像やリンクの記法があっても、文字どおりに見える（開いただけで外部を読まない）
+    #[test]
+    fn values_cannot_load_images_or_links() {
+        let processes = |name: &str| -> Snapshot {
+            serde_json::from_value(json!({ "taken_at": 100, "collectors": {
+                "processes": { "ok": true, "data": { "/x": { "name": name } } },
+            }}))
+            .unwrap()
+        };
+        let diff = render_diff(
+            Some(&known_good(&processes("x"))),
+            &processes("![a](https://evil.invalid/p.png)"),
+        );
+        assert!(
+            diff.contains(r"x ⇒ \!\[a\](https://evil.invalid/p.png)"),
+            "{diff}"
+        );
     }
 
     #[test]
