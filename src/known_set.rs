@@ -350,16 +350,26 @@ impl Classification {
 }
 
 /// 識別キーごとにまとめた、今 動いているプロセス
-struct Observed<'a> {
-    identity: Identity,
-    process: &'a ProcessInfo,
-    user_writable: bool,
-    masquerade: bool,
+pub struct Observed<'a> {
+    pub identity: Identity,
+    /// 代表のプロセス（PID が最小のもの）
+    pub process: &'a ProcessInfo,
+    /// 同じ識別キーで動いている数
+    pub instances: usize,
+    pub user_writable: bool,
+    pub masquerade: bool,
 }
 
 /// 今 動いているプロセスを識別キーごとにまとめたもの。ストアに触れずに作れるので、
 /// 学習する前提と、しない前提の 2 回分類するときも 1 回作れば済む
 pub struct Running<'a>(BTreeMap<String, Observed<'a>>);
+
+impl<'a> Running<'a> {
+    /// 識別キーの昇順。collector `processes` が、分類と同じ判定でスナップショットを作るために使う
+    pub fn iter(&self) -> impl Iterator<Item = &Observed<'a>> {
+        self.0.values()
+    }
+}
 
 /// 列挙結果から、除外（`excluded` の根の子孫と `ignore`）を除いて識別キーごとにまとめる。
 /// `excluded` は kuda 自身と調査プロセスの根
@@ -386,9 +396,11 @@ pub fn running<'a>(
             .or_insert_with(|| Observed {
                 identity,
                 process,
+                instances: 0,
                 user_writable,
                 masquerade,
             });
+        entry.instances += 1;
         // 代表は PID が最小のもの。列挙の順序に結果を依存させない
         if process.pid < entry.process.pid {
             entry.process = process;

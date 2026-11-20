@@ -2,6 +2,8 @@
 
 mod adapters;
 mod dns_config;
+mod listening_ports;
+mod processes;
 mod routes;
 mod snapshot;
 mod traceroute;
@@ -33,6 +35,8 @@ fn collect(spec: &CollectorSpec) -> Result<Value> {
         CollectorSpec::Adapters => adapters::collect(),
         CollectorSpec::Routes => routes::collect(),
         CollectorSpec::DnsConfig => dns_config::collect(),
+        CollectorSpec::Processes => processes::collect(),
+        CollectorSpec::ListeningPorts => listening_ports::collect(),
         CollectorSpec::Traceroute(target) => traceroute::collect(target),
     }
 }

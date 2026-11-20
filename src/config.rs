@@ -247,6 +247,8 @@ pub enum CollectorSpec {
     Adapters,
     Routes,
     DnsConfig,
+    Processes,
+    ListeningPorts,
     Traceroute(String),
 }
 
@@ -256,6 +258,8 @@ impl CollectorSpec {
             Self::Adapters => "adapters".to_string(),
             Self::Routes => "routes".to_string(),
             Self::DnsConfig => "dns_config".to_string(),
+            Self::Processes => "processes".to_string(),
+            Self::ListeningPorts => "listening_ports".to_string(),
             Self::Traceroute(target) => format!("traceroute:{target}"),
         }
     }
@@ -269,6 +273,8 @@ impl TryFrom<String> for CollectorSpec {
             "adapters" => Ok(Self::Adapters),
             "routes" => Ok(Self::Routes),
             "dns_config" => Ok(Self::DnsConfig),
+            "processes" => Ok(Self::Processes),
+            "listening_ports" => Ok(Self::ListeningPorts),
             other => match other.strip_prefix("traceroute:") {
                 Some(target) if !target.is_empty() => Ok(Self::Traceroute(target.to_string())),
                 _ => Err(format!("unknown collector: {other}")),
@@ -895,5 +901,17 @@ mod tests {
     fn rejects_unknown_collector() {
         let text = format!("{MINIMAL_WATCH}\n[watch.baseline]\nsnapshot_collectors = [\"nope\"]\n");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn accepts_process_collectors() {
+        let text = format!(
+            "{MINIMAL_WATCH}\n[watch.baseline]\nsnapshot_collectors = [\"processes\", \"listening_ports\"]\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            config.watch("w").unwrap().snapshots.collectors,
+            [CollectorSpec::Processes, CollectorSpec::ListeningPorts]
+        );
     }
 }
