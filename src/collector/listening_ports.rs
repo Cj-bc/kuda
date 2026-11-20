@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 
 /// 待ち受けの 1 件。UDP は接続を持たないので、束縛されたソケットを待ち受けとみなす
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,15 +17,26 @@ struct Listener {
     proto: &'static str,
     addr: IpAddr,
     port: u16,
-    pid: Option<u32>,
+    /// 持ち主。Linux では 1 つのソケットを複数のプロセスが持ちうる（ソケット起動など）。
+    /// 空なら持ち主を引けなかった
+    pids: Vec<u32>,
 }
 
 impl Listener {
-    /// `tcp:0.0.0.0:80`、`udp:[::]:53`。IPv6 は括弧で囲み、ポートと区切れるようにする
-    fn key(&self) -> String {
+    /// `tcp:0.0.0.0:80`、`udp:[::]:53`。IPv6 は括弧で囲み、ポートと区切れるようにする。
+    ///
+    /// UDP は待ち受けと、クライアントが送信のために束縛しただけのソケットを区別できない。
+    /// 後者は一時ポート（`ephemeral`）を使い、番号が毎回変わるので、番号の代わりに
+    /// `ephemeral` とまとめる。どのプロセスが一時ポートを使っているかは残る
+    fn key(&self, ephemeral: &RangeInclusive<u16>) -> String {
+        let port = if self.proto == "udp" && ephemeral.contains(&self.port) {
+            "ephemeral".to_string()
+        } else {
+            self.port.to_string()
+        };
         match self.addr {
-            IpAddr::V4(addr) => format!("{}:{addr}:{}", self.proto, self.port),
-            IpAddr::V6(addr) => format!("{}:[{addr}]:{}", self.proto, self.port),
+            IpAddr::V4(addr) => format!("{}:{addr}:{port}", self.proto),
+            IpAddr::V6(addr) => format!("{}:[{addr}]:{port}", self.proto),
         }
     }
 }
@@ -33,7 +45,8 @@ pub fn collect() -> Result<Value> {
     let listeners = imp::listeners()?;
     // 持ち主の識別は processes collector と同じ規則。列挙できなくてもポートの一覧は返す
     let processes = probe::enumerate().unwrap_or_default();
-    Ok(render(&listeners, &identities(Os::current(), &processes)))
+    let identities = identities(Os::current(), &processes);
+    Ok(render(&listeners, &identities, &imp::ephemeral_ports()))
 }
 
 fn identities(os: Os, processes: &[ProcessInfo]) -> HashMap<u32, String> {
@@ -45,13 +58,24 @@ fn identities(os: Os, processes: &[ProcessInfo]) -> HashMap<u32, String> {
 
 /// `{ "<proto:addr:port>": { "processes": ["<identity>", ...] } }`。
 /// PID は毎回変わるので入れず、持ち主は識別キーで示す
-fn render(listeners: &[Listener], identities: &HashMap<u32, String>) -> Value {
+fn render(
+    listeners: &[Listener],
+    identities: &HashMap<u32, String>,
+    ephemeral: &RangeInclusive<u16>,
+) -> Value {
     let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for listener in listeners {
-        let owner = listener.pid.and_then(|pid| identities.get(&pid));
-        let entry = owners.entry(listener.key()).or_default();
+        let entry = owners.entry(listener.key(ephemeral)).or_default();
+        let known: Vec<_> = listener
+            .pids
+            .iter()
+            .filter_map(|pid| identities.get(pid))
+            .collect();
         // 持ち主が分からない（権限が足りない、列挙の合間に終わった）ことも差分で見えるようにする
-        entry.insert(owner.cloned().unwrap_or_else(|| "unknown".to_string()));
+        if known.is_empty() {
+            entry.insert("unknown".to_string());
+        }
+        entry.extend(known.into_iter().cloned());
     }
     let map: Map<String, Value> = owners
         .into_iter()
@@ -132,7 +156,7 @@ mod imp {
                 proto: "tcp",
                 addr: IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwLocalAddr))),
                 port: port(row.dwLocalPort),
-                pid: Some(row.dwOwningPid),
+                pids: vec![row.dwOwningPid],
             });
         }
 
@@ -151,7 +175,7 @@ mod imp {
                 proto: "tcp",
                 addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
                 port: port(row.dwLocalPort),
-                pid: Some(row.dwOwningPid),
+                pids: vec![row.dwOwningPid],
             });
         }
 
@@ -163,7 +187,7 @@ mod imp {
                 proto: "udp",
                 addr: IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwLocalAddr))),
                 port: port(row.dwLocalPort),
-                pid: Some(row.dwOwningPid),
+                pids: vec![row.dwOwningPid],
             });
         }
 
@@ -175,19 +199,34 @@ mod imp {
                 proto: "udp",
                 addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
                 port: port(row.dwLocalPort),
-                pid: Some(row.dwOwningPid),
+                pids: vec![row.dwOwningPid],
             });
         }
         Ok(found)
+    }
+
+    /// Windows Vista 以降の既定の動的ポート範囲。`netsh` で変えられるが、読むには
+    /// 外部コマンドが要るので既定値を使う
+    pub fn ephemeral_ports() -> std::ops::RangeInclusive<u16> {
+        49152..=65535
     }
 }
 
 #[cfg(unix)]
 mod imp {
-    use super::{Listener, parse_proc_net};
-    use anyhow::{Result, bail};
+    use super::{Listener, parse_port_range, parse_proc_net};
+    use anyhow::{Context, Result};
     use std::collections::HashMap;
     use std::fs;
+    use std::io::ErrorKind;
+
+    /// 読めなければ Linux の既定値
+    pub fn ephemeral_ports() -> std::ops::RangeInclusive<u16> {
+        fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|text| parse_port_range(&text))
+            .unwrap_or(32768..=60999)
+    }
 
     /// /proc/net の 4 つの表。(ファイル, プロトコル, 待ち受けを表す状態, IPv6 か)。
     /// TCP は LISTEN（0A）、UDP は束縛されただけで接続していない（07）
@@ -201,31 +240,31 @@ mod imp {
     pub fn listeners() -> Result<Vec<Listener>> {
         let owners = socket_owners();
         let mut found = Vec::new();
-        let mut readable = 0;
         for (path, proto, state, v6) in TABLES {
-            // IPv6 が無効なホストでは tcp6 / udp6 が無い
-            let Ok(text) = fs::read_to_string(path) else {
-                continue;
+            let text = match fs::read_to_string(path) {
+                Ok(text) => text,
+                // IPv6 が無効なホストでは tcp6 / udp6 が無い
+                Err(error) if v6 && error.kind() == ErrorKind::NotFound => continue,
+                // 一部の表だけで成功させると、読めなかった表の待ち受けが消えたように見え、
+                // しかもそれが比較の基準として残る。それより、この collector を失敗にする
+                Err(error) => return Err(error).with_context(|| format!("cannot read {path}")),
             };
-            readable += 1;
             for (addr, port, inode) in parse_proc_net(&text, state, v6) {
                 found.push(Listener {
                     proto,
                     addr,
                     port,
-                    pid: owners.get(&inode).copied(),
+                    pids: owners.get(&inode).cloned().unwrap_or_default(),
                 });
             }
-        }
-        if readable == 0 {
-            bail!("cannot read /proc/net");
         }
         Ok(found)
     }
 
     /// ソケットの inode から持ち主の PID を引く。他のユーザーのプロセスの fd は読めないので、
-    /// 引けないソケットがあってよい（そのときの持ち主は unknown になる）
-    fn socket_owners() -> HashMap<u64, u32> {
+    /// 引けないソケットがあってよい（そのときの持ち主は unknown になる）。
+    /// 1 つのソケットを複数のプロセスが持つこと（ソケット起動、fork した子）があるので、全員を返す
+    fn socket_owners() -> HashMap<u64, Vec<u32>> {
         let mut owners = HashMap::new();
         let Ok(entries) = fs::read_dir("/proc") else {
             return owners;
@@ -251,12 +290,20 @@ mod imp {
                     .and_then(|rest| rest.strip_suffix(']'))
                     .and_then(|inode| inode.parse().ok())
                 {
-                    owners.entry(inode).or_insert(pid);
+                    owners.entry(inode).or_default().push(pid);
                 }
             }
         }
         owners
     }
+}
+
+/// `ip_local_port_range` の「下限 上限」
+#[cfg(any(unix, test))]
+fn parse_port_range(text: &str) -> Option<RangeInclusive<u16>> {
+    let mut parts = text.split_whitespace().map(str::parse::<u16>);
+    let (low, high) = (parts.next()?.ok()?, parts.next()?.ok()?);
+    (low <= high).then_some(low..=high)
 }
 
 /// /proc/net/{tcp,tcp6,udp,udp6} のうち、状態が `state` の行から (アドレス, ポート, inode) を取る。
@@ -328,14 +375,16 @@ mod tests {
         assert_eq!(rows, [(IpAddr::V6(Ipv6Addr::LOCALHOST), 22, 44444)]);
     }
 
-    fn listener(proto: &'static str, addr: IpAddr, port: u16, pid: Option<u32>) -> Listener {
+    fn listener(proto: &'static str, addr: IpAddr, port: u16, pids: &[u32]) -> Listener {
         Listener {
             proto,
             addr,
             port,
-            pid,
+            pids: pids.to_vec(),
         }
     }
+
+    const EPHEMERAL: RangeInclusive<u16> = 49152..=65535;
 
     #[test]
     fn keys_and_owners_do_not_depend_on_pid() {
@@ -345,11 +394,12 @@ mod tests {
             let identities = identities(Os::Linux, &[process(pid, "sshd", Some("/usr/sbin/sshd"))]);
             render(
                 &[
-                    listener("tcp", v4, 22, Some(pid)),
-                    listener("tcp", v6, 22, Some(pid)),
-                    listener("udp", v4, 53, Some(9999)),
+                    listener("tcp", v4, 22, &[pid]),
+                    listener("tcp", v6, 22, &[pid]),
+                    listener("udp", v4, 53, &[9999]),
                 ],
                 &identities,
+                &EPHEMERAL,
             )
         };
         let value = render_with(100);
@@ -362,6 +412,65 @@ mod tests {
         assert_eq!(value["udp:0.0.0.0:53"]["processes"], json!(["unknown"]));
         // 持ち主の PID が変わっても同じ出力になる
         assert_eq!(value, render_with(200));
+    }
+
+    /// クライアントが一時ポートで束縛した UDP は、番号ではなく ephemeral にまとめる。
+    /// TCP の待ち受けは、一時ポートの範囲でも番号のまま
+    #[test]
+    fn ephemeral_udp_ports_are_grouped() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let identities = identities(
+            Os::Linux,
+            &[
+                process(1, "browser", Some("/usr/bin/browser")),
+                process(2, "app", Some("/opt/app")),
+            ],
+        );
+        let value = render(
+            &[
+                listener("udp", any, 50001, &[1]),
+                listener("udp", any, 61234, &[2]),
+                listener("tcp", any, 50001, &[2]),
+            ],
+            &identities,
+            &EPHEMERAL,
+        );
+        assert_eq!(
+            value["udp:0.0.0.0:ephemeral"]["processes"],
+            json!(["/opt/app", "/usr/bin/browser"])
+        );
+        assert_eq!(value["tcp:0.0.0.0:50001"]["processes"], json!(["/opt/app"]));
+        assert_eq!(value.as_object().unwrap().len(), 2);
+    }
+
+    /// 1 つのソケットを複数のプロセスが持つとき、列挙の順序によらず全員が載る
+    #[test]
+    fn shared_sockets_list_every_owner() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let identities = identities(
+            Os::Linux,
+            &[
+                process(1, "systemd", Some("/usr/lib/systemd/systemd")),
+                process(2, "sshd", Some("/usr/sbin/sshd")),
+            ],
+        );
+        let owners = |pids: &[u32]| {
+            render(&[listener("tcp", any, 22, pids)], &identities, &EPHEMERAL)["tcp:0.0.0.0:22"]
+                ["processes"]
+                .clone()
+        };
+        let expected = json!(["/usr/lib/systemd/systemd", "/usr/sbin/sshd"]);
+        assert_eq!(owners(&[1, 2]), expected);
+        assert_eq!(owners(&[2, 1]), expected);
+        // 持ち主の一部だけ引けたなら、unknown は付けない
+        assert_eq!(owners(&[2, 999]), json!(["/usr/sbin/sshd"]));
+    }
+
+    #[test]
+    fn parses_the_local_port_range() {
+        assert_eq!(parse_port_range("32768\t60999\n"), Some(32768..=60999));
+        assert_eq!(parse_port_range("60999 32768"), None);
+        assert_eq!(parse_port_range("garbage"), None);
     }
 
     #[test]
