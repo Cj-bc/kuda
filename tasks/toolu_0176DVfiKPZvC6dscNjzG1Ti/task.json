@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "toolu_0176DVfiKPZvC6dscNjzG1Ti",
+  "agent_id": "a8e7ada1d6c107315",
+  "subagent_type": "general-purpose",
+  "task_description": "Implement process-watch T5",
+  "token_usage": {
+    "input_tokens": 88,
+    "cache_creation_tokens": 155951,
+    "cache_read_tokens": 5123637,
+    "output_tokens": 44887,
+    "api_call_count": 44
+  },
+  "started_at": "2026-11-20T11:06:23.9734939+09:00",
+  "completed_at": "2026-11-20T11:13:57.3728628+09:00"
+}
