@@ -17,28 +17,27 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub struct Identity {
     /// 識別キー。パスが取れたら正規化したパス、取れなければ `name:<小文字名>`
     pub key: String,
-    /// Linux で実行ファイルが削除済み（` (deleted)`）だった。事件の証拠に載せる
+    /// Linux で実行ファイルが削除済みだった（列挙時に判定済み）。事件の証拠に載せる
     pub deleted: bool,
 }
 
 /// パスの正規化のうち、バージョン要素の置き換えを除いた部分。フラグ判定にはこちらを使う
 /// （`C:\Users\1.2.3\...` のような置き換えで場所の判定が変わらないように）
-fn normalize_basic(os: Os, path: &str) -> (String, bool) {
+fn normalize_basic(os: Os, path: &str) -> String {
     match os {
         Os::Windows => {
             let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-            (path.replace('/', "\\").to_ascii_lowercase(), false)
+            path.replace('/', "\\").to_ascii_lowercase()
         }
-        Os::Linux => match path.strip_suffix(" (deleted)") {
-            Some(rest) => (rest.to_string(), true),
-            None => (path.to_string(), false),
-        },
+        // 削除済みの印 ` (deleted)` は、列挙の時点でリンク数を見て外してある
+        // （名前が本当にそう終わるファイルと区別するため）
+        Os::Linux => path.to_string(),
     }
 }
 
 /// パスを識別キーに正規化する（§2.2 の 1〜3）
 pub fn normalize_path(os: Os, path: &str) -> Identity {
-    let (path, deleted) = normalize_basic(os, path);
+    let path = normalize_basic(os, path);
     let sep = os.separator();
     let key = path
         .split(sep)
@@ -51,7 +50,10 @@ pub fn normalize_path(os: Os, path: &str) -> Identity {
         })
         .collect::<Vec<_>>()
         .join(&sep.to_string());
-    Identity { key, deleted }
+    Identity {
+        key,
+        deleted: false,
+    }
 }
 
 /// `(v|app-)?数字(.数字)+` の後に、任意で `[-+_.]` と英数字・`.` の列が続く形か。
@@ -111,7 +113,10 @@ pub fn identify(os: Os, info: &ProcessInfo) -> Option<Identity> {
         return None;
     }
     Some(match &info.path {
-        Some(path) => normalize_path(os, path),
+        Some(path) => Identity {
+            deleted: info.deleted,
+            ..normalize_path(os, path)
+        },
         None => Identity {
             key: format!("name:{}", info.name.to_lowercase()),
             deleted: false,
@@ -133,7 +138,7 @@ impl Roots {
     /// 渡す値は正規化前でよい。空や根（`/`）は、全部が書き込み可能になってしまうので捨てる
     pub fn new(os: Os, user_writable: &[&str], system_root: Option<&str>) -> Roots {
         let trim = |p: &str| {
-            let (p, _) = normalize_basic(os, p);
+            let p = normalize_basic(os, p);
             p.trim_end_matches(os.separator()).to_string()
         };
         Roots {
@@ -178,7 +183,7 @@ fn is_under(sep: char, path: &str, dir: &str) -> bool {
 
 /// user_writable: 利用者が書き込める場所（ユーザーフォルダや一時領域）の配下にある実行ファイル
 pub fn is_user_writable(roots: &Roots, path: &str) -> bool {
-    let (path, _) = normalize_basic(roots.os, path);
+    let path = normalize_basic(roots.os, path);
     roots
         .user_writable
         .iter()
@@ -211,7 +216,7 @@ pub fn is_masquerade(roots: &Roots, name: &str, path: Option<&str>) -> bool {
         return false;
     };
     let name = name.to_ascii_lowercase();
-    let (path, _) = normalize_basic(roots.os, path);
+    let path = normalize_basic(roots.os, path);
     // 名前の表に無ければ対象外。explorer.exe だけは %SystemRoot% 直下が正しい置き場所
     let allowed: Vec<String> = if name == "explorer.exe" {
         vec![roots.system_root.clone()]
@@ -496,6 +501,7 @@ mod tests {
             user: None,
             started,
             kernel_thread: false,
+            deleted: false,
         }
     }
 
@@ -575,12 +581,20 @@ mod tests {
     }
 
     #[test]
-    fn linux_keeps_case_and_strips_deleted() {
-        let id = normalize_path(Os::Linux, "/home/Me/Bin/Tool (deleted)");
+    fn linux_keeps_case_and_takes_deleted_from_the_enumeration() {
+        let id = normalize_path(Os::Linux, "/home/Me/Bin/Tool");
+        assert_eq!(id.key, "/home/Me/Bin/Tool");
+        // 削除済みかは列挙の時点で判定済み。名前が本当に ` (deleted)` で終わるファイルもある
+        let mut info = crate::testutil::process(1, "tool", Some("/home/Me/Bin/Tool (deleted)"));
+        assert_eq!(
+            identify(Os::Linux, &info).unwrap().key,
+            "/home/Me/Bin/Tool (deleted)"
+        );
+        info.path = Some("/home/Me/Bin/Tool".into());
+        info.deleted = true;
+        let id = identify(Os::Linux, &info).unwrap();
         assert_eq!(id.key, "/home/Me/Bin/Tool");
         assert!(id.deleted);
-        let id = normalize_path(Os::Linux, "/home/Me/Bin/Tool");
-        assert!(!id.deleted);
         // Windows では ` (deleted)` を特別扱いしない
         let id = normalize_path(Os::Windows, r"C:\a (deleted)");
         assert_eq!(id.key, r"c:\a (deleted)");
@@ -597,6 +611,7 @@ mod tests {
             user: None,
             started: None,
             kernel_thread: false,
+            deleted: false,
         };
         assert_eq!(identify(Os::Windows, &p).unwrap().key, "name:system");
         let q = ProcessInfo {
@@ -1072,7 +1087,8 @@ mod tests {
     #[test]
     fn the_representative_decides_the_deleted_flag() {
         let roots = Roots::new(Os::Linux, &["/home/me"], None);
-        let old = proc(10, "tool", Some("/usr/bin/tool (deleted)"));
+        let mut old = proc(10, "tool", Some("/usr/bin/tool"));
+        old.deleted = true;
         let new = proc(20, "tool", Some("/usr/bin/tool"));
         for order in [[old.clone(), new.clone()], [new, old]] {
             let running = running(&order, &[], &[], &roots);

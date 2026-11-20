@@ -37,7 +37,8 @@ fn render(running: &Running) -> Value {
     let mut map = Map::new();
     for observed in running.iter() {
         let mut flags = Vec::new();
-        if observed.identity.deleted {
+        // 代表（PID 最小）だけで決めると、削除済みの版が代表でないときに印が落ちる
+        if observed.members.iter().any(|p| p.deleted) {
             flags.push("deleted");
         }
         if observed.masquerade {
@@ -98,6 +99,16 @@ mod tests {
         let fake = &value[r"c:\users\alice\appdata\local\temp\svchost.exe"];
         assert_eq!(fake["flags"], json!(["masquerade", "user_writable"]));
         assert_eq!(value["name:system"]["paths"], json!([]));
+    }
+
+    /// 削除済みの版が代表（PID 最小）でなくても、deleted の印は付く
+    #[test]
+    fn any_deleted_instance_marks_the_identity() {
+        let new = process(1, "tool", Some(r"C:\Apps\tool.exe"));
+        let mut old = process(2, "tool", Some(r"C:\Apps\tool.exe"));
+        old.deleted = true;
+        let value = snapshot(&[new, old]);
+        assert_eq!(value[r"c:\apps\tool.exe"]["flags"], json!(["deleted"]));
     }
 
     /// 代表（PID 最小）が終わって別のプロセスに替わっても、集合が同じなら出力は同じ

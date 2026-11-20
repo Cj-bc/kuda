@@ -15,6 +15,9 @@ pub struct ProcessInfo {
     pub started: Option<i64>,
     /// Linux のカーネルスレッド（stat の flags に PF_KTHREAD）。Windows では常に false
     pub kernel_thread: bool,
+    /// Linux で、実行ファイルが削除済み（置き換えられた古い版など）。`path` からは
+    /// ` (deleted)` を除いてある。Windows では常に false
+    pub deleted: bool,
 }
 
 /// 全プロセスを列挙する。個々のプロセスの詳細が取れなくても列挙は続ける
@@ -103,6 +106,7 @@ mod imp {
             user: None,
             started: handle.as_ref().and_then(|h| start_time(h.0)),
             kernel_thread: false,
+            deleted: false,
         }
     }
 
@@ -148,12 +152,25 @@ fn path_text(bytes: &[u8]) -> String {
     text
 }
 
+/// `/proc/<pid>/exe` の読み先から、削除済みの印 ` (deleted)` を分ける。
+/// 名前が本当に ` (deleted)` で終わる、削除されていないファイルもありうるので、
+/// `unlinked`（リンク数が 0 か）が分かればそれに従い、分からないときだけ印で判断する
+#[cfg(any(unix, test))]
+fn split_deleted(target: &[u8], unlinked: Option<bool>) -> (String, bool) {
+    const MARK: &[u8] = b" (deleted)";
+    match target.strip_suffix(MARK) {
+        Some(rest) if unlinked != Some(false) => (path_text(rest), true),
+        _ => (path_text(target), false),
+    }
+}
+
 #[cfg(unix)]
 mod imp {
-    use super::{ProcessInfo, path_text};
+    use super::{ProcessInfo, path_text, split_deleted};
     use anyhow::{Context, Result};
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
 
     pub fn enumerate() -> Result<Vec<ProcessInfo>> {
         let boot_time = boot_time().context("cannot read btime from /proc/stat")?;
@@ -186,9 +203,16 @@ mod imp {
     ) -> Option<ProcessInfo> {
         let stat = parse_stat_bytes(&fs::read(format!("/proc/{pid}/stat")).ok()?)?;
         // 他ユーザーのプロセスやカーネルスレッドでは読めない
-        let path = fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|p| path_text(p.as_os_str().as_bytes()));
+        let exe = format!("/proc/{pid}/exe");
+        let (path, deleted) = match fs::read_link(&exe) {
+            Ok(target) => {
+                // リンク数 0 なら本当に削除済み。読めなければ末尾の印だけで判断する
+                let unlinked = fs::metadata(&exe).ok().map(|m| m.nlink() == 0);
+                let (path, deleted) = split_deleted(target.as_os_str().as_bytes(), unlinked);
+                (Some(path), deleted)
+            }
+            Err(_) => (None, false),
+        };
         // 名前の行は UTF-8 とは限らない。Uid の行だけ読めればよいので、崩して読む
         let user = fs::read(format!("/proc/{pid}/status"))
             .ok()
@@ -205,6 +229,7 @@ mod imp {
             user,
             started: Some(boot_time + (stat.start_ticks / ticks_per_sec) as i64),
             kernel_thread: stat.kernel_thread,
+            deleted,
         })
     }
 
@@ -371,6 +396,29 @@ mod tests {
     }
 
     /// 別のパスは別の文字列になる。UTF-8 のパスで `\` を含まないものは、そのまま
+    #[test]
+    fn deleted_is_told_by_the_link_count_when_known() {
+        // リンク数 0: 本当に削除済み
+        assert_eq!(
+            split_deleted(b"/usr/bin/x (deleted)", Some(true)),
+            ("/usr/bin/x".to_string(), true)
+        );
+        // リンク数が残っている: 名前が本当に ` (deleted)` で終わるだけのファイル
+        assert_eq!(
+            split_deleted(b"/tmp/x (deleted)", Some(false)),
+            ("/tmp/x (deleted)".to_string(), false)
+        );
+        // 分からなければ印で判断する
+        assert_eq!(
+            split_deleted(b"/usr/bin/x (deleted)", None),
+            ("/usr/bin/x".to_string(), true)
+        );
+        assert_eq!(
+            split_deleted(b"/usr/bin/x", Some(true)),
+            ("/usr/bin/x".to_string(), false)
+        );
+    }
+
     #[test]
     fn paths_stay_distinct_when_they_are_not_utf8() {
         assert_eq!(path_text(b"/usr/bin/tool"), "/usr/bin/tool");

@@ -106,6 +106,7 @@ mod tests {
             user: None,
             started: Some(started),
             kernel_thread: false,
+            deleted: false,
         }
     }
 
