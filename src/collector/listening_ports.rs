@@ -22,6 +22,9 @@ struct Listener {
     proto: &'static str,
     addr: IpAddr,
     port: u16,
+    /// IPv6 のスコープ（インターフェース）。リンクローカルのアドレスはインターフェースごとに
+    /// 同じでありうるので、区別に要る。無ければ 0。Linux の /proc/net には載っていない
+    scope: u32,
     /// 持ち主。Linux では 1 つのソケットを複数のプロセスが持ちうる（ソケット起動など）。
     /// 空なら持ち主を引けなかった
     pids: Vec<u32>,
@@ -44,16 +47,24 @@ impl Listener {
         };
         match self.addr {
             IpAddr::V4(addr) => format!("{}:{addr}:{port}", self.proto),
+            IpAddr::V6(addr) if self.scope != 0 => {
+                format!("{}:[{addr}%{}]:{port}", self.proto, self.scope)
+            }
             IpAddr::V6(addr) => format!("{}:[{addr}]:{port}", self.proto),
         }
     }
 }
 
 pub fn collect(paths: &Paths) -> Result<Value> {
-    let listeners = imp::listeners()?;
     // 持ち主を引けないと、全部が unknown に変わった差分が出て、それが比較の基準にも残る。
     // それより、この collector を失敗にする
-    let processes = probe::enumerate().context("cannot enumerate processes")?;
+    let enumerate = || probe::enumerate().context("cannot enumerate processes");
+    // 表を読む前と後に列挙し、両方に同じ起動時刻でいた PID だけを持ち主として信じる。
+    // 間に PID が再利用されると、ソケットを別のプロセスのものとしてしまうため
+    let before = enumerate()?;
+    let listeners = imp::listeners()?;
+    let processes = enumerate()?;
+    let listeners = only_stable_owners(listeners, &stable_pids(Os::current(), &before, &processes));
     let excluded = excluded_pids(
         &processes,
         &investigation::excluded_roots(paths, &processes),
@@ -61,6 +72,36 @@ pub fn collect(paths: &Paths) -> Result<Value> {
     let listeners = without_excluded(listeners, &excluded);
     let identities = identities(Os::current(), &processes);
     Ok(render(&listeners, &identities, &imp::ephemeral_ports()))
+}
+
+/// 2 回の列挙のどちらにも、同じ起動時刻でいた PID。
+/// Windows の保護プロセスなど起動時刻を読めないものは、名前とパスが同じなら同じとみなす
+/// （そうしないと、システムのサービスの待ち受けがすべて持ち主不明になる）
+fn stable_pids(os: Os, before: &[ProcessInfo], after: &[ProcessInfo]) -> HashSet<u32> {
+    after
+        .iter()
+        .filter(|p| {
+            before.iter().any(|q| {
+                q.pid == p.pid
+                    && match q.started {
+                        Some(started) => probe::same_start(os, started, p.started),
+                        None => p.started.is_none() && q.name == p.name && q.path == p.path,
+                    }
+            })
+        })
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// 確かめられなかった持ち主を外す。全員が外れた待ち受けは、持ち主の分からないものとして残す
+fn only_stable_owners(listeners: Vec<Listener>, stable: &HashSet<u32>) -> Vec<Listener> {
+    listeners
+        .into_iter()
+        .map(|mut l| {
+            l.pids.retain(|pid| stable.contains(pid));
+            l
+        })
+        .collect()
 }
 
 /// kuda 自身と調査プロセス（と子孫）の PID。processes collector や分類と同じく、
@@ -217,6 +258,7 @@ mod imp {
                 proto: "tcp",
                 addr: IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwLocalAddr))),
                 port: port(row.dwLocalPort),
+                scope: 0,
                 pids: vec![row.dwOwningPid],
             });
         }
@@ -236,6 +278,7 @@ mod imp {
                 proto: "tcp",
                 addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
                 port: port(row.dwLocalPort),
+                scope: row.dwLocalScopeId,
                 pids: vec![row.dwOwningPid],
             });
         }
@@ -248,6 +291,7 @@ mod imp {
                 proto: "udp",
                 addr: IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwLocalAddr))),
                 port: port(row.dwLocalPort),
+                scope: 0,
                 pids: vec![row.dwOwningPid],
             });
         }
@@ -260,6 +304,7 @@ mod imp {
                 proto: "udp",
                 addr: IpAddr::V6(Ipv6Addr::from(row.ucLocalAddr)),
                 port: port(row.dwLocalPort),
+                scope: row.dwLocalScopeId,
                 pids: vec![row.dwOwningPid],
             });
         }
@@ -315,6 +360,7 @@ mod imp {
                     proto,
                     addr,
                     port,
+                    scope: 0,
                     pids: owners.get(&inode).cloned().unwrap_or_default(),
                 });
             }
@@ -441,6 +487,7 @@ mod tests {
             proto,
             addr,
             port,
+            scope: 0,
             pids: pids.to_vec(),
         }
     }
@@ -539,6 +586,48 @@ mod tests {
         assert_eq!(parse_port_range("32768\t60999\n"), Some(32768..=60999));
         assert_eq!(parse_port_range("60999 32768"), None);
         assert_eq!(parse_port_range("garbage"), None);
+    }
+
+    /// 表を読む間に PID が再利用された持ち主は信じず、持ち主不明として残す
+    #[test]
+    fn owners_must_be_the_same_process_before_and_after() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let mut sshd = process(22, "sshd", Some("/usr/sbin/sshd"));
+        sshd.started = Some(100);
+        let mut reused = process(30, "old", Some("/usr/bin/old"));
+        reused.started = Some(100);
+        let mut replacement = process(30, "new", Some("/usr/bin/new"));
+        replacement.started = Some(900);
+        // 起動時刻が読めない（保護プロセス）ものは、名前とパスで同じとみなす
+        let mut protected = process(4, "svchost.exe", Some(r"C:\Windows\svchost.exe"));
+        protected.started = None;
+
+        let before = [sshd.clone(), reused, protected.clone()];
+        let after = [sshd, replacement, protected];
+        let stable = stable_pids(Os::Linux, &before, &after);
+        let kept = only_stable_owners(
+            vec![
+                listener("tcp", any, 22, &[22]),
+                listener("tcp", any, 9999, &[30]),
+                listener("tcp", any, 135, &[4]),
+            ],
+            &stable,
+        );
+        let owners: Vec<&[u32]> = kept.iter().map(|l| l.pids.as_slice()).collect();
+        assert_eq!(owners, [&[22][..], &[], &[4]]);
+    }
+
+    /// リンクローカルの同じアドレスでも、インターフェースが違えば別の待ち受け
+    #[test]
+    fn ipv6_scopes_tell_interfaces_apart() {
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+        let on = |scope| Listener {
+            scope,
+            ..listener("udp", link_local, 546, &[])
+        };
+        let value = render(&[on(3), on(7)], &HashMap::new(), &EPHEMERAL);
+        assert!(value.get("udp:[fe80::1%3]:546").is_some(), "{value}");
+        assert!(value.get("udp:[fe80::1%7]:546").is_some(), "{value}");
     }
 
     /// kuda 自身と調査プロセス（と子孫）だけが持つ待ち受けは載せない
