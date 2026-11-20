@@ -289,7 +289,7 @@ fn build_incident(
         (Some(classification), Some(processes)) => {
             let os = Os::current();
             let mut unknown = incident::describe_unknown(os, &classification.pending, processes);
-            incident::enrich_unknown(os, &mut unknown);
+            incident::enrich_unknown(os, &mut unknown, probe::enumerate);
             unknown
         }
         _ => Vec::new(),

@@ -93,47 +93,77 @@ pub fn describe(
         .collect()
 }
 
-/// ハッシュとコマンドラインを取って埋める。どちらも取れなくてよい（事件の作成は止めない）
-pub fn enrich(os: Os, unknown: &mut [UnknownProcess]) {
+/// ハッシュとコマンドラインを取って埋める。どちらも取れなくてよい（事件の作成は止めない）。
+///
+/// コマンドラインと `/proc/<pid>/exe` は PID で引くので、分類の後に PID が再利用されていると
+/// 別のプロセスの値になる。`alive` で読む前と読んだ後に列挙し、同じ PID と起動時刻の
+/// プロセスがどちらにもいたときだけ、PID で引いた値を使う
+pub fn enrich(
+    os: Os,
+    unknown: &mut [UnknownProcess],
+    alive: impl Fn() -> anyhow::Result<Vec<ProcessInfo>>,
+) {
     let detailed = unknown.len().min(MAX_DETAILED);
-    let command_lines = command_lines(os, &unknown[..detailed]);
-    for (index, item) in unknown.iter_mut().enumerate() {
-        if index >= detailed {
-            let note = format!("not collected: more than {MAX_DETAILED} unknown processes");
-            item.sha256_note = Some(note);
-            continue;
-        }
-        match sha256_of(&hash_candidates(os, item.pid, item.path.as_deref())) {
-            Ok(hash) => item.sha256 = Some(hash),
+    let (rest, overflow) = unknown.split_at_mut(detailed);
+    for item in overflow {
+        let note = format!("not collected: more than {MAX_DETAILED} unknown processes");
+        item.sha256_note = Some(note);
+    }
+
+    let before = alive().unwrap_or_default();
+    let command_lines = command_lines(os, rest);
+    let hashes: Vec<_> = rest
+        .iter()
+        .map(|item| sha256_of(&hash_candidates(os, item.pid, item.path.as_deref())))
+        .collect();
+    let after = alive().unwrap_or_default();
+
+    for (item, hash) in rest.iter_mut().zip(hashes) {
+        let same = |list: &[ProcessInfo]| {
+            list.iter()
+                .any(|p| p.pid == item.pid && p.started == item.started)
+        };
+        let verified = same(&before) && same(&after);
+        match hash {
+            Ok((hash, by_pid)) if verified || !by_pid => item.sha256 = Some(hash),
+            Ok(_) => item.sha256_note = Some(GONE.to_string()),
             Err(note) => item.sha256_note = Some(note),
         }
-        item.command_line = command_lines.get(&item.pid).cloned();
+        if verified {
+            item.command_line = command_lines.get(&item.pid).cloned();
+        }
     }
 }
 
-/// ハッシュを取る場所の候補。Linux では `/proc/<pid>/exe` が、削除済みの実行ファイルの
-/// 中身も読める。無ければ（または読めなければ）パスで読む
-fn hash_candidates(os: Os, pid: u32, path: Option<&str>) -> Vec<PathBuf> {
+/// PID で引いた値を捨てたときの理由
+const GONE: &str = "the process exited or its PID was reused before it could be read";
+
+/// ハッシュを取る場所の候補と、それが PID で引く場所かどうか。
+/// Linux では `/proc/<pid>/exe` が、削除済みの実行ファイルの中身も読める。
+/// 削除済みのパスそのものは、更新で置き換わった別のファイルを指しうるので候補にしない
+fn hash_candidates(os: Os, pid: u32, path: Option<&str>) -> Vec<(PathBuf, bool)> {
     let mut candidates = Vec::new();
     if os == Os::Linux {
-        candidates.push(PathBuf::from(format!("/proc/{pid}/exe")));
+        candidates.push((PathBuf::from(format!("/proc/{pid}/exe")), true));
     }
-    if let Some(path) = path {
-        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
-        candidates.push(PathBuf::from(path));
+    if let Some(path) = path
+        && !(os == Os::Linux && path.ends_with(" (deleted)"))
+    {
+        candidates.push((PathBuf::from(path), false));
     }
     candidates
 }
 
-/// 最初に読めた候補の SHA-256 を 16 進で返す。読めなければ、理由を返す
-fn sha256_of(candidates: &[PathBuf]) -> Result<String, String> {
+/// 最初に読めた候補の SHA-256 を 16 進で、その候補の印（PID で引いたか）と一緒に返す。
+/// 読めなければ、理由を返す
+fn sha256_of<T: Copy>(candidates: &[(PathBuf, T)]) -> Result<(String, T), String> {
     use sha2::{Digest, Sha256};
 
     if candidates.is_empty() {
         return Err("no executable path".to_string());
     }
     let mut last_error = String::new();
-    for path in candidates {
+    for (path, mark) in candidates {
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) => {
@@ -177,13 +207,14 @@ fn sha256_of(candidates: &[PathBuf]) -> Result<String, String> {
         if total > MAX_HASH_BYTES {
             return Err(format!("larger than {} MiB", MAX_HASH_BYTES / 1024 / 1024));
         }
-        return Ok(hasher
+        let hex = hasher
             .finalize()
             .iter()
             .fold(String::new(), |mut hex, byte| {
                 let _ = write!(hex, "{byte:02x}");
                 hex
-            }));
+            });
+        return Ok((hex, *mark));
     }
     Err(last_error)
 }
@@ -264,9 +295,19 @@ fn parse_command_lines(text: &str) -> HashMap<u32, String> {
         .collect()
 }
 
-/// 表のセルに入れる文字列。制御文字を除き、`CELL_LIMIT` 文字で切り、表を崩す文字を逃がす
+/// 表示の向きを変える書式文字。`evil\u{202e}exe.txt` が `evil` `txt.exe` と見えるように、
+/// 名前を偽って読ませるのに使える
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// 表のセルに入れる文字列。制御文字と向きを変える書式文字を除き、`CELL_LIMIT` 文字で切り、
+/// 表を崩す文字を逃がす
 fn untrusted_cell(text: &str) -> String {
-    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    let clean: String = text
+        .chars()
+        .filter(|&c| !c.is_control() && !is_bidi_control(c))
+        .collect();
     if clean.chars().count() > CELL_LIMIT {
         let cut: String = clean.chars().take(CELL_LIMIT).collect();
         cell(&format!("{cut}…"))
@@ -382,30 +423,76 @@ mod tests {
         let path = dir.join("a.bin");
         std::fs::write(&path, b"abc").unwrap();
         assert_eq!(
-            sha256_of(std::slice::from_ref(&path)).unwrap(),
+            sha256_of(&[(path.clone(), ())]).unwrap().0,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        // 最初の候補が読めなくても、次で取れる
-        assert!(sha256_of(&[dir.join("missing"), path]).is_ok());
+        // 最初の候補が読めなくても、次で取れる。どの候補で取れたかも分かる
+        assert_eq!(
+            sha256_of(&[(dir.join("missing"), 1), (path, 2)]).unwrap().1,
+            2
+        );
         assert!(
-            sha256_of(&[dir.join("missing")])
+            sha256_of(&[(dir.join("missing"), ())])
                 .unwrap_err()
                 .contains("cannot open")
         );
-        assert_eq!(sha256_of(&[]).unwrap_err(), "no executable path");
+        assert_eq!(sha256_of::<()>(&[]).unwrap_err(), "no executable path");
     }
 
     #[test]
     fn candidates_depend_on_the_os() {
         assert_eq!(
-            hash_candidates(Os::Linux, 7, Some("/tmp/x (deleted)")),
-            [PathBuf::from("/proc/7/exe"), PathBuf::from("/tmp/x")]
+            hash_candidates(Os::Linux, 7, Some("/usr/bin/x")),
+            [
+                (PathBuf::from("/proc/7/exe"), true),
+                (PathBuf::from("/usr/bin/x"), false)
+            ]
+        );
+        // 削除済みのパスは、更新で置き換わった別のファイルかもしれない
+        assert_eq!(
+            hash_candidates(Os::Linux, 7, Some("/usr/bin/x (deleted)")),
+            [(PathBuf::from("/proc/7/exe"), true)]
         );
         assert_eq!(
             hash_candidates(Os::Windows, 7, Some(r"C:\x.exe")),
-            [PathBuf::from(r"C:\x.exe")]
+            [(PathBuf::from(r"C:\x.exe"), false)]
         );
         assert!(hash_candidates(Os::Windows, 7, None).is_empty());
+    }
+
+    /// 読む前か後に同じ PID と起動時刻のプロセスがいなければ、PID で引いた値は使わない
+    #[test]
+    fn values_read_by_pid_need_the_same_process_before_and_after() {
+        let dir = TempDir::new("unknown-enrich");
+        let exe = dir.join("x.exe");
+        std::fs::write(&exe, b"abc").unwrap();
+        // 自分の PID を使う。Linux では /proc/<pid>/exe が開けるので、確かめる処理まで届く
+        let mut original = process(std::process::id(), "x.exe", Some(exe.to_str().unwrap()));
+        original.started = Some(100);
+        let mut reused = original.clone();
+        reused.started = Some(900);
+
+        let described = |os| describe(os, &pending(&[original.clone()]), &[]);
+        // Windows のハッシュはパスで読むので、PID が再利用されていても使える
+        let mut unknown = described(Os::Windows);
+        enrich(Os::Windows, &mut unknown, || Ok(vec![reused.clone()]));
+        assert!(unknown[0].sha256.is_some());
+        assert_eq!(unknown[0].command_line, None);
+
+        // Linux の /proc/<pid>/exe は PID で引くので、確かめられなければ捨てる
+        let mut unknown = described(Os::Linux);
+        unknown[0].path = Some("/kuda-test/x (deleted)".to_string());
+        enrich(Os::Linux, &mut unknown, || Ok(vec![reused.clone()]));
+        assert_eq!(unknown[0].sha256, None);
+        let note = unknown[0].sha256_note.as_deref().unwrap();
+        // Linux では自分の /proc/<pid>/exe が開けて再利用と判定され、Windows では開けない
+        assert!(note == GONE || note.contains("cannot open"), "{note}");
+    }
+
+    #[test]
+    fn bidi_controls_are_removed_from_cells() {
+        assert_eq!(untrusted_cell("evil\u{202e}exe.txt"), "evilexe.txt");
+        assert_eq!(untrusted_cell("a\u{2066}b\u{200f}c"), "abc");
     }
 
     #[test]
