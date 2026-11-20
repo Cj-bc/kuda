@@ -394,17 +394,20 @@ pub fn running<'a>(
         let entry = observed
             .entry(identity.key.clone())
             .or_insert_with(|| Observed {
-                identity,
+                identity: identity.clone(),
                 process,
                 instances: 0,
                 user_writable,
                 masquerade,
             });
         entry.instances += 1;
-        // 代表は PID が最小のもの。列挙の順序に結果を依存させない
+        // 代表は PID が最小のもの。列挙の順序に結果を依存させない。
+        // deleted は代表のパスから決まる性質なので、代表と一緒に入れ替える
         if process.pid < entry.process.pid {
             entry.process = process;
+            entry.identity = identity;
         }
+        entry.user_writable |= user_writable;
         entry.masquerade |= masquerade;
     }
     Running(observed)
@@ -1055,6 +1058,21 @@ mod tests {
         let c = observe(&mut store, &w, &procs, 1000 + 8 * DAY, true);
         assert_eq!(metric(&c, "unknown"), 1.0);
         assert_eq!(c.pending[0].process.pid, 20);
+    }
+
+    /// 削除済みの旧版と、置き換わった新版が同時に動いているとき、deleted は代表のものになる
+    #[test]
+    fn the_representative_decides_the_deleted_flag() {
+        let roots = Roots::new(Os::Linux, &["/home/me"], None);
+        let old = proc(10, "tool", Some("/usr/bin/tool (deleted)"));
+        let new = proc(20, "tool", Some("/usr/bin/tool"));
+        for order in [[old.clone(), new.clone()], [new, old]] {
+            let running = running(&order, &[], &[], &roots);
+            let observed: Vec<_> = running.iter().collect();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].process.pid, 10);
+            assert!(observed[0].identity.deleted);
+        }
     }
 
     #[test]
