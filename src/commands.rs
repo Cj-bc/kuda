@@ -120,9 +120,9 @@ struct Observation {
     metrics: Variables,
     stats: Vec<SeriesStats>,
     classification: Option<Classification>,
-    /// 学習する前提の分類で、条件式がすでに成立していた。やり直した分類では式の値が
-    /// 逆転しうる（`missing >= 1 && unknown == 0` など）ので、成立した事実をここで持ち越す
-    matched_while_learning: bool,
+    /// 学習する前提の分類で条件式が成立したときの、判定に使った値。やり直した分類では式の値が
+    /// 逆転しうる（`missing >= 1 && unknown == 0` など）ので、成立した事実と根拠をここで持ち越す
+    decision: Option<Variables>,
 }
 
 /// probe を実行して観測する。`learn` が false なら、学習期間中でも新しい識別キーを known にしない
@@ -147,12 +147,12 @@ fn observe_run(
     learn: bool,
 ) -> Result<Observation> {
     let mut metrics = run.metrics();
-    let mut matched_while_learning = false;
+    let mut decision = None;
     let classification = match (&watch.probe, &run.processes) {
         (ProbeSpec::Process(spec), Some(_)) => {
-            let (classification, matched) =
+            let (classification, decided) =
                 classify_processes(store, paths, watch, spec, &run, now, learn)?;
-            matched_while_learning = matched;
+            decision = decided;
             metrics.extend(classification.metrics.clone());
             Some(classification)
         }
@@ -165,7 +165,7 @@ fn observe_run(
         metrics,
         stats,
         classification,
-        matched_while_learning,
+        decision,
     })
 }
 
@@ -181,7 +181,7 @@ fn apply(
     let metrics = &observation.metrics;
     let mut variables = metrics.clone();
     variables.extend(baseline::variables(&observation.stats));
-    let matched = observation.matched_while_learning || trigger_matches(watch, &variables);
+    let matched = observation.decision.is_some() || trigger_matches(watch, &variables);
 
     store.record_run(&watch.name, &observation.run, metrics)?;
     if let Some(classification) = &observation.classification {
@@ -306,6 +306,7 @@ fn build_incident(
         current: &current,
         last_good: last_good.as_ref(),
         unknown_processes: &unknown_processes,
+        decision: observation.decision.as_ref(),
     };
     incident::create(&paths.incidents_dir, &evidence, created)
 }
@@ -331,7 +332,7 @@ fn trigger_matches(watch: &Watch, variables: &Variables) -> bool {
 /// 学習してよいのは正常な回だけ。正常かどうかは条件式の成否で決まるが、その式の変数は
 /// 分類の結果に依存する。そこで、まず学習する前提で分類し、式が成立したら（異常なら）
 /// 何も学習しない前提でやり直す。やり直すと pending が増えるので、式によっては成立しなく
-/// なる。そのため、最初の分類で成立したかどうかも返す。
+/// なる。そのため、最初の分類で成立したときは、判定に使った値も返す。
 /// `learn` が false なら最初から学習しない（手動の調査用）
 fn classify_processes(
     store: &Store,
@@ -341,25 +342,25 @@ fn classify_processes(
     run: &ProbeRun,
     now: i64,
     learn: bool,
-) -> Result<(Classification, bool)> {
+) -> Result<(Classification, Option<Variables>)> {
     let processes = run.processes.as_deref().unwrap_or_default();
     let roots = Roots::from_env();
     let excluded = investigation::excluded_roots(paths, processes);
     let running = known_set::running(processes, &excluded, &spec.ignore, &roots);
     let classify = |learn| known_set::classify(store, &watch.name, spec, &running, now, learn);
     if !learn {
-        return Ok((classify(false)?, false));
+        return Ok((classify(false)?, None));
     }
     let classification = classify(true)?;
     if classification.learned == 0 {
-        return Ok((classification, false));
+        return Ok((classification, None));
     }
     let mut variables = run.metrics();
     variables.extend(classification.metrics.clone());
     if trigger_matches(watch, &variables) {
-        return Ok((classify(false)?, true));
+        return Ok((classify(false)?, Some(variables)));
     }
-    Ok((classification, false))
+    Ok((classification, None))
 }
 
 fn fire(
@@ -948,6 +949,18 @@ mod tests {
         assert!(store.load_probe_state("p").unwrap().trigger.active);
         // 異常な回なので、学習期間中でも覚えない
         assert!(reported(&store, "name:alpha"));
+
+        // 事件には、数え直した値（unknown = 1）と、判定に使った値（unknown = 0）の両方が載る
+        let incident_dir = std::fs::read_dir(paths.incidents_dir.join("p"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let summary = std::fs::read_to_string(incident_dir.join("summary.md")).unwrap();
+        let (current, decision) = summary.split_once("## 判定に使った値").unwrap();
+        assert!(current.contains("| unknown | 1.000 |"), "{summary}");
+        assert!(decision.contains("| unknown | 0.000 |"), "{summary}");
     }
 
     /// 列挙に失敗した回は、missing の比較が成立しなくても回復にしない

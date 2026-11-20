@@ -45,6 +45,9 @@ pub struct Evidence<'a> {
     pub last_good: Option<&'a KnownGood>,
     /// 未知のプロセスの証拠（kind = "process" で pending があるときだけ空でない）
     pub unknown_processes: &'a [UnknownProcess],
+    /// 学習する前提の分類で条件式が成立したときの、判定に使った値。`metrics` は学習しない
+    /// 前提で数え直した値なので、式によっては `metrics` だけでは成立したことが読み取れない
+    pub decision: Option<&'a Variables>,
 }
 
 /// 秒単位の時刻から一意なディレクトリを作る。同じ秒に重なったら連番を付ける
@@ -181,6 +184,18 @@ fn render_summary(evidence: &Evidence, created: i64) -> String {
     text.push_str("\n## 現在の指標\n\n| 指標 | 値 |\n| --- | --- |\n");
     for (name, value) in evidence.metrics {
         let _ = writeln!(text, "| {name} | {value:.3} |");
+    }
+    if let Some(decision) = evidence.decision {
+        text.push_str(
+            "\n## 判定に使った値\n\n\
+             学習期間中のため、今回はじめて見たプロセスを既知として覚える前提で条件式を評価し、\
+             成立しました。異常な回には学習しないので、上の指標と記録は、覚えない前提で\
+             数え直した値です（式によっては、数え直した値では成立しません）。\n\n\
+             | 指標 | 値 |\n| --- | --- |\n",
+        );
+        for (name, value) in decision {
+            let _ = writeln!(text, "| {name} | {value:.3} |");
+        }
     }
 
     text.push_str(
@@ -354,6 +369,7 @@ mod tests {
             current,
             last_good: None,
             unknown_processes: &[],
+            decision: None,
         }
     }
 
