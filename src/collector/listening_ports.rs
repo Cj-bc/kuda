@@ -66,7 +66,7 @@ pub fn collect(paths: &Paths) -> Result<Value> {
 /// kuda 自身と調査プロセス（と子孫）の PID。processes collector や分類と同じく、
 /// それらの待ち受けは入れない
 fn excluded_pids(processes: &[ProcessInfo], roots: &[(u32, i64)]) -> HashSet<u32> {
-    let kept: HashSet<u32> = known_set::without_descendants(processes, roots)
+    let kept: HashSet<u32> = known_set::without_descendants(Os::current(), processes, roots)
         .iter()
         .map(|p| p.pid)
         .collect();

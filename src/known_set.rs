@@ -237,6 +237,7 @@ pub fn is_masquerade(roots: &Roots, name: &str, path: Option<&str>) -> bool {
 /// - 親子は、親の起動時刻 ≤ 子の起動時刻のときだけたどる。
 ///   どちらかの起動時刻が None のときは確かめられないので、たどらない
 pub fn without_descendants<'a>(
+    os: Os,
     processes: &'a [ProcessInfo],
     roots: &[(u32, i64)],
 ) -> Vec<&'a ProcessInfo> {
@@ -255,7 +256,7 @@ pub fn without_descendants<'a>(
             by_pid
                 .get(&pid)
                 .copied()
-                .filter(|p| probe::same_start(started, p.started))
+                .filter(|p| probe::same_start(os, started, p.started))
         })
         .collect();
     while let Some(parent) = queue.pop() {
@@ -382,7 +383,7 @@ pub fn running<'a>(
 ) -> Running<'a> {
     let os = roots.os;
     let mut observed: BTreeMap<String, Observed> = BTreeMap::new();
-    for process in without_descendants(processes, excluded) {
+    for process in without_descendants(os, processes, excluded) {
         let Some(identity) = identify(os, process) else {
             continue;
         };
@@ -754,7 +755,7 @@ mod tests {
             info(102, Some(101), Some(120)),
             info(200, Some(1), Some(130)), // 無関係
         ];
-        let kept: Vec<u32> = without_descendants(&list, &[(100, 100)])
+        let kept: Vec<u32> = without_descendants(Os::Linux, &list, &[(100, 100)])
             .iter()
             .map(|p| p.pid)
             .collect();
@@ -769,9 +770,15 @@ mod tests {
             info(100, Some(1), Some(900)),
             info(101, Some(100), Some(910)),
         ];
-        assert_eq!(without_descendants(&list, &[(100, 100)]).len(), 2);
+        assert_eq!(
+            without_descendants(Os::Linux, &list, &[(100, 100)]).len(),
+            2
+        );
         // 一覧に根がいなくても同じ
-        assert_eq!(without_descendants(&list, &[(555, 100)]).len(), 2);
+        assert_eq!(
+            without_descendants(Os::Linux, &list, &[(555, 100)]).len(),
+            2
+        );
     }
 
     #[test]
@@ -784,7 +791,7 @@ mod tests {
             info(102, Some(101), Some(200)),
             info(103, Some(101), Some(600)),
         ];
-        let kept: Vec<u32> = without_descendants(&list, &[(100, 100)])
+        let kept: Vec<u32> = without_descendants(Os::Linux, &list, &[(100, 100)])
             .iter()
             .map(|p| p.pid)
             .collect();
@@ -798,20 +805,20 @@ mod tests {
             info(101, Some(100), None),
             info(102, Some(100), Some(150)),
         ];
-        let kept: Vec<u32> = without_descendants(&list, &[(100, 100)])
+        let kept: Vec<u32> = without_descendants(Os::Linux, &list, &[(100, 100)])
             .iter()
             .map(|p| p.pid)
             .collect();
         assert_eq!(kept, vec![101]);
         // 根自身の起動時刻が不明なら生存を確かめられない
         let list = vec![info(100, Some(1), None), info(101, Some(100), Some(1))];
-        assert_eq!(without_descendants(&list, &[(100, 0)]).len(), 2);
+        assert_eq!(without_descendants(Os::Linux, &list, &[(100, 0)]).len(), 2);
     }
 
     #[test]
     fn parent_cycles_terminate() {
         let list = vec![info(100, Some(101), Some(5)), info(101, Some(100), Some(5))];
-        assert!(without_descendants(&list, &[(100, 5)]).is_empty());
+        assert!(without_descendants(Os::Linux, &list, &[(100, 5)]).is_empty());
     }
 
     #[test]

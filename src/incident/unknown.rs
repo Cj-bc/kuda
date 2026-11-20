@@ -118,7 +118,9 @@ pub fn enrich(
     let still_running = |list: &[ProcessInfo], item: &UnknownProcess| {
         item.started.is_some_and(|started| {
             list.iter().any(|p| {
-                p.pid == item.pid && probe::same_start(started, p.started) && p.path == item.path
+                p.pid == item.pid
+                    && probe::same_start(os, started, p.started)
+                    && p.path == item.path
             })
         })
     };
@@ -511,16 +513,18 @@ mod tests {
             unknown.remove(0)
         };
 
-        // 同じプロセスがいれば、ハッシュが付く（起動時刻の 1 秒のずれは同じとみなす）
+        // 同じプロセスがいれば、ハッシュが付く
+        assert!(enriched(&original, vec![original.clone()]).sha256.is_some());
+
+        // Windows の作成時刻はずれないので、1 秒の差でも別のプロセスとみなす
         let mut drifted = original.clone();
         drifted.started = Some(101);
-        assert!(enriched(&original, vec![drifted]).sha256.is_some());
 
         let mut reused = original.clone();
         reused.started = Some(900);
         let mut replaced = original.clone();
         replaced.path = Some(r"C:\other.exe".to_string());
-        for seen in [vec![], vec![reused], vec![replaced]] {
+        for seen in [vec![], vec![drifted], vec![reused], vec![replaced]] {
             let item = enriched(&original, seen);
             assert_eq!(item.sha256, None);
             assert_eq!(item.command_line, None);

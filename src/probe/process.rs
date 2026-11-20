@@ -1,5 +1,6 @@
 //! kind = "process": 動いているプロセスの列挙。判定や学習はここでは行わない。
 
+use crate::os::Os;
 use anyhow::Result;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,16 +24,18 @@ pub fn enumerate() -> Result<Vec<ProcessInfo>> {
 
 /// 別々の列挙で見た起動時刻が、同じプロセスのものか。
 /// Linux の起動時刻は、起動からの経過と、読むたびに計算される起動時刻（btime）から作るので、
-/// 列挙をまたぐと 1 秒ずれうる。同じ 1 秒のうちに同じ PID が再利用されることは考えない
-pub fn same_start(recorded: i64, seen: Option<i64>) -> bool {
-    seen.is_some_and(|seen| (seen - recorded).abs() <= 1)
+/// 列挙をまたぐと 1 秒ずれうる。同じ 1 秒のうちに同じ PID が再利用されることは考えない。
+/// Windows の作成時刻はカーネルが持つ値そのものでずれないので、ぴったり比べる
+pub fn same_start(os: Os, recorded: i64, seen: Option<i64>) -> bool {
+    let tolerance = if os == Os::Linux { 1 } else { 0 };
+    seen.is_some_and(|seen| (seen - recorded).abs() <= tolerance)
 }
 
 #[cfg(windows)]
 mod imp {
     use super::ProcessInfo;
     use anyhow::{Context, Result};
-    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, FILETIME, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS,
@@ -70,8 +73,11 @@ mod imp {
         let mut processes = Vec::new();
         loop {
             processes.push(describe(&entry));
-            if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
-                break; // ERROR_NO_MORE_FILES で終わる
+            match unsafe { Process32NextW(snapshot.0, &mut entry) } {
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => break,
+                // 途中までの一覧を返すと、続きにいたプロセスが missing や消えたように見える
+                Err(error) => return Err(error).context("Process32NextW failed"),
             }
         }
         Ok(processes)
@@ -183,9 +189,10 @@ mod imp {
         let path = fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .map(|p| path_text(p.as_os_str().as_bytes()));
-        let user = fs::read_to_string(format!("/proc/{pid}/status"))
+        // 名前の行は UTF-8 とは限らない。Uid の行だけ読めればよいので、崩して読む
+        let user = fs::read(format!("/proc/{pid}/status"))
             .ok()
-            .and_then(|status| parse_uid(&status))
+            .and_then(|status| parse_uid(&String::from_utf8_lossy(&status)))
             .map(|uid| match users.iter().find(|(id, _)| *id == uid) {
                 Some((_, name)) => name.clone(),
                 None => uid.to_string(),
@@ -212,23 +219,20 @@ mod imp {
     /// （名前空間の中では kthreadd が PID 2 とは限らず、PID 2 が普通のサービスでありうる）
     const PF_KTHREAD: u64 = 0x0020_0000;
 
-    /// comm は UTF-8 とは限らない（プロセスが自由に付けられる）。UTF-8 として読むと
-    /// プロセスごと列挙から落ちるので、名前だけを置き換え文字で崩して読む。
-    /// 区切りの `(` `)` と数字は ASCII なので、崩しても位置は変わらない
+    /// `pid (comm) state ppid ...`。comm は空白や括弧を含みうるので、最後の `)` で区切る。
+    /// comm は UTF-8 とは限らない（プロセスが自由に付けられる）。パスが読めないプロセスでは
+    /// 名前が識別キーになるので、置き換え文字で崩さず、パスと同じく元に戻せる形にする
     fn parse_stat_bytes(stat: &[u8]) -> Option<Stat> {
-        parse_stat(&String::from_utf8_lossy(stat))
-    }
-
-    /// `pid (comm) state ppid ...`。comm は空白や括弧を含みうるので、最後の `)` で区切る
-    fn parse_stat(stat: &str) -> Option<Stat> {
-        let open = stat.find('(')?;
-        let close = stat.rfind(')')?;
-        let rest: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+        let open = stat.iter().position(|&b| b == b'(')?;
+        let close = stat.iter().rposition(|&b| b == b')')?;
+        let name = path_text(stat.get(open + 1..close)?);
+        let rest = String::from_utf8_lossy(stat.get(close + 1..)?);
+        let rest: Vec<&str> = rest.split_whitespace().collect();
         // rest[0] = state, rest[1] = ppid, rest[6] = flags（stat の 9 番目）、
         // rest[19] = starttime（stat の 22 番目）
         let flags: u64 = rest.get(6)?.parse().ok()?;
         Some(Stat {
-            name: stat.get(open + 1..close)?.to_string(),
+            name,
             ppid: rest.get(1)?.parse().ok()?,
             start_ticks: rest.get(19)?.parse().ok()?,
             kernel_thread: flags & PF_KTHREAD != 0,
@@ -274,7 +278,7 @@ mod imp {
         fn stat_with_spaces_and_parens_in_the_name() {
             let line =
                 "42 (a) b (c) S 7 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 12345 1000 10 0";
-            let stat = parse_stat(line).unwrap();
+            let stat = parse_stat_bytes(line.as_bytes()).unwrap();
             assert_eq!(stat.name, "a) b (c");
             assert_eq!(stat.ppid, 7);
             assert_eq!(stat.start_ticks, 12345);
@@ -285,14 +289,15 @@ mod imp {
         fn kernel_threads_are_told_by_their_flags() {
             // kworker の実例。flags 0x4208060 に PF_KTHREAD（0x200000）が立っている
             let line = "88 (kworker/0:1H) I 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 0 -20 1 0 77 0 0";
-            assert!(parse_stat(line).unwrap().kernel_thread);
+            assert!(parse_stat_bytes(line.as_bytes()).unwrap().kernel_thread);
         }
 
         #[test]
         fn a_name_that_is_not_utf8_keeps_the_process() {
             let line = b"42 (x\xff\xfey) S 7 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 12345 1000 10 0";
             let stat = parse_stat_bytes(line).unwrap();
-            assert_eq!(stat.name, "x\u{fffd}\u{fffd}y");
+            // 置き換え文字に崩すと、別の名前と同じ識別キー（name:）になる
+            assert_eq!(stat.name, r"x\xff\xfey");
             assert_eq!(stat.ppid, 7);
             assert_eq!(stat.start_ticks, 12345);
         }
@@ -354,6 +359,15 @@ mod tests {
 
         let found = processes.iter().find(|p| p.pid == child.id()).unwrap();
         assert_eq!(found.ppid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn start_times_drift_by_a_second_only_on_linux() {
+        assert!(same_start(Os::Linux, 100, Some(101)));
+        assert!(!same_start(Os::Linux, 100, Some(102)));
+        assert!(same_start(Os::Windows, 100, Some(100)));
+        assert!(!same_start(Os::Windows, 100, Some(101)));
+        assert!(!same_start(Os::Linux, 100, None));
     }
 
     /// 別のパスは別の文字列になる。UTF-8 のパスで `\` を含まないものは、そのまま

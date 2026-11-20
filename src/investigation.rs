@@ -5,6 +5,7 @@
 //! プロセスの監視が kuda 自身の仲間として除外できるようにする。
 
 use crate::known_set;
+use crate::os::Os;
 use crate::paths::Paths;
 use crate::probe::{self, ProcessInfo};
 use anyhow::{Context, Result};
@@ -59,7 +60,7 @@ pub fn running(paths: &Paths, processes: &[ProcessInfo]) -> Vec<(u32, i64)> {
         };
         if processes
             .iter()
-            .any(|p| p.pid == root.0 && probe::same_start(root.1, p.started))
+            .any(|p| p.pid == root.0 && probe::same_start(Os::current(), root.1, p.started))
         {
             roots.push(root);
         }
@@ -125,8 +126,9 @@ mod tests {
         // 消さない。列挙の直後に始まった調査の記録かもしれない
         assert!(registration.0.exists());
         assert_eq!(running(&paths, &[me(42)]).len(), 1);
-        // 列挙ごとに 1 秒ずれうる（Linux の btime）ので、1 秒差は同じプロセスとみなす
-        assert_eq!(running(&paths, &[me(43)]).len(), 1);
+        // Linux では列挙ごとに 1 秒ずれうる（btime）ので、1 秒差は同じプロセスとみなす
+        let tolerated = usize::from(Os::current() == Os::Linux);
+        assert_eq!(running(&paths, &[me(43)]).len(), tolerated);
         std::mem::forget(registration);
     }
 
