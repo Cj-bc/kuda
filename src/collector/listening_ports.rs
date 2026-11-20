@@ -2,14 +2,19 @@
 //!
 //! 外部コマンド（netstat、ss）は使わない。Windows は IP Helper、Linux は /proc を読む。
 
+use crate::investigation;
 use crate::known_set;
 use crate::os::Os;
+use crate::paths::Paths;
 use crate::probe::{self, ProcessInfo};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
+
+/// 一時ポートの番号の一覧。証拠としては残すが、毎回変わるので差分では比べない
+pub(super) const VOLATILE_KEYS: &[&str] = &["ephemeral_ports"];
 
 /// 待ち受けの 1 件。UDP は接続を持たないので、束縛されたソケットを待ち受けとみなす
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,13 +28,16 @@ struct Listener {
 }
 
 impl Listener {
-    /// `tcp:0.0.0.0:80`、`udp:[::]:53`。IPv6 は括弧で囲み、ポートと区切れるようにする。
-    ///
     /// UDP は待ち受けと、クライアントが送信のために束縛しただけのソケットを区別できない。
-    /// 後者は一時ポート（`ephemeral`）を使い、番号が毎回変わるので、番号の代わりに
-    /// `ephemeral` とまとめる。どのプロセスが一時ポートを使っているかは残る
+    /// 後者は一時ポートを使い、番号が毎回変わる
+    fn is_ephemeral(&self, ephemeral: &RangeInclusive<u16>) -> bool {
+        self.proto == "udp" && ephemeral.contains(&self.port)
+    }
+
+    /// `tcp:0.0.0.0:80`、`udp:[::]:53`。IPv6 は括弧で囲み、ポートと区切れるようにする。
+    /// 一時ポートの UDP は番号の代わりに `ephemeral` とまとめ、番号は `ephemeral_ports` に残す
     fn key(&self, ephemeral: &RangeInclusive<u16>) -> String {
-        let port = if self.proto == "udp" && ephemeral.contains(&self.port) {
+        let port = if self.is_ephemeral(ephemeral) {
             "ephemeral".to_string()
         } else {
             self.port.to_string()
@@ -41,12 +49,40 @@ impl Listener {
     }
 }
 
-pub fn collect() -> Result<Value> {
+pub fn collect(paths: &Paths) -> Result<Value> {
     let listeners = imp::listeners()?;
-    // 持ち主の識別は processes collector と同じ規則。列挙できなくてもポートの一覧は返す
-    let processes = probe::enumerate().unwrap_or_default();
+    // 持ち主を引けないと、全部が unknown に変わった差分が出て、それが比較の基準にも残る。
+    // それより、この collector を失敗にする
+    let processes = probe::enumerate().context("cannot enumerate processes")?;
+    let excluded = excluded_pids(
+        &processes,
+        &investigation::excluded_roots(paths, &processes),
+    );
+    let listeners = without_excluded(listeners, &excluded);
     let identities = identities(Os::current(), &processes);
     Ok(render(&listeners, &identities, &imp::ephemeral_ports()))
+}
+
+/// kuda 自身と調査プロセス（と子孫）の PID。processes collector や分類と同じく、
+/// それらの待ち受けは入れない
+fn excluded_pids(processes: &[ProcessInfo], roots: &[(u32, i64)]) -> HashSet<u32> {
+    let kept: HashSet<u32> = known_set::without_descendants(processes, roots)
+        .iter()
+        .map(|p| p.pid)
+        .collect();
+    processes
+        .iter()
+        .map(|p| p.pid)
+        .filter(|pid| !kept.contains(pid))
+        .collect()
+}
+
+/// 持ち主がすべて除外対象の待ち受けを除く。持ち主の分からないものは残す
+fn without_excluded(listeners: Vec<Listener>, excluded: &HashSet<u32>) -> Vec<Listener> {
+    listeners
+        .into_iter()
+        .filter(|l| l.pids.is_empty() || !l.pids.iter().all(|pid| excluded.contains(pid)))
+        .collect()
 }
 
 fn identities(os: Os, processes: &[ProcessInfo]) -> HashMap<u32, String> {
@@ -63,9 +99,12 @@ fn render(
     identities: &HashMap<u32, String>,
     ephemeral: &RangeInclusive<u16>,
 ) -> Value {
-    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut owners: BTreeMap<String, (BTreeSet<String>, BTreeSet<u16>)> = BTreeMap::new();
     for listener in listeners {
-        let entry = owners.entry(listener.key(ephemeral)).or_default();
+        let (entry, ports) = owners.entry(listener.key(ephemeral)).or_default();
+        if listener.is_ephemeral(ephemeral) {
+            ports.insert(listener.port);
+        }
         let known: Vec<_> = listener
             .pids
             .iter()
@@ -79,7 +118,14 @@ fn render(
     }
     let map: Map<String, Value> = owners
         .into_iter()
-        .map(|(key, owners)| (key, json!({ "processes": owners })))
+        .map(|(key, (owners, ports))| {
+            let value = if ports.is_empty() {
+                json!({ "processes": owners })
+            } else {
+                json!({ "processes": owners, "ephemeral_ports": ports })
+            };
+            (key, value)
+        })
         .collect();
     Value::Object(map)
 }
@@ -344,7 +390,7 @@ fn parse_proc_net(text: &str, state: &str, v6: bool) -> Vec<(IpAddr, u16, u64)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::process;
+    use crate::testutil::{TempDir, process};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -441,6 +487,13 @@ mod tests {
         );
         assert_eq!(value["tcp:0.0.0.0:50001"]["processes"], json!(["/opt/app"]));
         assert_eq!(value.as_object().unwrap().len(), 2);
+        // 番号は証拠として残すが、差分では比べない
+        assert_eq!(
+            value["udp:0.0.0.0:ephemeral"]["ephemeral_ports"],
+            json!([50001, 61234])
+        );
+        assert!(crate::collector::is_volatile_key("ephemeral_ports"));
+        assert!(value["tcp:0.0.0.0:50001"].get("ephemeral_ports").is_none());
     }
 
     /// 1 つのソケットを複数のプロセスが持つとき、列挙の順序によらず全員が載る
@@ -473,8 +526,36 @@ mod tests {
         assert_eq!(parse_port_range("garbage"), None);
     }
 
+    /// kuda 自身と調査プロセス（と子孫）だけが持つ待ち受けは載せない
+    #[test]
+    fn listeners_of_kuda_and_investigations_are_left_out() {
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let mut kuda = process(100, "kuda", Some("/usr/bin/kuda"));
+        kuda.started = Some(5);
+        let mut agent = process(101, "claude", Some("/usr/bin/claude"));
+        agent.ppid = Some(100);
+        agent.started = Some(6);
+        let sshd = process(22, "sshd", Some("/usr/sbin/sshd"));
+        let excluded = excluded_pids(&[kuda, agent, sshd], &[(100, 5)]);
+        let kept = without_excluded(
+            vec![
+                listener("tcp", any, 9000, &[101]),
+                listener("tcp", any, 22, &[22]),
+                listener("tcp", any, 8080, &[101, 22]),
+                listener("tcp", any, 7000, &[]),
+            ],
+            &excluded,
+        );
+        let ports: Vec<u16> = kept.iter().map(|l| l.port).collect();
+        assert_eq!(ports, [22, 8080, 7000]);
+    }
+
     #[test]
     fn collects_from_this_machine() {
-        assert!(collect().unwrap().is_object());
+        assert!(
+            collect(&TempDir::new("listening-ports").paths())
+                .unwrap()
+                .is_object()
+        );
     }
 }

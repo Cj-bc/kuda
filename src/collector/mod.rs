@@ -28,7 +28,13 @@ pub fn identity_keys() -> impl Iterator<Item = &'static str> {
 
 /// 毎回変わるので差分で比べないキー
 pub fn is_volatile_key(key: &str) -> bool {
-    traceroute::VOLATILE_KEYS.contains(&key) || processes::VOLATILE_KEYS.contains(&key)
+    [
+        traceroute::VOLATILE_KEYS,
+        processes::VOLATILE_KEYS,
+        listening_ports::VOLATILE_KEYS,
+    ]
+    .iter()
+    .any(|keys| keys.contains(&key))
 }
 
 fn collect(spec: &CollectorSpec, paths: &Paths) -> Result<Value> {
@@ -37,7 +43,7 @@ fn collect(spec: &CollectorSpec, paths: &Paths) -> Result<Value> {
         CollectorSpec::Routes => routes::collect(),
         CollectorSpec::DnsConfig => dns_config::collect(),
         CollectorSpec::Processes => processes::collect(paths),
-        CollectorSpec::ListeningPorts => listening_ports::collect(),
+        CollectorSpec::ListeningPorts => listening_ports::collect(paths),
         CollectorSpec::Traceroute(target) => traceroute::collect(target),
     }
 }
