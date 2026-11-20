@@ -66,6 +66,39 @@ fn flatten(path: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     }
 }
 
+/// 差分の 1 行に載せる文字列。プロセス名やパスは攻撃者が決められるので、改行で見出しや
+/// 偽の項目を作られないよう、制御文字と向きを変える書式文字を `\u{..}` の形で見せる。
+/// 生の値は current.json と last_known_good.json に残る
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || super::unknown::is_bidi_control(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// インラインコードにする。中のバッククォートより長い区切りで囲み、途中で閉じさせない
+fn code(text: &str) -> String {
+    let text = printable(text);
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    // 区切りに接するバッククォートは、空白を挟まないと区切りの一部と読まれる
+    if longest > 0 {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
+}
+
 fn flat_data(name: &str, data: &Value) -> BTreeMap<String, String> {
     let mut flat = BTreeMap::new();
     flatten(name, data, &mut flat);
@@ -106,22 +139,27 @@ pub(super) fn render_diff(last_good: Option<&KnownGood>, current: &Snapshot) -> 
                 None => "現在のスナップショットに含まれていません",
                 Some(CollectorResult::Ok(_)) => "正常時に取得に成功したことがありません",
             };
-            failed.push(format!("- `{name}`: {error}"));
+            failed.push(format!("- {}: {}", code(name), printable(error)));
             continue;
         };
         let (old, new) = (flat_data(name, old), flat_data(name, new));
         for (path, value) in &new {
             match old.get(path) {
-                None => added.push(format!("- `{path}`: {value}")),
+                None => added.push(format!("- {}: {}", code(path), printable(value))),
                 Some(previous) if previous != value => {
-                    changed.push(format!("- `{path}`: {previous} ⇒ {value}"));
+                    changed.push(format!(
+                        "- {}: {} ⇒ {}",
+                        code(path),
+                        printable(previous),
+                        printable(value)
+                    ));
                 }
                 Some(_) => {}
             }
         }
         for (path, value) in &old {
             if !new.contains_key(path) {
-                removed.push(format!("- `{path}`: {value}"));
+                removed.push(format!("- {}: {}", code(path), printable(value)));
             }
         }
     }
@@ -249,5 +287,34 @@ mod tests {
     #[test]
     fn missing_baseline_snapshot_is_stated() {
         assert!(render_diff(None, &snapshot(json!([]))).contains("ありません"));
+    }
+
+    /// プロセスが決められる名前に改行やバッククォートがあっても、見出しや項目を作れない
+    #[test]
+    fn hostile_names_cannot_forge_lines() {
+        let processes = |data: Value| -> Snapshot {
+            serde_json::from_value(json!({ "taken_at": 100, "collectors": {
+                "processes": { "ok": true, "data": data },
+            }}))
+            .unwrap()
+        };
+        let before = processes(json!({}));
+        let hostile = "/tmp/x\n## 変更\n- `ok`: \u{202e}fake`";
+        let after = processes(json!({ hostile: { "name": "x\r\n# 見出し" } }));
+        let diff = render_diff(Some(&known_good(&before)), &after);
+        assert!(!diff.lines().any(|l| l.starts_with("# 見出し")), "{diff}");
+        assert!(!diff.lines().any(|l| l.starts_with("## 変更")), "{diff}");
+        assert!(!diff.contains('\u{202e}'), "{diff}");
+        assert!(diff.contains("\\u{a}## 変更"), "{diff}");
+        // 項目は 1 行で、パスはバッククォートを含んでも閉じない区切りで囲まれている
+        let line = diff.lines().find(|l| l.contains("/tmp/x")).unwrap();
+        assert!(line.starts_with("- `` processes./tmp/x"), "{line}");
+    }
+
+    #[test]
+    fn code_spans_outlast_the_backticks_inside() {
+        assert_eq!(code("plain"), "`plain`");
+        assert_eq!(code("a`b"), "`` a`b ``");
+        assert_eq!(code("a``b"), "``` a``b ```");
     }
 }

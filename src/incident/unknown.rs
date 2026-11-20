@@ -297,7 +297,7 @@ fn parse_command_lines(text: &str) -> HashMap<u32, String> {
 
 /// 表示の向きを変える書式文字。`evil\u{202e}exe.txt` が `evil` `txt.exe` と見えるように、
 /// 名前を偽って読ませるのに使える
-fn is_bidi_control(c: char) -> bool {
+pub(super) fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
